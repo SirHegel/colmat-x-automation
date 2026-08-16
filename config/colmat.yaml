@@ -1,0 +1,16 @@
+brand:
+  name: Colmat
+  timezone: America/Bogota
+  language: es
+
+paths:
+  content_dir: content/posts
+  templates_dir: content/templates
+  state_db: .state/colmat.db
+
+safety:
+  max_weighted_length: 280
+  max_posts_per_run: 1
+  max_posts_per_day: 2
+  allow_urls: false
+  lease_minutes: 10

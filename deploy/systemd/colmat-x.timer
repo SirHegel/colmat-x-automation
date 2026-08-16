@@ -1,0 +1,11 @@
+[Unit]
+Description=Revisar la cola de Colmat cada cinco minutos
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+AccuracySec=30s
+RandomizedDelaySec=10s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+id: colmat-bienvenida-001
+template: idea
+publish_at: "2026-09-01T09:00:00-05:00"
+data:
+  titulo: "Pensar juntos también es construir."
+  desarrollo: >-
+    Colmat abre un espacio para formular mejores preguntas, contrastar ideas y convertir
+    la reflexión en acción colectiva.
+  cierre: "Este es un borrador de ejemplo: edítalo antes de aprobarlo."

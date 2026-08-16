@@ -1,0 +1,18 @@
+[Unit]
+Description=Publicador de X para Colmat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=colmat
+Group=colmat
+WorkingDirectory=/opt/colmat-x-automation
+EnvironmentFile=/opt/colmat-x-automation/.env
+Environment=COLMAT_STATE_DB=/var/lib/colmat-x/colmat.db
+ExecStart=/opt/colmat-x-automation/.venv/bin/colmat-x run-due --live
+StateDirectory=colmat-x
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
