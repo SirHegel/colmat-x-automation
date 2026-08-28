@@ -16,6 +16,26 @@ class ConfigError(ValueError):
     """La configuración del proyecto no es válida."""
 
 
+def _trusted_user_home() -> Path:
+    """Return the OS account profile without trusting environment overrides."""
+
+    if os.name == "nt":
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32_768)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 40, None, 0, buffer)
+        if result != 0 or not buffer.value:
+            raise ConfigError("No se pudo determinar el perfil del usuario actual")
+        return Path(buffer.value)
+
+    import pwd
+
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise ConfigError("No se pudo determinar el perfil del usuario actual") from exc
+
+
 @dataclass(frozen=True)
 class BrandSettings:
     name: str
@@ -103,7 +123,7 @@ def load_settings(config_path: str | Path | None = None) -> ProjectSettings:
         requested = requested.strip()
         if not requested:
             raise ConfigError("COLMAT_CONFIG no puede estar vacío")
-    path = Path(requested).expanduser().resolve()
+    path = _resolve_config_path(requested)
     if not path.is_file():
         raise ConfigError(f"No existe el archivo de configuración: {path}")
 
@@ -153,7 +173,7 @@ def load_settings(config_path: str | Path | None = None) -> ProjectSettings:
     paths = PathSettings(
         content_dir=_project_path(root, paths_data, "content_dir"),
         templates_dir=_project_path(root, paths_data, "templates_dir"),
-        state_db=_resolve_project_path(
+        state_db=_state_path(
             root, _optional_env("COLMAT_STATE_DB") or _nonempty_string(paths_data, "state_db")
         ),
     )
@@ -215,12 +235,65 @@ def _boolean(section: dict[str, Any], name: str) -> bool:
 
 
 def _project_path(root: Path, section: dict[str, Any], name: str) -> Path:
-    return _resolve_project_path(root, _nonempty_string(section, name))
+    return _resolve_under_root(root, _nonempty_string(section, name), label=f"paths.{name}")
 
 
-def _resolve_project_path(root: Path, raw: str) -> Path:
-    path = Path(raw).expanduser()
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
+def _resolve_config_path(requested: str | Path) -> Path:
+    """Resolve a config file only below the working directory or the user's home.
+
+    ``COLMAT_CONFIG`` and ``--config`` are operator-controlled inputs.  Normalizing
+    before checking a directory boundary prevents ``..`` and symlink escapes while
+    still allowing a project below the current user's workspace to be selected.
+    """
+
+    raw = os.fspath(requested)
+    try:
+        expanded = os.path.expanduser(raw)
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(os.fspath(Path.cwd()), expanded)
+        candidate = os.path.normcase(os.path.realpath(expanded))
+        cwd = os.path.normcase(os.path.realpath(os.fspath(Path.cwd())))
+        home = os.path.normcase(os.path.realpath(os.fspath(_trusted_user_home())))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ConfigError("La ruta de configuración no es válida") from exc
+
+    if cwd != os.path.dirname(cwd) and candidate.startswith(cwd.rstrip(os.sep) + os.sep):
+        return Path(candidate)
+    if home != os.path.dirname(home) and candidate.startswith(home.rstrip(os.sep) + os.sep):
+        return Path(candidate)
+    raise ConfigError(
+        "El archivo de configuración debe estar dentro del directorio de trabajo "
+        "o del perfil del usuario"
+    )
+
+
+def _resolve_under_root(root: Path, raw: str, *, label: str) -> Path:
+    """Return a normalized descendant of ``root`` or fail closed."""
+
+    try:
+        trusted_root = os.path.normcase(os.path.realpath(os.fspath(root)))
+        expanded = os.path.expanduser(raw)
+        unresolved = expanded if os.path.isabs(expanded) else os.path.join(trusted_root, expanded)
+        candidate = os.path.normcase(os.path.realpath(unresolved))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ConfigError(f"'{label}' no contiene una ruta válida") from exc
+
+    if trusted_root != os.path.dirname(trusted_root) and candidate.startswith(
+        trusted_root.rstrip(os.sep) + os.sep
+    ):
+        return Path(candidate)
+    raise ConfigError(f"'{label}' debe permanecer dentro del proyecto")
+
+
+def _state_path(root: Path, raw: str) -> Path:
+    """Resolve state storage under the project or the fixed system service root."""
+
+    if not os.path.isabs(os.path.expanduser(raw)):
+        return _resolve_under_root(root, raw, label="paths.state_db")
+
+    # The packaged systemd deployment uses this dedicated, administrator-owned
+    # directory.  No other absolute destination is accepted from configuration.
+    return _resolve_under_root(Path("/var/lib/colmat-x"), raw, label="paths.state_db")
 
 
 def _optional_env(name: str) -> str | None:

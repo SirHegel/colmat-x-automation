@@ -4,11 +4,16 @@ from pathlib import Path
 
 import pytest
 
+import colmat_x.config as config_module
 from colmat_x.config import BrandSettings, PathSettings, ProjectSettings, SafetySettings
 
 
 @pytest.fixture
-def project_settings(tmp_path: Path) -> ProjectSettings:
+def project_settings(tmp_path: Path, monkeypatch) -> ProjectSettings:
+    # Cada proyecto de prueba vive dentro de un perfil aislado, igual que exige
+    # la resolución segura de rutas de configuración en producción.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(config_module, "_trusted_user_home", lambda: tmp_path)
     content_dir = tmp_path / "content" / "posts"
     templates_dir = tmp_path / "content" / "templates"
     content_dir.mkdir(parents=True)
