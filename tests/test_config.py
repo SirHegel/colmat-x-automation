@@ -209,6 +209,16 @@ def test_accepts_dedicated_system_service_state_path(configured_project, monkeyp
     assert loaded.paths.state_db == Path("/var/lib/colmat-x/production.db")
 
 
+def test_accepts_absolute_state_path_inside_project(configured_project, monkeypatch) -> None:
+    project, config_path = configured_project
+    state_path = project.root / ".state" / "absolute.db"
+    monkeypatch.setenv("COLMAT_STATE_DB", str(state_path))
+
+    loaded = load_settings(config_path)
+
+    assert loaded.paths.state_db == state_path
+
+
 def test_rejects_duplicate_safety_keys(configured_project) -> None:
     _, config_path = configured_project
     document = config_path.read_text(encoding="utf-8").replace(

@@ -291,9 +291,12 @@ def _state_path(root: Path, raw: str) -> Path:
     if not os.path.isabs(os.path.expanduser(raw)):
         return _resolve_under_root(root, raw, label="paths.state_db")
 
-    # The packaged systemd deployment uses this dedicated, administrator-owned
-    # directory.  No other absolute destination is accepted from configuration.
-    return _resolve_under_root(Path("/var/lib/colmat-x"), raw, label="paths.state_db")
+    # Una ruta absoluta puede ser la forma canónica del estado del proyecto. El
+    # despliegue systemd admite además su raíz fija administrada; ninguna otra.
+    try:
+        return _resolve_under_root(root, raw, label="paths.state_db")
+    except ConfigError:
+        return _resolve_under_root(Path("/var/lib/colmat-x"), raw, label="paths.state_db")
 
 
 def _optional_env(name: str) -> str | None:
