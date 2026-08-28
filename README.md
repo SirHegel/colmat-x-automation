@@ -154,7 +154,11 @@ una sola cuenta desatendida; X también permite OAuth 2.0 Authorization Code con
 Un `.env` con modo `0600` es la protección local mínima. Para producción, usa el gestor de
 secretos del entorno y cifrado en reposo; rota de inmediato cualquier credencial expuesta.
 Cuando se selecciona otro proyecto mediante `--config` o `COLMAT_CONFIG`, solo se carga el `.env`
-de ese proyecto; un `.env` del directorio de trabajo no puede sustituir sus credenciales.
+de ese proyecto; un `.env` del directorio de trabajo no puede sustituir sus credenciales. La ruta
+de configuración debe permanecer bajo el directorio de trabajo o el perfil del usuario. Las rutas
+de contenido y plantillas permanecen dentro del proyecto; la base admite además el destino de
+servicio dedicado `/var/lib/colmat-x/`. La normalización previa rechaza escapes con `..`, prefijos
+hermanos y enlaces simbólicos.
 
 Solo `.env.example`, con nombres y valores secretos vacíos, pertenece al repositorio. `.env`,
 `.state/`, bases SQLite, logs, entornos virtuales, cobertura y artefactos de construcción están

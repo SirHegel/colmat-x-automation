@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import colmat_x.config as config_module
 from colmat_x.config import ConfigError, XCredentials, live_enabled, load_settings
 
 
@@ -42,6 +43,7 @@ def test_selected_project_never_inherits_dotenv_secrets_from_cwd(
         "X_ACCESS_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.chdir(foreign_cwd)
 
     loaded = load_settings()
@@ -114,6 +116,107 @@ def test_rejects_blank_state_override(configured_project, monkeypatch) -> None:
 
     with pytest.raises(ConfigError, match="COLMAT_STATE_DB no puede estar vacío"):
         load_settings(config_path)
+
+
+def test_rejects_config_outside_working_directory_and_home(
+    configured_project, monkeypatch, tmp_path: Path
+) -> None:
+    _, config_path = configured_project
+    trusted_cwd = tmp_path / "trusted-cwd"
+    trusted_home = trusted_cwd / "home"
+    trusted_cwd.mkdir()
+    trusted_home.mkdir()
+    monkeypatch.chdir(trusted_cwd)
+    monkeypatch.setenv("HOME", str(trusted_home))
+    monkeypatch.setattr(config_module, "_trusted_user_home", lambda: trusted_home)
+
+    with pytest.raises(ConfigError, match="directorio de trabajo.*perfil"):
+        load_settings(config_path)
+
+
+def test_rejects_config_symlink_escape(configured_project, monkeypatch, tmp_path: Path) -> None:
+    project, _ = configured_project
+    trusted_cwd = tmp_path / "trusted-cwd"
+    trusted_home = trusted_cwd / "home"
+    trusted_cwd.mkdir()
+    trusted_home.mkdir()
+    (trusted_cwd / "selected").symlink_to(project.root, target_is_directory=True)
+    monkeypatch.chdir(trusted_cwd)
+    monkeypatch.setenv("HOME", str(trusted_home))
+    monkeypatch.setattr(config_module, "_trusted_user_home", lambda: trusted_home)
+
+    with pytest.raises(ConfigError, match="directorio de trabajo.*perfil"):
+        load_settings("selected/config/colmat.yaml")
+
+
+def test_home_environment_cannot_move_trusted_boundary(configured_project, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", "/etc")
+
+    with pytest.raises(ConfigError, match="directorio de trabajo.*perfil"):
+        load_settings("/etc/passwd")
+
+
+def test_filesystem_root_is_never_a_trusted_working_boundary(
+    configured_project, monkeypatch
+) -> None:
+    monkeypatch.chdir("/")
+
+    with pytest.raises(ConfigError, match="directorio de trabajo.*perfil"):
+        load_settings("/etc/passwd")
+
+
+def test_rejects_project_path_traversal(configured_project, tmp_path: Path) -> None:
+    _, config_path = configured_project
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-content"
+    outside.mkdir()
+    document = config_path.read_text(encoding="utf-8").replace(
+        "content_dir: content/posts", f"content_dir: ../{outside.name}"
+    )
+    config_path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="paths.content_dir.*dentro del proyecto"):
+        load_settings(config_path)
+
+
+def test_rejects_project_path_symlink_escape(configured_project, tmp_path: Path) -> None:
+    project, config_path = configured_project
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-templates"
+    outside.mkdir()
+    (project.root / "escaped-templates").symlink_to(outside, target_is_directory=True)
+    document = config_path.read_text(encoding="utf-8").replace(
+        "templates_dir: content/templates", "templates_dir: escaped-templates"
+    )
+    config_path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="paths.templates_dir.*dentro del proyecto"):
+        load_settings(config_path)
+
+
+def test_rejects_arbitrary_absolute_state_path(configured_project, monkeypatch) -> None:
+    _, config_path = configured_project
+    monkeypatch.setenv("COLMAT_STATE_DB", "/etc/passwd")
+
+    with pytest.raises(ConfigError, match="paths.state_db.*dentro del proyecto"):
+        load_settings(config_path)
+
+
+def test_accepts_dedicated_system_service_state_path(configured_project, monkeypatch) -> None:
+    _, config_path = configured_project
+    monkeypatch.setenv("COLMAT_STATE_DB", "/var/lib/colmat-x/production.db")
+
+    loaded = load_settings(config_path)
+
+    assert loaded.paths.state_db == Path("/var/lib/colmat-x/production.db")
+
+
+def test_accepts_absolute_state_path_inside_project(configured_project, monkeypatch) -> None:
+    project, config_path = configured_project
+    state_path = project.root / ".state" / "absolute.db"
+    monkeypatch.setenv("COLMAT_STATE_DB", str(state_path))
+
+    loaded = load_settings(config_path)
+
+    assert loaded.paths.state_db == state_path
 
 
 def test_rejects_duplicate_safety_keys(configured_project) -> None:
