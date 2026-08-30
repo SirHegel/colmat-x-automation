@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect
 
-from colmat_x.platform_store import ConflictError, PlatformStore
+from colmat_x.platform_store import Base, ConflictError, PlatformStore
 from colmat_x.rbac import Role
 from colmat_x.telegram_bot import (
     BotAutomationMode,
@@ -17,6 +17,7 @@ from colmat_x.telegram_bot import (
     WebhookResult,
 )
 from colmat_x.web import (
+    REQUIRED_DATABASE_COLUMNS,
     PlatformTelegramOperations,
     RuntimeProvider,
     WebConfigurationError,
@@ -125,6 +126,38 @@ def test_ready_reports_only_check_states() -> None:
     }
 
 
+def test_readiness_requires_every_declared_model_column(tmp_path) -> None:
+    expected = {
+        table_name: frozenset(column.name for column in table.columns)
+        for table_name, table in Base.metadata.tables.items()
+    }
+    assert expected == REQUIRED_DATABASE_COLUMNS
+    assert "id" in REQUIRED_DATABASE_COLUMNS["users"]
+
+    store = PlatformStore(
+        f"sqlite+pysqlite:///{tmp_path / 'partial-readiness.db'}",
+        create_schema=False,
+    )
+    try:
+        with store.engine.begin() as connection:
+            for table_name, columns in REQUIRED_DATABASE_COLUMNS.items():
+                selected = sorted(columns - {"id"}) if table_name == "users" else sorted(columns)
+                declarations = ", ".join(f'"{column}" TEXT' for column in selected)
+                connection.exec_driver_sql(f'CREATE TABLE "{table_name}" ({declarations})')
+        provider = RuntimeProvider(
+            store=store,
+            processor=FakeProcessor(),
+            telegram_client=FakeTelegramClient(),
+        )
+
+        ready, checks = provider.readiness()
+
+        assert ready is False
+        assert checks["database"] == "error"
+    finally:
+        store.close()
+
+
 def test_ready_is_503_when_vercel_configuration_is_missing() -> None:
     app = create_app(environ={"VERCEL": "1"})
 
@@ -134,6 +167,7 @@ def test_ready_is_503_when_vercel_configuration_is_missing() -> None:
     assert response.json()["status"] == "not_ready"
     assert response.json()["checks"] == {
         "worker_secrets": "ok",
+        "web_auth_pepper": "missing",
         "telegram_webhook_secret": "missing",
         "telegram_bot_token": "missing",
         "database": "missing",
@@ -157,7 +191,7 @@ def test_ready_rejects_privileged_worker_environment_on_vercel(
 ) -> None:
     secret = f"sensitive-{variable_name.lower()}"
     app = create_app(
-        environ={"VERCEL": "1", variable_name: secret},
+        environ={"VERCEL": "1", "WEB_AUTH_PEPPER": "p" * 32, variable_name: secret},
         store=FakeStore(),
         processor=FakeProcessor(),
         telegram_client=FakeTelegramClient(),
@@ -170,6 +204,7 @@ def test_ready_rejects_privileged_worker_environment_on_vercel(
         "status": "not_ready",
         "checks": {
             "worker_secrets": "error",
+            "web_auth_pepper": "ok",
             "telegram_webhook_secret": "ok",
             "telegram_bot_token": "ok",
             "database": "ok",
@@ -223,6 +258,32 @@ def test_webhook_rejects_bad_secret_without_finalizing() -> None:
 
     assert response.status_code == 403
     assert response.json() == {"detail": "forbidden"}
+    assert store.finished == []
+
+
+def test_configured_webhook_rejects_bad_secret_before_reading_body() -> None:
+    store = FakeStore()
+    processor = FakeProcessor()
+    app = create_app(
+        environ={"TELEGRAM_WEBHOOK_SECRET": SECRET},
+        store=store,
+        processor=processor,
+        telegram_client=FakeTelegramClient(),
+        max_update_bytes=8,
+    )
+
+    response = TestClient(app).post(
+        "/api/telegram/webhook",
+        headers={
+            "X-Telegram-Bot-Api-Secret-Token": "wrong",
+            "Content-Type": "application/json",
+        },
+        content=b'{"update_id":123456789}',
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "forbidden"}
+    assert processor.calls == []
     assert store.finished == []
 
 

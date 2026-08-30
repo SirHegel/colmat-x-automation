@@ -34,6 +34,18 @@ DEFAULT_MINIMAX_IMAGE_MODEL = "image-01"
 MAX_IMAGE_PROMPT_CHARACTERS = 1_500
 MAX_ALT_TEXT_CHARACTERS = 1_000
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_DRAFT_VALIDATION_ATTEMPTS = 2
+
+_DRAFT_CROSS_FIELD_RULES = (
+    "Invariantes obligatorias del objeto: copia dentro de texto el valor completo de cifra y el "
+    "valor completo de fuente, exactamente con los mismos caracteres, sin convertir dígitos a "
+    "palabras, resumir ni abreviar; si visual.tipo='ninguna', visual.colores debe ser []; "
+    "si visual.tipo no es 'ninguna', visual.colores debe incluir al menos un color permitido; "
+    "fuera de categoria='lamina', visual.serie_completa=false y visual.eje_truncado=false; "
+    "si categoria='lamina', visual.tipo='grafica', visual.serie_completa=true y "
+    "visual.eje_truncado=false; si categoria='ficha_territorio', "
+    "visual.tipo='ficha_territorio'. Revisa todas las invariantes antes de llamar la herramienta."
+)
 
 IMAGE_ASPECT_RATIO_DIMENSIONS: dict[str, tuple[int, int]] = {
     "1:1": (1024, 1024),
@@ -150,30 +162,52 @@ class MiniMaxClient:
             category=category,
             institution=institution,
         )
-        request_body = {
-            "model": self.model,
-            "messages": messages,
-            "tools": [build_editorial_draft_tool(policy)],
-            "tool_choice": "auto",
-            "reasoning_split": True,
-            "stream": False,
-            "temperature": 0.2,
-            "max_completion_tokens": self.max_completion_tokens,
-        }
-        response = self._post_json(
-            MINIMAX_CHAT_COMPLETIONS_ENDPOINT,
-            request_body,
-            read_timeout=self.read_timeout_seconds,
-        )
-        arguments = _extract_draft_arguments(response)
-        try:
-            draft = validate_ai_draft(arguments, policy)
-        except EditorialValidationError as exc:
-            raise MiniMaxResponseError(f"MiniMax devolvió un borrador inválido: {exc}") from exc
-        if category is not None and draft.categoria.value != str(category):
-            raise MiniMaxResponseError("MiniMax no respetó la categoría editorial solicitada")
-        if institution is not None and draft.institucion.value != str(institution):
-            raise MiniMaxResponseError("MiniMax no respetó la institución solicitada")
+        messages[0]["content"] = f"{messages[0]['content']}\n{_DRAFT_CROSS_FIELD_RULES}"
+        tool = build_editorial_draft_tool(policy)
+        response: dict[str, Any] | None = None
+        draft: EditorialDraft | None = None
+        draft_error: MiniMaxResponseError | EditorialValidationError | None = None
+        for attempt in range(MAX_DRAFT_VALIDATION_ATTEMPTS):
+            response = self._post_json(
+                MINIMAX_CHAT_COMPLETIONS_ENDPOINT,
+                _draft_request_body(
+                    model=self.model,
+                    messages=messages,
+                    tool=tool,
+                    max_completion_tokens=self.max_completion_tokens,
+                ),
+                read_timeout=self.read_timeout_seconds,
+            )
+            arguments: Mapping[str, Any] | None = None
+            try:
+                arguments = _extract_draft_arguments(response)
+                candidate = validate_ai_draft(arguments, policy)
+                if category is not None and candidate.categoria.value != str(category):
+                    raise MiniMaxResponseError(
+                        "MiniMax no respetó la categoría editorial solicitada"
+                    )
+                if institution is not None and candidate.institucion.value != str(institution):
+                    raise MiniMaxResponseError("MiniMax no respetó la institución solicitada")
+            except (MiniMaxResponseError, EditorialValidationError) as exc:
+                draft_error = exc
+                if attempt + 1 == MAX_DRAFT_VALIDATION_ATTEMPTS:
+                    break
+                messages = _draft_repair_messages(
+                    messages,
+                    response,
+                    exc,
+                    arguments=arguments,
+                )
+                continue
+            draft = candidate
+            break
+        if draft is None:
+            assert draft_error is not None
+            if isinstance(draft_error, EditorialValidationError):
+                raise MiniMaxResponseError(
+                    f"MiniMax devolvió un borrador inválido: {draft_error}"
+                ) from draft_error
+            raise draft_error
         return draft
 
     def generate_image(
@@ -284,6 +318,94 @@ class MiniMaxClient:
         return payload
 
 
+def _draft_request_body(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tool: Mapping[str, Any],
+    max_completion_tokens: int,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": messages,
+        "tools": [tool],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": DRAFT_TOOL_NAME},
+        },
+        "reasoning_split": True,
+        "stream": False,
+        "temperature": 0.2,
+        "max_completion_tokens": max_completion_tokens,
+    }
+
+
+def _draft_repair_messages(
+    original: list[dict[str, Any]],
+    response: Mapping[str, Any],
+    error: MiniMaxResponseError | EditorialValidationError,
+    *,
+    arguments: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Conserva la cadena M2.7 al reparar una salida, sin ejecutar ninguna herramienta."""
+
+    feedback_payload: dict[str, Any] = {
+        "accepted": False,
+        "validation_error": str(error)[:500],
+        "instruction": (
+            "Corrige el objeto completo y vuelve a llamar exactamente la misma herramienta. "
+            "Copia literalmente en texto los valores completos de cifra y fuente, sin "
+            "abreviarlos ni reformularlos. No inventes cifras ni fuentes y respeta todas las "
+            "invariantes del sistema."
+        ),
+    }
+    if arguments is not None:
+        literal_values = {
+            field: value[:limit]
+            for field, limit in (("cifra", 80), ("fuente", 200))
+            if isinstance((value := arguments.get(field)), str) and value
+        }
+        if literal_values:
+            feedback_payload["texto_debe_contener_literalmente"] = literal_values
+    feedback = json.dumps(
+        feedback_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    choices = response.get("choices")
+    if isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], Mapping):
+        message = choices[0].get("message")
+        if isinstance(message, Mapping) and message.get("role") == "assistant":
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and len(tool_calls) == 1:
+                tool_call = tool_calls[0]
+                if isinstance(tool_call, Mapping):
+                    tool_call_id = tool_call.get("id")
+                    if isinstance(tool_call_id, str) and tool_call_id:
+                        return [
+                            *original,
+                            dict(message),
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": feedback,
+                            },
+                        ]
+    # Una respuesta heredada sin id de tool call no puede formar una conversación
+    # OpenAI válida. El reintento conserva el encargo original y solo agrega el
+    # diagnóstico local; nunca inventa ni ejecuta un identificador de herramienta.
+    return [
+        *original,
+        {
+            "role": "user",
+            "content": (
+                "El candidato anterior fue rechazado por el validador local. "
+                f"Diagnóstico: {str(error)[:500]}. Genera un objeto nuevo y corregido."
+            ),
+        },
+    ]
+
+
 def validate_alt_text(value: str | None) -> str | None:
     if value is None:
         return None
@@ -335,6 +457,8 @@ def _extract_draft_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     fence = _JSON_FENCE_PATTERN.fullmatch(content)
     if fence:
         content = fence.group(1)
+    elif not content.startswith("{"):
+        raise MiniMaxResponseError("MiniMax no hizo la llamada de herramienta requerida")
     return _load_strict_json_object(content)
 
 

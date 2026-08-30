@@ -31,7 +31,8 @@ Telegram puede consultar y registrar decisiones, pero no crea usuarios ni llama 
   deterministas de un OpenClaw aislado en un host persistente.
 - Carga de hasta cuatro imágenes en X, texto alternativo obligatorio y marca `made_with_ai` para
   media generada con IA.
-- FastAPI con `/api/health`, `/api/ready` y `/api/telegram/webhook`, desplegable en Vercel.
+- Panel FastAPI desplegable en Vercel con acceso passwordless por Telegram, gestión de equipo,
+  agenda, generación y revisión; además de `/api/health`, `/api/ready` y el webhook.
 
 No automatiza respuestas, mensajes directos, likes, follows, tendencias, scraping ni segmentación
 de personas. Tampoco promete viralidad: la rúbrica de engagement compara claridad, cifra temprana,
@@ -147,6 +148,11 @@ preparar la entrega y solo existen en memoria y en el mensaje de Telegram; la ba
 hashes.
 `publication-run` consume por separado la cola aprobada de `/publicar` con lease, fence,
 idempotencia y los gates de X. El webhook no contiene credenciales de MiniMax ni de X.
+
+El panel web usa el mismo binding `control` para enviar un código de ocho dígitos por Telegram.
+Solo conserva HMAC de códigos, sesiones y CSRF; los códigos duran cinco minutos y las sesiones se
+revalidan contra usuario activo, membresía, rol y binding en cada solicitud. `SirHegel` puede crear
+cuentas desde `/app`; cada nueva identidad debe vincularse a su propio Telegram antes de entrar.
 
 ## Agenda y automatización programada
 
@@ -440,8 +446,9 @@ Las unidades `deploy/systemd/` pertenecen al flujo YAML heredado `run-due`; no i
 ## FastAPI, PostgreSQL y Vercel
 
 SQLite no es almacenamiento persistente válido en Vercel. Conecta un PostgreSQL serverless (por
-ejemplo Neon) y define `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` y `TELEGRAM_WEBHOOK_SECRET` como
-secretos del proyecto. No definas `MINIMAX_API_KEY` ni credenciales `X_*` en Vercel: `/generar`
+ejemplo Neon) y define `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` y un
+`WEB_AUTH_PEPPER` aleatorio de al menos 32 caracteres como secretos del proyecto. No definas
+`MINIMAX_API_KEY` ni credenciales `X_*` en Vercel: `/generar`
 solo encola y los workers persistentes atienden ambas integraciones. Vercel no crea ni migra el
 esquema: aplícalo de forma explícita antes del despliegue y usa readiness para verificar que la
 versión requerida ya existe. Despliega después de ejecutar la suite:
@@ -453,6 +460,10 @@ vercel --prod
 curl -fsS https://TU_DOMINIO/api/health
 curl -fsS https://TU_DOMINIO/api/ready
 ```
+
+La raíz redirige a `/login`; después del código de Telegram, `/app` muestra el centro de
+operaciones. Todas las mutaciones exigen cookie segura, CSRF, origen del mismo host y permisos
+RBAC; FastAPI solo encola trabajo y nunca llama a MiniMax o X durante la solicitud.
 
 Solo cuando `ready` responda `200`, registra en BotFather/API de Telegram la URL HTTPS
 `https://TU_DOMINIO/api/telegram/webhook` con el mismo secreto. Vercel aloja el plano de control y

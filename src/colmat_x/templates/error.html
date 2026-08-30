@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title|default("No pudimos completar la acción", true) }} · Colmat{% endblock %}
+{% block body_class %}error-page{% endblock %}
+
+{% block body %}
+  <main class="error-shell" id="contenido">
+    <a class="brand" href="/" aria-label="Colmat, inicio">
+      <span class="brand__mark" aria-hidden="true">C</span>
+      <span class="brand__copy">
+        <strong>COLMAT</strong>
+        <small>Materialismo colombiano</small>
+      </span>
+    </a>
+    <section class="error-card" aria-labelledby="error-heading">
+      <span class="error-code" aria-label="Código de estado {{ status|default(500) }}">
+        {{ status|default(500) }}
+      </span>
+      <p class="eyebrow">Algo interrumpió el proceso</p>
+      <h1 id="error-heading">{{ title|default("No pudimos completar la acción", true) }}</h1>
+      <p>{{ message|default("Inténtalo de nuevo. Si el problema continúa, comunícate con el administrador del equipo.", true) }}</p>
+      <a class="button button--primary" href="{{ back_url|default('/', true) }}">
+        Volver a un lugar seguro
+      </a>
+    </section>
+  </main>
+{% endblock %}

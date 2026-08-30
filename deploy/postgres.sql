@@ -1066,4 +1066,307 @@ CREATE INDEX IF NOT EXISTS ix_audit_workspace_sequence
 CREATE INDEX IF NOT EXISTS ix_audit_entity
     ON audit_events(entity_type, entity_id);
 
+-- Autenticación web passwordless. Los identificadores, IP, códigos y tokens
+-- se conservan exclusivamente como HMAC-SHA256 (64 caracteres hexadecimales).
+CREATE TABLE IF NOT EXISTS web_auth_challenges (
+    id VARCHAR(36) PRIMARY KEY,
+    workspace_id VARCHAR(80) NOT NULL,
+    identifier_hash VARCHAR(64) NOT NULL,
+    ip_hash VARCHAR(64) NOT NULL,
+    code_hash VARCHAR(64) NOT NULL,
+    user_id VARCHAR(36),
+    membership_id VARCHAR(36),
+    telegram_binding_id VARCHAR(36),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    CONSTRAINT fk_web_auth_challenges_user
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_web_auth_challenges_membership
+        FOREIGN KEY (membership_id) REFERENCES memberships(id) ON DELETE CASCADE,
+    CONSTRAINT fk_web_auth_challenges_telegram_binding
+        FOREIGN KEY (telegram_binding_id) REFERENCES telegram_bindings(id) ON DELETE CASCADE,
+    CONSTRAINT ck_web_auth_challenges_identifier_hash
+        CHECK (identifier_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_web_auth_challenges_ip_hash
+        CHECK (ip_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_web_auth_challenges_code_hash
+        CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_web_auth_challenges_attempt_count
+        CHECK (attempt_count BETWEEN 0 AND 5),
+    CONSTRAINT ck_web_auth_challenges_expiry
+        CHECK (expires_at > created_at),
+    CONSTRAINT ck_web_auth_challenges_consumed_at
+        CHECK (consumed_at IS NULL OR consumed_at >= created_at),
+    CONSTRAINT ck_web_auth_challenges_identity_state CHECK (
+        (
+            user_id IS NULL
+            AND membership_id IS NULL
+            AND telegram_binding_id IS NULL
+        ) OR (
+            user_id IS NOT NULL
+            AND membership_id IS NOT NULL
+            AND telegram_binding_id IS NOT NULL
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_web_auth_challenges_rate_limit
+    ON web_auth_challenges(workspace_id, identifier_hash, ip_hash, created_at);
+CREATE INDEX IF NOT EXISTS ix_web_auth_challenges_identifier_rate
+    ON web_auth_challenges(workspace_id, identifier_hash, created_at);
+CREATE INDEX IF NOT EXISTS ix_web_auth_challenges_ip_rate
+    ON web_auth_challenges(workspace_id, ip_hash, created_at);
+CREATE INDEX IF NOT EXISTS ix_web_auth_challenges_expiry
+    ON web_auth_challenges(expires_at);
+
+CREATE TABLE IF NOT EXISTS web_auth_sessions (
+    id VARCHAR(36) PRIMARY KEY,
+    workspace_id VARCHAR(80) NOT NULL,
+    user_id VARCHAR(36) NOT NULL,
+    membership_id VARCHAR(36) NOT NULL,
+    token_hash VARCHAR(64) NOT NULL,
+    csrf_hash VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    absolute_expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    CONSTRAINT fk_web_auth_sessions_user
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_web_auth_sessions_membership
+        FOREIGN KEY (membership_id) REFERENCES memberships(id) ON DELETE CASCADE,
+    CONSTRAINT uq_web_auth_sessions_token_hash UNIQUE (token_hash),
+    CONSTRAINT ck_web_auth_sessions_token_hash
+        CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_web_auth_sessions_csrf_hash
+        CHECK (csrf_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_web_auth_sessions_absolute_expiry
+        CHECK (absolute_expires_at > created_at),
+    CONSTRAINT ck_web_auth_sessions_last_seen CHECK (
+        last_seen_at >= created_at AND last_seen_at <= absolute_expires_at
+    ),
+    CONSTRAINT ck_web_auth_sessions_revoked_at
+        CHECK (revoked_at IS NULL OR revoked_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS ix_web_auth_sessions_user_active
+    ON web_auth_sessions(user_id, revoked_at);
+CREATE INDEX IF NOT EXISTS ix_web_auth_sessions_expiry
+    ON web_auth_sessions(absolute_expires_at);
+
+-- `CREATE TABLE IF NOT EXISTS` no agrega constraints a una instalación parcial.
+-- Estas guardas hacen que la migración sea repetible también en ese escenario.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_web_auth_challenges_user'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT fk_web_auth_challenges_user
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_web_auth_challenges_membership'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT fk_web_auth_challenges_membership
+            FOREIGN KEY (membership_id) REFERENCES memberships(id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_web_auth_challenges_telegram_binding'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT fk_web_auth_challenges_telegram_binding
+            FOREIGN KEY (telegram_binding_id) REFERENCES telegram_bindings(id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_identifier_hash'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_identifier_hash
+            CHECK (identifier_hash ~ '^[0-9a-f]{64}$');
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_ip_hash'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_ip_hash
+            CHECK (ip_hash ~ '^[0-9a-f]{64}$');
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_code_hash'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_code_hash
+            CHECK (code_hash ~ '^[0-9a-f]{64}$');
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_attempt_count'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_attempt_count
+            CHECK (attempt_count BETWEEN 0 AND 5);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_expiry'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_expiry
+            CHECK (expires_at > created_at);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_consumed_at'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_consumed_at
+            CHECK (consumed_at IS NULL OR consumed_at >= created_at);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_challenges_identity_state'
+          AND conrelid = 'web_auth_challenges'::regclass
+    ) THEN
+        ALTER TABLE web_auth_challenges
+            ADD CONSTRAINT ck_web_auth_challenges_identity_state CHECK (
+                (user_id IS NULL AND membership_id IS NULL AND telegram_binding_id IS NULL)
+                OR
+                (user_id IS NOT NULL AND membership_id IS NOT NULL
+                    AND telegram_binding_id IS NOT NULL)
+            );
+    END IF;
+END
+$$;
+
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT fk_web_auth_challenges_user;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT fk_web_auth_challenges_membership;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT fk_web_auth_challenges_telegram_binding;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_identifier_hash;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_ip_hash;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_code_hash;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_attempt_count;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_expiry;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_consumed_at;
+ALTER TABLE web_auth_challenges
+    VALIDATE CONSTRAINT ck_web_auth_challenges_identity_state;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_web_auth_sessions_user'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT fk_web_auth_sessions_user
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_web_auth_sessions_membership'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT fk_web_auth_sessions_membership
+            FOREIGN KEY (membership_id) REFERENCES memberships(id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'uq_web_auth_sessions_token_hash'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT uq_web_auth_sessions_token_hash UNIQUE (token_hash);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_sessions_token_hash'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT ck_web_auth_sessions_token_hash
+            CHECK (token_hash ~ '^[0-9a-f]{64}$');
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_sessions_csrf_hash'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT ck_web_auth_sessions_csrf_hash
+            CHECK (csrf_hash ~ '^[0-9a-f]{64}$');
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_sessions_absolute_expiry'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT ck_web_auth_sessions_absolute_expiry
+            CHECK (absolute_expires_at > created_at);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_sessions_last_seen'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT ck_web_auth_sessions_last_seen CHECK (
+                last_seen_at >= created_at AND last_seen_at <= absolute_expires_at
+            );
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_web_auth_sessions_revoked_at'
+          AND conrelid = 'web_auth_sessions'::regclass
+    ) THEN
+        ALTER TABLE web_auth_sessions
+            ADD CONSTRAINT ck_web_auth_sessions_revoked_at
+            CHECK (revoked_at IS NULL OR revoked_at >= created_at);
+    END IF;
+END
+$$;
+
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT fk_web_auth_sessions_user;
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT fk_web_auth_sessions_membership;
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT ck_web_auth_sessions_token_hash;
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT ck_web_auth_sessions_csrf_hash;
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT ck_web_auth_sessions_absolute_expiry;
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT ck_web_auth_sessions_last_seen;
+ALTER TABLE web_auth_sessions
+    VALIDATE CONSTRAINT ck_web_auth_sessions_revoked_at;
+
 COMMIT;

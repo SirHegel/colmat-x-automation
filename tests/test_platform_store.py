@@ -178,6 +178,8 @@ def test_schema_contains_all_platform_tables() -> None:
         "telegram_bindings",
         "telegram_updates",
         "users",
+        "web_auth_challenges",
+        "web_auth_sessions",
     }
     assert set(Base.metadata.tables) == set(table_names())
 
@@ -1552,6 +1554,81 @@ def test_admin_cannot_promote_admin_or_remove_owner(store) -> None:
         store.grant_membership(candidate.id, Role.ADMIN, actor_id=admin.id, now=NOW)
     with pytest.raises(AuthorizationError, match="owners"):
         store.revoke_membership(owner.id, actor_id=admin.id, now=NOW)
+
+
+def test_create_team_member_is_atomic_and_enforces_role_hierarchy(store) -> None:
+    owner, _ = store.bootstrap_owner(email="owner@colmat.test", display_name="Owner", now=NOW)
+    admin = add_member(store, owner.id, Role.ADMIN, 1)
+
+    editor, membership = store.create_team_member(
+        actor_id=admin.id,
+        email="new-editor@colmat.test",
+        username="new.editor",
+        display_name="New Editor",
+        role=Role.EDITOR,
+        now=NOW,
+    )
+
+    assert editor.email == "new-editor@colmat.test"
+    assert editor.username == "new.editor"
+    assert membership.user_id == editor.id
+    assert membership.role_value is Role.EDITOR
+
+    with pytest.raises(AuthorizationError, match="no puede asignar"):
+        store.create_team_member(
+            actor_id=admin.id,
+            email="forbidden-admin@colmat.test",
+            display_name="Forbidden Admin",
+            role=Role.ADMIN,
+            now=NOW,
+        )
+
+    # La identidad tampoco queda huérfana cuando falla la asignación de rol.
+    recovered = store.create_user(
+        actor_id=owner.id,
+        email="forbidden-admin@colmat.test",
+        display_name="Recovered",
+        now=NOW,
+    )
+    assert recovered.email == "forbidden-admin@colmat.test"
+
+
+def test_telegram_binding_cannot_impersonate_higher_roles_or_transfer_identity(store) -> None:
+    owner, editor, reviewer, _publisher, _auditor = bootstrap_team(store)
+    admin = add_member(store, owner.id, Role.ADMIN, 2)
+
+    with pytest.raises(AuthorizationError, match="owners"):
+        store.bind_telegram_chat(
+            9001,
+            telegram_user_id=9001,
+            actor_id=admin.id,
+            user_id=owner.id,
+            now=NOW,
+        )
+    with pytest.raises(AuthorizationError, match="Solo el owner"):
+        store.bind_telegram_chat(
+            9002,
+            telegram_user_id=9002,
+            actor_id=admin.id,
+            user_id=reviewer.id,
+            now=NOW,
+        )
+
+    store.bind_telegram_chat(
+        9003,
+        telegram_user_id=9003,
+        actor_id=owner.id,
+        user_id=reviewer.id,
+        now=NOW,
+    )
+    with pytest.raises(ConflictError, match="no se transfiere"):
+        store.bind_telegram_chat(
+            9003,
+            telegram_user_id=9003,
+            actor_id=owner.id,
+            user_id=editor.id,
+            now=NOW,
+        )
 
 
 def test_last_owner_is_protected(store) -> None:
