@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import os
 import re
-import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -13,11 +11,8 @@ import requests
 
 TELEGRAM_API_ROOT = "https://api.telegram.org"
 DEFAULT_TOKEN_ENVIRONMENT_VARIABLE = "TELEGRAM_BOT_TOKEN"
-DEFAULT_TOKEN_FILE_ENVIRONMENT_VARIABLE = "TELEGRAM_BOT_TOKEN_FILE"
-MAX_TOKEN_FILE_BYTES = 1024
 _COMMAND_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 _WEBHOOK_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
-_TOKEN_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class TelegramConfigurationError(ValueError):
@@ -59,32 +54,15 @@ class TelegramCredentials:
         cls,
         variable: str = DEFAULT_TOKEN_ENVIRONMENT_VARIABLE,
         *,
-        file_variable: str = DEFAULT_TOKEN_FILE_ENVIRONMENT_VARIABLE,
-        token_directory: str | Path | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> TelegramCredentials:
-        if not isinstance(variable, str) or not variable or not isinstance(file_variable, str):
+        if not isinstance(variable, str) or not variable:
             raise TelegramConfigurationError("El nombre de la variable del token no es válido")
-        if not file_variable:
-            raise TelegramConfigurationError("El nombre de la variable del archivo no es válido")
         source = os.environ if environ is None else environ
         raw_token = source.get(variable, "")
-        raw_file = source.get(file_variable, "")
         token = raw_token.strip() if isinstance(raw_token, str) else ""
-        token_file = raw_file.strip() if isinstance(raw_file, str) else ""
-        if token and token_file:
-            raise TelegramConfigurationError(
-                f"{variable} y {file_variable} son mutuamente excluyentes"
-            )
-        if token_file:
-            token = _read_token_file(
-                Path(token_directory) if token_directory is not None else Path.cwd() / ".state",
-                _safe_token_filename(token_file),
-            )
         if not token:
-            raise TelegramConfigurationError(
-                f"Falta la credencial requerida: {variable} o {file_variable}"
-            )
+            raise TelegramConfigurationError(f"Falta la credencial requerida: {variable}")
         return cls(token=token)
 
 
@@ -386,73 +364,6 @@ def _validate_webhook_url(url: object) -> None:
         raise ValueError(
             "La URL del webhook debe ser HTTPS y no contener credenciales ni fragmentos"
         )
-
-
-def _safe_token_filename(raw_path: str) -> str:
-    """Reduce la entrada de entorno a un nombre, nunca a una expresión de ruta."""
-
-    normalized = raw_path.replace("\\", "/")
-    filename = os.path.basename(normalized)
-    if _TOKEN_FILE_NAME_PATTERN.fullmatch(filename) is None or normalized not in {
-        filename,
-        f".state/{filename}",
-    }:
-        raise TelegramConfigurationError(
-            "TELEGRAM_BOT_TOKEN_FILE solo admite un nombre dentro de .state"
-        )
-    return filename
-
-
-def _read_token_file(token_directory: Path, filename: str) -> str:
-    path = token_directory / filename
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        raise TelegramConfigurationError(
-            "No se pudo abrir TELEGRAM_BOT_TOKEN_FILE como archivo regular seguro"
-        ) from None
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise TelegramConfigurationError("TELEGRAM_BOT_TOKEN_FILE debe ser un archivo regular")
-        if stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise TelegramConfigurationError("TELEGRAM_BOT_TOKEN_FILE debe tener permisos 0600")
-        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-            raise TelegramConfigurationError(
-                "TELEGRAM_BOT_TOKEN_FILE debe pertenecer al usuario actual"
-            )
-        if metadata.st_size > MAX_TOKEN_FILE_BYTES:
-            raise TelegramConfigurationError("TELEGRAM_BOT_TOKEN_FILE es demasiado grande")
-        chunks: list[bytes] = []
-        remaining = MAX_TOKEN_FILE_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw_token = b"".join(chunks)
-    except OSError:
-        raise TelegramConfigurationError("No se pudo leer TELEGRAM_BOT_TOKEN_FILE") from None
-    finally:
-        os.close(descriptor)
-    if len(raw_token) > MAX_TOKEN_FILE_BYTES:
-        raise TelegramConfigurationError("TELEGRAM_BOT_TOKEN_FILE es demasiado grande")
-    try:
-        token = raw_token.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        raise TelegramConfigurationError(
-            "TELEGRAM_BOT_TOKEN_FILE debe contener texto UTF-8"
-        ) from None
-    if not token:
-        raise TelegramConfigurationError("TELEGRAM_BOT_TOKEN_FILE está vacío")
-    return token
 
 
 def _retry_after(parameters: object) -> int | None:

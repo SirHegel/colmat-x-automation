@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -72,65 +70,6 @@ def test_missing_environment_token_has_a_nonsecret_error() -> None:
         TelegramCredentials.from_environment(environ={})
 
     assert TOKEN not in str(captured.value)
-
-
-def test_credentials_can_be_loaded_from_a_private_token_file(tmp_path: Path) -> None:
-    token_file = tmp_path / "telegram.token"
-    token_file.write_text(TOKEN + "\n", encoding="utf-8")
-    token_file.chmod(0o600)
-
-    credentials = TelegramCredentials.from_environment(
-        environ={"TELEGRAM_BOT_TOKEN_FILE": token_file.name},
-        token_directory=tmp_path,
-    )
-
-    assert credentials.token == TOKEN
-    assert TOKEN not in repr(credentials)
-
-
-def test_token_value_and_file_are_mutually_exclusive(tmp_path: Path) -> None:
-    token_file = tmp_path / "telegram.token"
-    token_file.write_text(TOKEN, encoding="utf-8")
-    token_file.chmod(0o600)
-
-    with pytest.raises(TelegramConfigurationError, match="mutuamente excluyentes"):
-        TelegramCredentials.from_environment(
-            environ={
-                "TELEGRAM_BOT_TOKEN": TOKEN,
-                "TELEGRAM_BOT_TOKEN_FILE": token_file.name,
-            },
-            token_directory=tmp_path,
-        )
-
-
-def test_token_file_rejects_open_permissions_and_symbolic_links(tmp_path: Path) -> None:
-    token_file = tmp_path / "telegram.token"
-    token_file.write_text(TOKEN, encoding="utf-8")
-    token_file.chmod(0o644)
-
-    with pytest.raises(TelegramConfigurationError, match="0600"):
-        TelegramCredentials.from_environment(
-            environ={"TELEGRAM_BOT_TOKEN_FILE": token_file.name},
-            token_directory=tmp_path,
-        )
-
-    token_file.chmod(0o600)
-    link = tmp_path / "telegram-link.token"
-    os.symlink(token_file, link)
-    with pytest.raises(TelegramConfigurationError, match="archivo regular seguro"):
-        TelegramCredentials.from_environment(
-            environ={"TELEGRAM_BOT_TOKEN_FILE": link.name},
-            token_directory=tmp_path,
-        )
-
-
-@pytest.mark.parametrize(
-    "unsafe_path",
-    ("../telegram.token", "/tmp/telegram.token", ".state/../telegram.token", "folder/token"),
-)
-def test_token_file_rejects_path_expressions(unsafe_path: str) -> None:
-    with pytest.raises(TelegramConfigurationError, match="solo admite un nombre"):
-        TelegramCredentials.from_environment(environ={"TELEGRAM_BOT_TOKEN_FILE": unsafe_path})
 
 
 def test_client_requires_a_credential_container() -> None:
