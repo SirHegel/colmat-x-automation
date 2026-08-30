@@ -19,6 +19,7 @@ class Role(StrEnum):
     EDITOR = "editor"
     REVIEWER = "reviewer"
     PUBLISHER = "publisher"
+    SCHEDULER = "scheduler"
     AUDITOR = "auditor"
 
 
@@ -35,6 +36,9 @@ class Permission(StrEnum):
     REVIEW_DRAFTS = "drafts:review"
     PUBLISH_DRAFTS = "drafts:publish"
     MANAGE_MEDIA = "media:manage"
+    VIEW_AUTOMATION = "automation:view"
+    MANAGE_SCHEDULE = "automation:schedule:manage"
+    MANAGE_AUTOMATION_MODE = "automation:mode:manage"
     VIEW_TELEGRAM = "telegram:view"
     MANAGE_TELEGRAM = "telegram:manage"
     VIEW_AUDIT = "audit:view"
@@ -57,6 +61,7 @@ ROLE_PERMISSIONS: Mapping[Role, frozenset[Permission]] = MappingProxyType(
                 Permission.EDIT_DRAFTS,
                 Permission.SUBMIT_DRAFTS,
                 Permission.MANAGE_MEDIA,
+                Permission.VIEW_AUTOMATION,
                 Permission.VIEW_TELEGRAM,
             }
         ),
@@ -65,6 +70,7 @@ ROLE_PERMISSIONS: Mapping[Role, frozenset[Permission]] = MappingProxyType(
                 Permission.VIEW_WORKSPACE,
                 Permission.VIEW_DRAFTS,
                 Permission.REVIEW_DRAFTS,
+                Permission.VIEW_AUTOMATION,
                 Permission.VIEW_TELEGRAM,
             }
         ),
@@ -73,6 +79,20 @@ ROLE_PERMISSIONS: Mapping[Role, frozenset[Permission]] = MappingProxyType(
                 Permission.VIEW_WORKSPACE,
                 Permission.VIEW_DRAFTS,
                 Permission.PUBLISH_DRAFTS,
+                Permission.VIEW_AUTOMATION,
+                Permission.VIEW_TELEGRAM,
+            }
+        ),
+        Role.SCHEDULER: frozenset(
+            {
+                Permission.VIEW_WORKSPACE,
+                Permission.VIEW_DRAFTS,
+                Permission.CREATE_DRAFTS,
+                Permission.EDIT_DRAFTS,
+                Permission.SUBMIT_DRAFTS,
+                Permission.MANAGE_MEDIA,
+                Permission.VIEW_AUTOMATION,
+                Permission.MANAGE_SCHEDULE,
                 Permission.VIEW_TELEGRAM,
             }
         ),
@@ -80,6 +100,7 @@ ROLE_PERMISSIONS: Mapping[Role, frozenset[Permission]] = MappingProxyType(
             {
                 Permission.VIEW_WORKSPACE,
                 Permission.VIEW_DRAFTS,
+                Permission.VIEW_AUTOMATION,
                 Permission.VIEW_TELEGRAM,
                 Permission.VIEW_AUDIT,
             }
@@ -92,10 +113,13 @@ ROLE_PERMISSIONS: Mapping[Role, frozenset[Permission]] = MappingProxyType(
 ASSIGNABLE_ROLES: Mapping[Role, frozenset[Role]] = MappingProxyType(
     {
         Role.OWNER: frozenset(Role),
-        Role.ADMIN: frozenset({Role.EDITOR, Role.REVIEWER, Role.PUBLISHER, Role.AUDITOR}),
+        Role.ADMIN: frozenset(
+            {Role.EDITOR, Role.REVIEWER, Role.PUBLISHER, Role.SCHEDULER, Role.AUDITOR}
+        ),
         Role.EDITOR: frozenset(),
         Role.REVIEWER: frozenset(),
         Role.PUBLISHER: frozenset(),
+        Role.SCHEDULER: frozenset(),
         Role.AUDITOR: frozenset(),
     }
 )

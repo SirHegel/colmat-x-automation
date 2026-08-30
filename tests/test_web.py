@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect
 
-from colmat_x.platform_store import ConflictError
+from colmat_x.platform_store import ConflictError, PlatformStore
+from colmat_x.rbac import Role
 from colmat_x.telegram_bot import (
+    BotAutomationMode,
     SendMessage,
     WebhookAuthenticationError,
     WebhookResult,
@@ -34,6 +38,7 @@ class FakeStore:
 @dataclass
 class FakeProcessor:
     duplicate: bool = False
+    retryable: bool = False
     actions: tuple[object, ...] = ()
     error: Exception | None = None
     calls: list[tuple[object, str | None]] = field(default_factory=list)
@@ -49,6 +54,7 @@ class FakeProcessor:
             update_id=payload["update_id"],
             duplicate=self.duplicate,
             actions=self.actions,
+            retryable=self.retryable,
         )
 
 
@@ -127,10 +133,49 @@ def test_ready_is_503_when_vercel_configuration_is_missing() -> None:
     assert response.status_code == 503
     assert response.json()["status"] == "not_ready"
     assert response.json()["checks"] == {
+        "worker_secrets": "ok",
         "telegram_webhook_secret": "missing",
         "telegram_bot_token": "missing",
         "database": "missing",
     }
+
+
+@pytest.mark.parametrize(
+    "variable_name",
+    (
+        "MINIMAX_API_KEY",
+        "X_CONSUMER_KEY",
+        "X_CONSUMER_SECRET",
+        "X_ACCESS_TOKEN",
+        "X_ACCESS_TOKEN_SECRET",
+        "EXPECTED_X_USER_ID",
+        "EXPECTED_X_USERNAME",
+    ),
+)
+def test_ready_rejects_privileged_worker_environment_on_vercel(
+    variable_name: str,
+) -> None:
+    secret = f"sensitive-{variable_name.lower()}"
+    app = create_app(
+        environ={"VERCEL": "1", variable_name: secret},
+        store=FakeStore(),
+        processor=FakeProcessor(),
+        telegram_client=FakeTelegramClient(),
+    )
+
+    response = TestClient(app).get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "checks": {
+            "worker_secrets": "error",
+            "telegram_webhook_secret": "ok",
+            "telegram_bot_token": "ok",
+            "database": "ok",
+        },
+    }
+    assert secret not in response.text
 
 
 def test_webhook_processes_executes_and_finalizes_update() -> None:
@@ -246,6 +291,23 @@ def test_delivery_failure_returns_503_and_marks_claimed_update_failed() -> None:
     assert "transport included secret" not in response.text
 
 
+def test_active_duplicate_claim_returns_503_so_telegram_retries_later() -> None:
+    client, store, _, telegram = make_client(
+        processor=FakeProcessor(duplicate=True, retryable=True)
+    )
+
+    response = client.post(
+        "/api/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
+        json={"update_id": 78},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "service unavailable"}
+    assert store.finished == []
+    assert telegram.sent == []
+
+
 def test_processing_failure_after_claim_is_finalized_when_record_exists() -> None:
     processor = FakeProcessor(error=RuntimeError("database failed"))
     client, store, _, _ = make_client(processor=processor)
@@ -338,6 +400,59 @@ class FakeEditorialStore:
         self.rejected.append((post_id, actor_id, expected_snapshot_hash, reason))
 
 
+class FakeAutomationTelegramStore(FakeEditorialStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings = SimpleNamespace(
+            enabled=True,
+            mode="human_review",
+            timezone="America/Bogota",
+            slots=[{"id": "manana", "at": "08:30", "mode": "human_review"}],
+            version=3,
+        )
+        self.mode_changes: list[tuple[str, int, object, list[dict[str, object]]]] = []
+        self.generation_requests: list[dict[str, object]] = []
+        self.generation_error = False
+        self.publication_requests: list[dict[str, object]] = []
+
+    def get_automation_settings(self, *, actor_id: str):
+        assert actor_id == "reviewer-1"
+        return self.settings
+
+    def update_automation_settings(
+        self,
+        *,
+        actor_id: str,
+        expected_version: int,
+        mode: object,
+        slots: list[dict[str, object]],
+    ):
+        self.mode_changes.append((actor_id, expected_version, mode, slots))
+        self.settings = SimpleNamespace(
+            **{
+                **vars(self.settings),
+                "mode": getattr(mode, "value", str(mode)),
+                "slots": slots,
+                "version": expected_version + 1,
+            }
+        )
+        return self.settings
+
+    def enqueue_generation_request(self, brief: str, **kwargs):
+        if self.generation_error:
+            raise ValueError("secret should never be returned")
+        self.generation_requests.append({"brief": brief, **kwargs})
+        return SimpleNamespace(id="generation-request-1", generate_image=kwargs["generate_image"])
+
+    def get_current_revision(self, post_id: str, *, actor_id: str):
+        assert (post_id, actor_id) == ("draft-approved", "reviewer-1")
+        return SimpleNamespace(snapshot_hash="b" * 64)
+
+    def enqueue_publication_request(self, draft_id: str, **kwargs):
+        self.publication_requests.append({"draft_id": draft_id, **kwargs})
+        return SimpleNamespace(id="publication-request-1")
+
+
 def test_platform_telegram_operations_report_status_and_team() -> None:
     operations = PlatformTelegramOperations(FakeEditorialStore())
 
@@ -392,6 +507,236 @@ def test_platform_telegram_operations_review_without_publishing() -> None:
     assert rejected_conflict.accepted is False
 
 
+def test_platform_telegram_operations_expose_calendar_and_cas_mode() -> None:
+    store = FakeAutomationTelegramStore()
+    store.settings.slots = [
+        {
+            "id": "manana",
+            "at": "08:30",
+            "weekdays": ["lunes"],
+            "mode": "human_review",
+            "category": "dato_semana",
+            "evidence": {"verified": False, "reference": None},
+        },
+        {
+            "id": "tarde",
+            "at": "16:30",
+            "mode": "human_review",
+            "generate_image": True,
+        },
+    ]
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
+    )
+
+    calendar = operations.get_calendar(days=2, telegram_user_id=7, chat_id=9)
+    current = operations.get_mode(telegram_user_id=7, chat_id=9)
+    changed = operations.set_mode(
+        BotAutomationMode.DIRECT,
+        request_id="telegram:10:modo",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert "2026-08-30 08:30 — manana" not in calendar
+    assert "2026-08-31 08:30 — manana" in calendar
+    assert "2026-08-30 16:30 — tarde" in calendar
+    assert "modo human_review" in calendar
+    assert "versión 3" in current
+    assert changed.accepted is True
+    assert "versión 4" in changed.text
+    assert store.mode_changes[0][0:2] == ("reviewer-1", 3)
+    assert getattr(store.mode_changes[0][2], "value", None) == "direct"
+    assert store.mode_changes[0][3] == [
+        {
+            "id": "manana",
+            "at": "08:30",
+            "weekdays": ["lunes"],
+            "mode": "direct",
+            "category": "dato_semana",
+            "evidence": {"verified": False, "reference": None},
+        },
+        {
+            "id": "tarde",
+            "at": "16:30",
+            "mode": "direct",
+            "generate_image": True,
+        },
+    ]
+    assert store.settings.slots == store.mode_changes[0][3]
+
+
+def test_platform_telegram_mode_change_rejects_malformed_persisted_slots() -> None:
+    store = FakeAutomationTelegramStore()
+    store.settings.slots = [{"id": "manana", "mode": "human_review"}, "invalid"]
+    operations = PlatformTelegramOperations(store)
+
+    changed = operations.set_mode(
+        BotAutomationMode.DIRECT,
+        request_id="telegram:10:modo",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert changed.accepted is False
+    assert store.mode_changes == []
+    assert store.settings.mode == "human_review"
+
+
+def test_platform_telegram_mode_change_uses_real_cas_and_rbac(monkeypatch) -> None:
+    monkeypatch.setenv("COLMAT_DIRECT_PUBLISH_ENABLED", "true")
+    with PlatformStore("sqlite+pysqlite:///:memory:") as store:
+        owner, _membership = store.bootstrap_owner(
+            email="owner@web.test",
+            display_name="Owner",
+        )
+        reviewer = store.create_user(
+            actor_id=owner.id,
+            email="reviewer@web.test",
+            display_name="Reviewer",
+        )
+        store.grant_membership(reviewer.id, Role.REVIEWER, actor_id=owner.id)
+        store.bind_telegram_chat(
+            -202,
+            telegram_user_id=101,
+            actor_id=owner.id,
+            user_id=owner.id,
+        )
+        store.bind_telegram_chat(
+            -303,
+            telegram_user_id=102,
+            actor_id=owner.id,
+            user_id=reviewer.id,
+        )
+        store.update_automation_settings(
+            actor_id=owner.id,
+            expected_version=1,
+            slots=[
+                {
+                    "id": "manana",
+                    "at": "08:30",
+                    "mode": "human_review",
+                    "category": "dato_semana",
+                    "institution": "colmat",
+                    "brief": "Explica una cifra territorial con fuente primaria.",
+                    "generate_image": True,
+                    "evidence": {
+                        "verified": False,
+                        "reference": None,
+                        "expected_figure": None,
+                        "expected_source": None,
+                    },
+                }
+            ],
+        )
+        operations = PlatformTelegramOperations(store)
+
+        changed = operations.set_mode(
+            BotAutomationMode.DIRECT,
+            request_id="telegram:20:modo",
+            telegram_user_id=101,
+            chat_id=-202,
+        )
+        denied = operations.set_mode(
+            BotAutomationMode.HUMAN_REVIEW,
+            request_id="telegram:21:modo",
+            telegram_user_id=102,
+            chat_id=-303,
+        )
+        settings = store.get_automation_settings(actor_id=owner.id)
+
+    assert changed.accepted is True
+    assert denied.accepted is False
+    assert settings.mode == "direct"
+    assert settings.version == 3
+    assert settings.slots == [
+        {
+            "at": "08:30",
+            "brief": "Explica una cifra territorial con fuente primaria.",
+            "category": "dato_semana",
+            "evidence": {
+                "expected_figure": None,
+                "expected_source": None,
+                "reference": None,
+                "verified": False,
+            },
+            "generate_image": True,
+            "id": "manana",
+            "institution": "colmat",
+            "mode": "direct",
+        }
+    ]
+
+
+def test_platform_telegram_generation_only_enqueues_for_openclaw() -> None:
+    store = FakeAutomationTelegramStore()
+    operations = PlatformTelegramOperations(store, generate_images=True)
+
+    result = operations.generate_draft(
+        "Una cifra verificable",
+        request_id="telegram:11:generar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is True
+    assert "OpenClaw" in result.text
+    assert "revisión humana" in result.text
+    assert store.generation_requests == [
+        {
+            "brief": "Una cifra verificable",
+            "actor_id": "reviewer-1",
+            "telegram_user_id": 7,
+            "chat_id": 9,
+            "idempotency_key": "telegram:11:generar",
+            "generate_image": True,
+        }
+    ]
+
+
+def test_platform_telegram_publication_only_enqueues_durable_request() -> None:
+    store = FakeAutomationTelegramStore()
+    operations = PlatformTelegramOperations(store)
+
+    result = operations.request_publication(
+        "draft-approved",
+        request_id="telegram:12:publicar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is True
+    assert "publication-request-1" in result.text
+    assert "no se publicó durante el webhook" in result.text
+    assert store.publication_requests == [
+        {
+            "draft_id": "draft-approved",
+            "actor_id": "reviewer-1",
+            "expected_snapshot_hash": "b" * 64,
+            "idempotency_key": "telegram:12:publicar",
+        }
+    ]
+
+
+def test_platform_telegram_generation_failure_is_generic_and_never_publishes() -> None:
+    store = FakeAutomationTelegramStore()
+    store.generation_error = True
+    operations = PlatformTelegramOperations(store)
+
+    result = operations.generate_draft(
+        "Una cifra verificable",
+        request_id="telegram:13:generar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is False
+    assert "secret should never be returned" not in result.text
+    assert store.generation_requests == []
+    assert not hasattr(store, "publish_post")
+
+
 def test_runtime_provider_builds_real_local_runtime_and_reuses_it() -> None:
     provider = RuntimeProvider(
         environ={
@@ -411,6 +756,28 @@ def test_runtime_provider_builds_real_local_runtime_and_reuses_it() -> None:
         "telegram_bot_token": "ok",
         "database": "ok",
     }
+    runtime.store.close()
+
+
+def test_vercel_runtime_never_creates_schema_and_fails_readiness_when_unmigrated(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "unmigrated.db"
+    provider = RuntimeProvider(
+        environ={
+            "VERCEL": "1",
+            "DATABASE_URL": f"sqlite+pysqlite:///{database_path}",
+            "TELEGRAM_WEBHOOK_SECRET": SECRET,
+            "TELEGRAM_BOT_TOKEN": "123456:valid-local-test-token-without-spaces",
+        }
+    )
+
+    runtime = provider.get()
+    ready, checks = provider.readiness()
+
+    assert ready is False
+    assert checks["database"] == "error"
+    assert inspect(runtime.store.engine).get_table_names() == []
     runtime.store.close()
 
 

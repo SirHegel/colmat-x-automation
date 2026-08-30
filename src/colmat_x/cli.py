@@ -2,14 +2,38 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+import stat
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from dotenv import load_dotenv
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from colmat_x.automation import (
+    DEFAULT_AUTOMATION_CONFIG_PATH,
+    AutomationConfigurationError,
+    AutomationError,
+    AutomationSlot,
+    AutomationStatus,
+    DailyAutomation,
+    automation_slot_mapping,
+    load_automation_config,
+    parse_automation_config,
+    slot_idempotency_key,
+)
+from colmat_x.automation_adapters import (
+    AutomationReviewNotificationWorker,
+    MiniMaxAutomationGenerator,
+    PlatformAutomationRepository,
+    PlatformXPublisher,
+    ReviewNotificationDeliveryResult,
+    ReviewNotificationDeliveryStatus,
+    TelegramAutomationNotifier,
+)
 from colmat_x.config import ConfigError, XCredentials, live_enabled, load_settings
 from colmat_x.content import ContentCollectionError, load_rendered_posts
 from colmat_x.domain import ContentError, PostStatus, weighted_length
@@ -23,22 +47,49 @@ from colmat_x.editorial import (
     load_editorial_policy,
     validate_ai_draft,
 )
+from colmat_x.generation_worker import (
+    GENERATION_ENABLED_ENV,
+    QueuedGenerationWorker,
+    QueueGenerationStatus,
+)
 from colmat_x.minimax import MiniMaxClient, MiniMaxError
+from colmat_x.platform_store import AutomationMode as StoredAutomationMode
 from colmat_x.platform_store import (
+    ConflictError,
     Membership,
     PlatformStore,
     PlatformStoreError,
     User,
 )
+from colmat_x.publication_worker import QueuedPublicationWorker, QueuePublicationStatus
 from colmat_x.rbac import AuthorizationError, Role, require_role_assignment
 from colmat_x.service import Outcome, run_due_posts
 from colmat_x.state import StateError, StateStore
+from colmat_x.telegram_api import (
+    BotCommand,
+    TelegramApiClient,
+    TelegramApiError,
+    TelegramConfigurationError,
+    TelegramCredentials,
+    TelegramProtocolError,
+)
 from colmat_x.x_api import XApiClient, XApiError
 
 app = typer.Typer(
     name="colmat-x",
-    help="Planifica y publica contenido de Colmat en X con aprobación humana.",
+    help=("Planifica contenido de Colmat en X y opera su scheduler seguro con aprobación humana."),
     no_args_is_help=True,
+)
+
+AUTOMATION_RUN_RECONCILIATION_GRACE = timedelta(minutes=30)
+TELEGRAM_CONTROL_COMMANDS = (
+    BotCommand("estado", "Consultar estado editorial y automatización"),
+    BotCommand("equipo", "Ver usuarios y roles del equipo"),
+    BotCommand("calendario", "Consultar la agenda de publicaciones"),
+    BotCommand("modo", "Ver o cambiar revisión humana/directo"),
+    BotCommand("generar", "Crear un borrador con MiniMax"),
+    BotCommand("publicar", "Encolar un borrador aprobado"),
+    BotCommand("ayuda", "Mostrar comandos y controles"),
 )
 
 ConfigOption = Annotated[
@@ -65,6 +116,14 @@ PolicyOption = Annotated[
     typer.Option(
         "--policy",
         help="Política editorial que debe validar el borrador.",
+    ),
+]
+
+AutomationConfigOption = Annotated[
+    Path,
+    typer.Option(
+        "--automation-config",
+        help="Programación semanal (por defecto config/automation.yaml).",
     ),
 ]
 
@@ -370,6 +429,10 @@ def team_bootstrap(
         str,
         typer.Option("--display", help="Nombre visible de la cuenta owner."),
     ],
+    username: Annotated[
+        str | None,
+        typer.Option("--username", help="Username único opcional, sin @."),
+    ] = None,
     user_id: Annotated[
         str | None,
         typer.Option("--user-id", help="ID estable opcional para la cuenta owner."),
@@ -384,6 +447,7 @@ def team_bootstrap(
             user, membership = store.bootstrap_owner(
                 email=email,
                 display_name=display_name,
+                username=username,
                 user_id=user_id,
             )
     except (PlatformStoreError, AuthorizationError, ValueError) as exc:
@@ -391,7 +455,8 @@ def team_bootstrap(
     except (SQLAlchemyError, ImportError, OSError):
         _abort_database()
     typer.echo(
-        f"Owner creado: id={user.id} | display={user.display_name} | "
+        f"Owner creado: id={user.id} | username={_display_username(user.username)} | "
+        f"display={user.display_name} | "
         f"email={user.email} | role={membership.role} | activo=sí"
     )
 
@@ -411,9 +476,13 @@ def team_add(
         str,
         typer.Option(
             "--role",
-            help="Rol: owner, admin, editor, reviewer, publisher o auditor.",
+            help="Rol: owner, admin, editor, reviewer, publisher, scheduler o auditor.",
         ),
     ],
+    username: Annotated[
+        str | None,
+        typer.Option("--username", help="Username único opcional, sin @."),
+    ] = None,
     user_id: Annotated[
         str | None,
         typer.Option("--user-id", help="ID estable opcional para la cuenta."),
@@ -441,6 +510,7 @@ def team_add(
                 actor_id=actor_id,
                 email=email,
                 display_name=display_name,
+                username=username,
                 user_id=user_id,
             )
             try:
@@ -460,7 +530,8 @@ def team_add(
     except (SQLAlchemyError, ImportError, OSError):
         _abort_database()
     typer.echo(
-        f"Miembro creado: id={user.id} | display={user.display_name} | "
+        f"Miembro creado: id={user.id} | username={_display_username(user.username)} | "
+        f"display={user.display_name} | "
         f"email={user.email} | role={membership.role} | activo=sí"
     )
 
@@ -486,11 +557,14 @@ def team_list(
     if not rows:
         typer.echo("El equipo no tiene miembros.")
         return
-    typer.echo(f"{'ID':<36}  {'DISPLAY':<24}  {'EMAIL':<32}  {'ROLE':<10}  ACTIVO")
+    typer.echo(
+        f"{'ID':<36}  {'USERNAME':<20}  {'DISPLAY':<24}  {'EMAIL':<32}  {'ROLE':<10}  ACTIVO"
+    )
     for membership, user in rows:
         active = "sí" if user.is_active else "no"
         typer.echo(
-            f"{user.id:<36}  {user.display_name:<24}  {user.email:<32}  "
+            f"{user.id:<36}  {_display_username(user.username):<20}  "
+            f"{user.display_name:<24}  {user.email:<32}  "
             f"{membership.role:<10}  {active}"
         )
 
@@ -642,6 +716,826 @@ def ai_draft(
         }
     )
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@app.command("automation-validate")
+def automation_validate(
+    automation_config: AutomationConfigOption = DEFAULT_AUTOMATION_CONFIG_PATH,
+    policy_path: PolicyOption = DEFAULT_POLICY_PATH,
+) -> None:
+    """Valida política y scheduler semanal sin crear runs ni publicar."""
+
+    try:
+        policy = load_editorial_policy(policy_path)
+        schedule = load_automation_config(automation_config, policy=policy)
+    except (AutomationConfigurationError, EditorialPolicyError, ValueError) as exc:
+        _abort(exc)
+    modes = ", ".join(sorted({slot.mode.value for slot in schedule.slots}))
+    typer.echo(
+        "OK: scheduler válido; "
+        f"timezone={schedule.timezone} | slots={len(schedule.slots)} | "
+        f"daily_limit={schedule.daily_limit} | modes={modes} | no se publicó nada"
+    )
+
+
+@app.command("automation-calendar")
+def automation_calendar(
+    automation_config: AutomationConfigOption = DEFAULT_AUTOMATION_CONFIG_PATH,
+    policy_path: PolicyOption = DEFAULT_POLICY_PATH,
+    days: Annotated[
+        int,
+        typer.Option("--days", help="Horizonte del calendario, entre 1 y 31 días."),
+    ] = 7,
+    start_date: Annotated[
+        str | None,
+        typer.Option(
+            "--start-date",
+            help="Fecha local inicial YYYY-MM-DD; por defecto hoy en Bogotá.",
+        ),
+    ] = None,
+) -> None:
+    """Proyecta próximos slots locales; es una vista y no ejecuta el scheduler."""
+
+    try:
+        if not 1 <= days <= 31:
+            raise ValueError("days debe estar entre 1 y 31")
+        policy = load_editorial_policy(policy_path)
+        schedule = load_automation_config(automation_config, policy=policy)
+        first_day = (
+            _parse_calendar_date(start_date)
+            if start_date is not None
+            else datetime.now(schedule.zoneinfo).date()
+        )
+    except (AutomationConfigurationError, EditorialPolicyError, ValueError) as exc:
+        _abort(exc)
+
+    typer.echo(
+        f"{'FECHA':<10}  {'HORA':<5}  {'SLOT':<20}  {'MODO':<12}  "
+        f"{'CATEGORÍA':<20}  {'IMAGEN':<6}  IDEMPOTENCY KEY"
+    )
+    ordered_slots = sorted(schedule.slots, key=lambda item: (item.at, item.id))
+    for offset in range(days):
+        local_day = first_day + timedelta(days=offset)
+        for item in ordered_slots:
+            if not item.runs_on(local_day):
+                continue
+            key = slot_idempotency_key(local_day, item.id)
+            typer.echo(
+                f"{local_day.isoformat():<10}  {item.at.strftime('%H:%M'):<5}  "
+                f"{item.id:<20}  {item.mode.value:<12}  {item.category.value:<20}  "
+                f"{('sí' if item.generate_image else 'no'):<6}  {key}"
+            )
+
+
+@app.command("automation-status")
+def automation_status(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Miembro autorizado que consulta el scheduler."),
+    ],
+    database_url: DatabaseUrlOption = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", help="Cantidad máxima de runs recientes, entre 1 y 1000."),
+    ] = 100,
+) -> None:
+    """Muestra settings persistidos y runs recientes del scheduler."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            settings = store.get_automation_settings(actor_id=actor_id)
+            runs = store.list_automation_runs(actor_id=actor_id, limit=limit)
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+
+    payload = {
+        "settings": {
+            "enabled": settings.enabled,
+            "mode": settings.mode,
+            "timezone": settings.timezone,
+            "slots": settings.slots,
+            "generate_images": settings.generate_images,
+            "min_engagement_score": settings.min_engagement_score,
+            "max_posts_per_day": settings.max_posts_per_day,
+            "version": settings.version,
+            "direct_authorized": settings.direct_authorized_by is not None,
+            "direct_authorized_at": _iso_or_none(settings.direct_authorized_at),
+            "updated_at": settings.updated_at.isoformat(),
+        },
+        "runs": [
+            {
+                "id": run.id,
+                "idempotency_key": run.idempotency_key,
+                "slot_id": run.slot_id,
+                "scheduled_for": run.scheduled_for.isoformat(),
+                "mode": run.mode,
+                "settings_version": run.settings_version,
+                "slot_hash": run.slot_hash,
+                "status": run.status,
+                "draft_id": run.draft_id,
+                "error": run.error,
+                "claimed_at": run.claimed_at.isoformat(),
+                "finished_at": _iso_or_none(run.finished_at),
+            }
+            for run in runs
+        ],
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@app.command("automation-sync")
+def automation_sync(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner, admin o scheduler que sincroniza la agenda."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option("--expected-version", help="Versión CAS leída previamente."),
+    ],
+    automation_config: AutomationConfigOption = DEFAULT_AUTOMATION_CONFIG_PATH,
+    policy_path: PolicyOption = DEFAULT_POLICY_PATH,
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Copia la agenda YAML validada a la plataforma; no la activa ni ejecuta."""
+
+    try:
+        policy = load_editorial_policy(policy_path)
+        schedule = load_automation_config(automation_config, policy=policy)
+        with PlatformStore(database_url) as store:
+            current = store.get_automation_settings(actor_id=actor_id)
+            _require_settings_version(current.version, expected_version)
+            slots = _persisted_slots(schedule.slots, StoredAutomationMode(current.mode))
+            updated = store.update_automation_settings(
+                actor_id=actor_id,
+                expected_version=expected_version,
+                timezone=schedule.timezone,
+                slots=slots,
+                generate_images=any(slot.generate_image for slot in schedule.slots),
+                min_engagement_score=schedule.direct_min_engagement_score,
+                max_posts_per_day=schedule.daily_limit,
+            )
+    except (
+        AutomationConfigurationError,
+        EditorialPolicyError,
+        PlatformStoreError,
+        AuthorizationError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Agenda sincronizada: slots={len(updated.slots)} | timezone={updated.timezone} | "
+        f"version={updated.version} | enabled={'sí' if updated.enabled else 'no'}; "
+        "no se ejecutaron runs ni publicaciones"
+    )
+
+
+@app.command("automation-mode")
+def automation_mode(
+    mode: Annotated[
+        str,
+        typer.Argument(help="Modo cerrado: human_review o direct."),
+    ],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner o admin que autoriza el cambio."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option("--expected-version", help="Versión CAS leída previamente."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Cambia el modo con CAS; direct conserva el kill switch del servidor."""
+
+    try:
+        requested_mode = StoredAutomationMode(mode.strip().casefold())
+        with PlatformStore(database_url) as store:
+            current = store.get_automation_settings(actor_id=actor_id)
+            _require_settings_version(current.version, expected_version)
+            changes: dict[str, object] = {"mode": requested_mode}
+            aligned_slots = _slots_for_mode(current.slots, requested_mode)
+            if aligned_slots != current.slots:
+                changes["slots"] = aligned_slots
+            updated = store.update_automation_settings(
+                actor_id=actor_id,
+                expected_version=expected_version,
+                **changes,
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Modo actualizado: mode={updated.mode} | version={updated.version} | "
+        f"enabled={'sí' if updated.enabled else 'no'} | "
+        f"direct_authorized={'sí' if updated.direct_authorized_by else 'no'}"
+    )
+
+
+@app.command("automation-enable")
+def automation_enable(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner, admin o scheduler que activa la agenda."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option("--expected-version", help="Versión CAS leída previamente."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Activa explícitamente la agenda con CAS; no ejecuta ni publica ningún slot."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            current = store.get_automation_settings(actor_id=actor_id)
+            _require_settings_version(current.version, expected_version)
+            updated = store.update_automation_settings(
+                actor_id=actor_id,
+                expected_version=expected_version,
+                enabled=True,
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Scheduler activado: enabled=sí | mode={updated.mode} | version={updated.version}; "
+        "no se ejecutaron runs ni publicaciones"
+    )
+
+
+@app.command("automation-disable")
+def automation_disable(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner, admin o scheduler que pausa la agenda."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option("--expected-version", help="Versión CAS leída previamente."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Pausa nuevos claims con CAS; no altera runs ya terminales ni publica."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            current = store.get_automation_settings(actor_id=actor_id)
+            _require_settings_version(current.version, expected_version)
+            updated = store.update_automation_settings(
+                actor_id=actor_id,
+                expected_version=expected_version,
+                enabled=False,
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Scheduler pausado: enabled=no | mode={updated.mode} | version={updated.version}; "
+        "no se ejecutaron runs ni publicaciones"
+    )
+
+
+@app.command("automation-run")
+def automation_run(
+    database_url: DatabaseUrlOption = None,
+    policy_path: PolicyOption = DEFAULT_POLICY_PATH,
+    env_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--env-file",
+            help="Archivo local 0600, regular y propiedad del usuario del worker.",
+        ),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live",
+            help="Tercera confirmación requerida cuando el modo persistido es direct.",
+        ),
+    ] = False,
+) -> None:
+    """Ejecuta slots vencidos usando únicamente settings persistidos y actores de servicio."""
+
+    try:
+        _load_trusted_worker_environment(env_file)
+        scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
+        telegram: TelegramApiClient | None = None
+        with PlatformStore(database_url) as store:
+            reconciliation_now = datetime.now(UTC)
+            store.reconcile_stale_automation_runs(
+                actor_id=scheduler_actor_id,
+                stale_before=reconciliation_now - AUTOMATION_RUN_RECONCILIATION_GRACE,
+                now=reconciliation_now,
+            )
+            review_notifications = [
+                ReviewNotificationDeliveryResult(
+                    notification_id=item.id,
+                    automation_run_id=item.automation_run_id,
+                    status=ReviewNotificationDeliveryStatus.UNKNOWN,
+                    detail=("La lease venció; la entrega requiere conciliación y no se reenviará."),
+                )
+                for item in store.expire_automation_review_notification_claims(
+                    actor_id=scheduler_actor_id,
+                    now=reconciliation_now,
+                )
+            ]
+            if store.has_queued_automation_review_notifications(actor_id=scheduler_actor_id):
+                telegram = TelegramApiClient(TelegramCredentials.from_environment())
+                review_notifications.extend(
+                    AutomationReviewNotificationWorker(
+                        store=store,
+                        telegram_client=telegram,
+                        actor_id=scheduler_actor_id,
+                        media_root=os.getenv(
+                            "COLMAT_AUTOMATION_MEDIA_ROOT",
+                            ".state/media/automation",
+                        ),
+                    ).drain()
+                )
+            settings = store.get_automation_settings(actor_id=scheduler_actor_id)
+            if not settings.enabled:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "enabled": False,
+                            "mode": settings.mode,
+                            "processed": 0,
+                            "review_notifications": [
+                                {
+                                    "automation_run_id": item.automation_run_id,
+                                    "detail": item.detail,
+                                    "notification_id": item.notification_id,
+                                    "status": item.status.value,
+                                }
+                                for item in review_notifications
+                            ],
+                            "settings_version": settings.version,
+                            "status": "paused",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                if any(
+                    item.status is not ReviewNotificationDeliveryStatus.SENT
+                    for item in review_notifications
+                ):
+                    raise typer.Exit(code=1)
+                return
+
+            policy = load_editorial_policy(policy_path)
+            schedule = parse_automation_config(
+                {
+                    "version": 1,
+                    "timezone": settings.timezone,
+                    "daily_limit": settings.max_posts_per_day,
+                    "direct": {
+                        "enabled": settings.mode == StoredAutomationMode.DIRECT.value,
+                        "minimum_engagement_score": settings.min_engagement_score,
+                    },
+                    "slots": list(settings.slots or ()),
+                },
+                policy=policy,
+            )
+            if not schedule.slots:
+                raise AutomationConfigurationError(
+                    "La automatización activa requiere al menos un slot persistido"
+                )
+            direct_mode = settings.mode == StoredAutomationMode.DIRECT.value
+            if direct_mode:
+                _require_direct_worker_preflight(live=live)
+
+            author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
+            telegram_chat_id = _required_worker_environment("COLMAT_TELEGRAM_ALERT_CHAT_ID")
+            reviewer_telegram_user_id = _required_worker_environment(
+                "COLMAT_TELEGRAM_REVIEWER_USER_ID"
+            )
+            if telegram is None:
+                telegram = TelegramApiClient(TelegramCredentials.from_environment())
+            repository = PlatformAutomationRepository(
+                store,
+                scheduler_actor_id=scheduler_actor_id,
+                author_actor_id=author_actor_id,
+                media_root=os.getenv("COLMAT_AUTOMATION_MEDIA_ROOT", ".state/media/automation"),
+            )
+            notifier = TelegramAutomationNotifier(
+                telegram,
+                chat_id=telegram_chat_id,
+                store=store,
+                repository=repository,
+                reviewer_telegram_user_id=reviewer_telegram_user_id,
+                actor_id=scheduler_actor_id,
+            )
+            generator = MiniMaxAutomationGenerator(MiniMaxClient(), policy=policy)
+
+            publisher = None
+            if direct_mode:
+                reviewer_actor_id = _required_worker_environment("COLMAT_AUTOMATION_REVIEWER_ID")
+                publisher_actor_id = _required_worker_environment("COLMAT_AUTOMATION_PUBLISHER_ID")
+                x_client = XApiClient(XCredentials.from_environment())
+                x_client.verify_identity(
+                    expected_user_id=_required_worker_environment("EXPECTED_X_USER_ID"),
+                    expected_username=_required_worker_environment("EXPECTED_X_USERNAME"),
+                )
+                publisher = PlatformXPublisher(
+                    store=store,
+                    repository=repository,
+                    x_client=x_client,
+                    reviewer_actor_id=reviewer_actor_id,
+                    publisher_actor_id=publisher_actor_id,
+                    environ=os.environ,
+                )
+
+            results = DailyAutomation(
+                config=schedule,
+                policy=policy,
+                generator=generator,
+                repository=repository,
+                notifier=notifier,
+                publisher=publisher,
+            ).run_due(environ=os.environ, progress=_emit_automation_progress)
+    except (
+        AutomationConfigurationError,
+        AuthorizationError,
+        ConfigError,
+        EditorialPolicyError,
+        MiniMaxError,
+        PlatformStoreError,
+        SQLAlchemyError,
+        TelegramApiError,
+        TelegramConfigurationError,
+        XApiError,
+        OSError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+
+    payload = {
+        "enabled": True,
+        "mode": settings.mode,
+        "processed": len(results),
+        "review_notifications": [
+            {
+                "automation_run_id": item.automation_run_id,
+                "detail": item.detail,
+                "notification_id": item.notification_id,
+                "status": item.status.value,
+            }
+            for item in review_notifications
+        ],
+        "settings_version": settings.version,
+        "results": [
+            {
+                "detail": result.detail,
+                "idempotency_key": result.idempotency_key,
+                "media_generated": result.media_generated,
+                "notification_delivered": result.notification_delivered,
+                "scheduled_for": result.scheduled_for.isoformat(),
+                "slot_id": result.slot_id,
+                "status": result.status.value,
+            }
+            for result in results
+        ],
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    failed = {AutomationStatus.FAILED, AutomationStatus.UNKNOWN, AutomationStatus.DIRECT_BLOCKED}
+    notification_required = {AutomationStatus.REVIEW_REQUIRED, AutomationStatus.PUBLISHED}
+    if (
+        any(
+            item.status is not ReviewNotificationDeliveryStatus.SENT
+            for item in review_notifications
+        )
+        or any(result.status in failed for result in results)
+        or any(
+            result.status in notification_required and not result.notification_delivered
+            for result in results
+        )
+    ):
+        raise typer.Exit(code=1)
+
+
+@app.command("telegram-commands")
+def telegram_commands(
+    env_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--env-file",
+            help="Archivo local 0600 que contiene TELEGRAM_BOT_TOKEN.",
+        ),
+    ] = None,
+) -> None:
+    """Registra y verifica el menú privado del bot sin mostrar su token."""
+
+    scope = {"type": "all_private_chats"}
+    desired = [command.as_payload() for command in TELEGRAM_CONTROL_COMMANDS]
+    try:
+        _load_trusted_worker_environment(env_file)
+        client = TelegramApiClient(TelegramCredentials.from_environment())
+        client.set_my_commands(TELEGRAM_CONTROL_COMMANDS, scope=scope)
+        persisted = client.get_my_commands(scope=scope)
+        if persisted != desired:
+            raise TelegramProtocolError("Telegram no confirmó el menú esperado")
+    except (
+        ConfigError,
+        OSError,
+        TelegramApiError,
+        TelegramConfigurationError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+    typer.echo(
+        json.dumps(
+            {"commands": [item["command"] for item in desired], "registered": True},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("publication-run")
+def publication_run(
+    database_url: DatabaseUrlOption = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--env-file",
+            help="Archivo local 0600, regular y propiedad del usuario del worker.",
+        ),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Confirmación explícita exigida para contactar a X."),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", help="Máximo de solicitudes por ejecución, entre 1 y 20."),
+    ] = 5,
+) -> None:
+    """Consume la cola aprobada de Telegram con lease, fencing e idempotencia."""
+
+    try:
+        _load_trusted_worker_environment(env_file)
+        _reject_publication_minimax_credentials()
+        if not live:
+            raise ConfigError("publication-run exige la opción --live")
+        if os.getenv("COLMAT_LIVE_ENABLED", "").strip().casefold() != "true":
+            raise ConfigError("publication-run exige COLMAT_LIVE_ENABLED=true exactamente")
+        scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
+        publisher_actor_id = _required_worker_environment("COLMAT_AUTOMATION_PUBLISHER_ID")
+        x_client = XApiClient(XCredentials.from_environment())
+        with PlatformStore(database_url) as store:
+            results = QueuedPublicationWorker(
+                store=store,
+                x_client=x_client,
+                publisher_actor_id=publisher_actor_id,
+                scheduler_actor_id=scheduler_actor_id,
+                media_root=os.getenv(
+                    "COLMAT_AUTOMATION_MEDIA_ROOT",
+                    ".state/media/automation",
+                ),
+                environ=os.environ,
+            ).run(limit=limit)
+    except (
+        AutomationError,
+        AuthorizationError,
+        ConfigError,
+        PlatformStoreError,
+        SQLAlchemyError,
+        XApiError,
+        OSError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+
+    typer.echo(
+        json.dumps(
+            {
+                "processed": len(results),
+                "results": [
+                    {
+                        "detail": result.detail,
+                        "draft_id": result.draft_id,
+                        "provider_post_id": result.provider_post_id,
+                        "request_id": result.request_id,
+                        "status": result.status.value,
+                    }
+                    for result in results
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    if any(result.status is not QueuePublicationStatus.SUCCEEDED for result in results):
+        raise typer.Exit(code=1)
+
+
+@app.command("generation-run")
+def generation_run(
+    database_url: DatabaseUrlOption = None,
+    policy_path: PolicyOption = DEFAULT_POLICY_PATH,
+    env_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--env-file",
+            help="Archivo local 0600 del worker, deliberadamente sin credenciales de X.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", help="Máximo de generaciones y entregas, entre 1 y 20."),
+    ] = 5,
+) -> None:
+    """Asigna a MiniMax la cola de OpenClaw y entrega revisiones por Telegram."""
+
+    try:
+        _load_trusted_worker_environment(env_file)
+        if os.getenv(GENERATION_ENABLED_ENV, "").strip().casefold() != "true":
+            raise ConfigError(f"generation-run exige {GENERATION_ENABLED_ENV}=true exactamente")
+        _reject_generation_x_credentials()
+        worker_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
+        author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
+        policy = load_editorial_policy(policy_path)
+        with PlatformStore(database_url) as store:
+            results = QueuedGenerationWorker(
+                store=store,
+                minimax_client=MiniMaxClient(),
+                telegram_client=TelegramApiClient(TelegramCredentials.from_environment()),
+                policy=policy,
+                worker_actor_id=worker_actor_id,
+                author_actor_id=author_actor_id,
+                media_root=os.getenv(
+                    "COLMAT_GENERATION_MEDIA_ROOT",
+                    ".state/media/generation",
+                ),
+                environ=os.environ,
+            ).run(limit=limit)
+    except (
+        AutomationError,
+        AuthorizationError,
+        ConfigError,
+        EditorialPolicyError,
+        MiniMaxError,
+        PlatformStoreError,
+        SQLAlchemyError,
+        TelegramApiError,
+        TelegramConfigurationError,
+        OSError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+
+    typer.echo(
+        json.dumps(
+            {
+                "processed": len(results),
+                "results": [
+                    {
+                        "detail": result.detail,
+                        "draft_id": result.draft_id,
+                        "entity_id": result.entity_id,
+                        "request_id": result.request_id,
+                        "status": result.status.value,
+                    }
+                    for result in results
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    successful = {QueueGenerationStatus.GENERATED, QueueGenerationStatus.NOTIFIED}
+    if any(result.status not in successful for result in results):
+        raise typer.Exit(code=1)
+
+
+def _display_username(username: str | None) -> str:
+    return f"@{username}" if username else "-"
+
+
+def _parse_calendar_date(value: str) -> date:
+    normalized = value.strip()
+    try:
+        parsed = date.fromisoformat(normalized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("start-date debe usar YYYY-MM-DD") from exc
+    if normalized != parsed.isoformat():
+        raise ValueError("start-date debe usar YYYY-MM-DD")
+    return parsed
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _emit_automation_progress(event: str, slot_id: str, status: str | None) -> None:
+    payload: dict[str, object] = {
+        "event": f"automation.slot_{event}",
+        "slot_id": slot_id,
+    }
+    if status is not None:
+        payload["status"] = status
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _load_trusted_worker_environment(path: Path | None) -> None:
+    if path is None:
+        return
+    candidate = path.expanduser()
+    try:
+        metadata = candidate.lstat()
+    except OSError as exc:
+        raise ConfigError("No se pudo abrir el archivo de entorno del worker") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ConfigError("El archivo de entorno del worker debe ser regular, no un enlace")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise ConfigError("El archivo de entorno del worker pertenece a otro usuario")
+    if metadata.st_mode & 0o077:
+        raise ConfigError("El archivo de entorno del worker debe tener permisos 0600")
+    if not load_dotenv(
+        candidate.resolve(strict=True),
+        override=True,
+        interpolate=False,
+    ):
+        raise ConfigError("El archivo de entorno del worker está vacío o no pudo cargarse")
+
+
+def _required_worker_environment(name: str) -> str:
+    value = os.getenv(name, "")
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not normalized:
+        raise ConfigError(f"Falta la configuración de servicio requerida: {name}")
+    if len(normalized) > 256 or any(ord(character) < 32 for character in normalized):
+        raise ConfigError(f"La configuración de servicio {name} no es válida")
+    return normalized
+
+
+def _reject_generation_x_credentials() -> None:
+    forbidden = (
+        "X_CONSUMER_KEY",
+        "X_CONSUMER_SECRET",
+        "X_ACCESS_TOKEN",
+        "X_ACCESS_TOKEN_SECRET",
+    )
+    if any(os.getenv(name, "").strip() for name in forbidden):
+        raise ConfigError(
+            "generation-run rechaza credenciales de X; usa un entorno OpenClaw separado"
+        )
+
+
+def _reject_publication_minimax_credentials() -> None:
+    if os.getenv("MINIMAX_API_KEY", "").strip():
+        raise ConfigError(
+            "publication-run rechaza credenciales de MiniMax; usa un entorno OpenClaw separado"
+        )
+
+
+def _require_direct_worker_preflight(*, live: bool) -> None:
+    if not live:
+        raise ConfigError("El modo direct exige además la opción --live del worker fijo")
+    for name in ("COLMAT_LIVE_ENABLED", "COLMAT_DIRECT_PUBLISH_ENABLED"):
+        if os.getenv(name, "").strip().casefold() != "true":
+            raise ConfigError(f"El modo direct exige {name}=true exactamente")
+
+
+def _require_settings_version(current: int, expected: int) -> None:
+    if isinstance(expected, bool) or expected < 1:
+        raise ValueError("expected-version debe ser un entero positivo")
+    if current != expected:
+        raise ConflictError(f"La configuración cambió (versión actual {current})")
+
+
+def _slots_for_mode(slots: object, mode: StoredAutomationMode) -> list[dict[str, object]]:
+    if not isinstance(slots, list):
+        raise ValueError("Los slots persistidos no tienen formato de lista")
+    aligned: list[dict[str, object]] = []
+    for index, item in enumerate(slots):
+        if not isinstance(item, dict):
+            raise ValueError(f"El slot persistido {index} no tiene formato de objeto")
+        copied = dict(item)
+        if "mode" in copied:
+            copied["mode"] = mode.value
+        aligned.append(copied)
+    return aligned
+
+
+def _persisted_slots(
+    slots: Sequence[AutomationSlot], mode: StoredAutomationMode
+) -> list[dict[str, object]]:
+    persisted: list[dict[str, object]] = []
+    for item in slots:
+        selected = automation_slot_mapping(item)
+        selected["mode"] = mode.value
+        persisted.append(selected)
+    return persisted
 
 
 def _require_empty_platform(store: PlatformStore) -> None:

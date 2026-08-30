@@ -100,6 +100,13 @@ def test_webhook_and_commands_use_their_canonical_bot_api_methods() -> None:
                 FakeResponse(200, {"ok": True, "result": True}),
                 FakeResponse(200, {"ok": True, "result": {"url": "https://bot.example/hook"}}),
                 FakeResponse(200, {"ok": True, "result": True}),
+                FakeResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "result": [{"command": "estado", "description": "Consultar estado"}],
+                    },
+                ),
             ]
         )
     )
@@ -126,11 +133,15 @@ def test_webhook_and_commands_use_their_canonical_bot_api_methods() -> None:
         )
         is True
     )
+    assert client.get_my_commands(scope={"type": "all_private_chats"}) == [
+        {"command": "estado", "description": "Consultar estado"}
+    ]
 
     assert [call["url"].rsplit("/", 1)[-1] for call in session.calls] == [
         "setWebhook",
         "getWebhookInfo",
         "setMyCommands",
+        "getMyCommands",
     ]
     assert session.calls[0]["json"] == {
         "url": "https://bot.example/hook",
@@ -143,6 +154,7 @@ def test_webhook_and_commands_use_their_canonical_bot_api_methods() -> None:
         {"command": "estado", "description": "Consultar estado"},
         {"command": "equipo", "description": "Equipo"},
     ]
+    assert session.calls[3]["json"] == {"scope": {"type": "all_private_chats"}}
 
 
 def test_message_photo_edit_and_callback_build_expected_payloads() -> None:
@@ -178,6 +190,46 @@ def test_message_photo_edit_and_callback_build_expected_payloads() -> None:
         "cache_time": 2,
         "text": "Listo",
     }
+
+
+def test_photo_bytes_uses_multipart_without_public_url() -> None:
+    client, session = make_client(
+        session=FakeSession([FakeResponse(200, {"ok": True, "result": {"message_id": 7}})])
+    )
+
+    result = client.send_photo_bytes(
+        -1001,
+        b"local-image",
+        filename="preview.webp",
+        mime_type="image/webp",
+        caption="Vista previa",
+        reply_markup={"inline_keyboard": [[{"text": "Aprobar", "callback_data": "x"}]]},
+    )
+
+    assert result == {"message_id": 7}
+    call = session.calls[0]
+    assert call["url"].endswith("/sendPhoto")
+    assert "json" not in call
+    assert call["data"]["chat_id"] == "-1001"
+    assert call["files"] == {"photo": ("preview.webp", b"local-image", "image/webp")}
+    assert TOKEN not in str(call["data"])
+
+
+def test_photo_bytes_invalid_response_does_not_retain_remote_document() -> None:
+    client, _ = make_client(
+        session=FakeSession([FakeResponse(502, ValueError(f"invalid {TOKEN}"))])
+    )
+
+    with pytest.raises(TelegramProtocolError) as captured:
+        client.send_photo_bytes(
+            -1001,
+            b"local-image",
+            filename="preview.webp",
+            mime_type="image/webp",
+        )
+
+    assert TOKEN not in str(captured.value)
+    assert captured.value.__context__ is None
 
 
 @pytest.mark.parametrize(

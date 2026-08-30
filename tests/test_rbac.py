@@ -50,11 +50,22 @@ def test_publisher_and_auditor_have_narrow_responsibilities() -> None:
     assert not has_permission(Role.PUBLISHER, Permission.REVIEW_DRAFTS)
 
 
+def test_scheduler_can_manage_calendar_but_not_mode_or_publication() -> None:
+    assert has_permission(Role.SCHEDULER, Permission.VIEW_AUTOMATION)
+    assert has_permission(Role.SCHEDULER, Permission.MANAGE_SCHEDULE)
+    assert has_permission(Role.SCHEDULER, Permission.CREATE_DRAFTS)
+    assert has_permission(Role.SCHEDULER, Permission.SUBMIT_DRAFTS)
+    assert not has_permission(Role.SCHEDULER, Permission.MANAGE_AUTOMATION_MODE)
+    assert not has_permission(Role.SCHEDULER, Permission.PUBLISH_DRAFTS)
+    assert roles_with(Permission.MANAGE_AUTOMATION_MODE) == {Role.OWNER, Role.ADMIN}
+
+
 def test_role_delegation_hierarchy_protects_privileged_roles() -> None:
     assert can_assign_role(Role.OWNER, Role.OWNER)
     assert can_assign_role(Role.OWNER, Role.ADMIN)
     assert can_assign_role(Role.ADMIN, Role.EDITOR)
     assert can_assign_role(Role.ADMIN, Role.REVIEWER)
+    assert can_assign_role(Role.ADMIN, Role.SCHEDULER)
     assert not can_assign_role(Role.ADMIN, Role.ADMIN)
     assert not can_assign_role(Role.ADMIN, Role.OWNER)
     assert not can_assign_role(Role.EDITOR, Role.AUDITOR)

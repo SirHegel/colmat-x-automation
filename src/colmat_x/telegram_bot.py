@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -13,7 +15,7 @@ TELEGRAM_WEBHOOK_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 _WEBHOOK_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _CALLBACK_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,48}$")
 _COMMAND_PATTERN = re.compile(r"^/([a-zA-Z0-9_]+)(?:@[A-Za-z0-9_]{5,32})?$")
-_POST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,79}$")
+_POST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 _SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_TELEGRAM_INTEGER = 9_223_372_036_854_775_807
 
@@ -62,8 +64,17 @@ class BotPermission(StrEnum):
     ACCESS = "telegram.access"
     VIEW_STATUS = "telegram.status.view"
     VIEW_TEAM = "telegram.team.view"
+    VIEW_CALENDAR = "calendar.view"
+    MANAGE_MODE = "automation.mode.manage"
+    GENERATE = "content.generate"
+    REQUEST_PUBLISH = "content.publish.request"
     APPROVE = "content.approve"
     REJECT = "content.reject"
+
+
+class BotAutomationMode(StrEnum):
+    HUMAN_REVIEW = "human_review"
+    DIRECT = "direct"
 
 
 class CallbackDecision(StrEnum):
@@ -83,7 +94,32 @@ class CallbackIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramUpdateClaim:
+    """Lease cercada para procesar o redistribuir un update persistido.
+
+    ``prepared_actions`` distingue ``None`` (aún no existe un resultado durable)
+    de una tupla vacía (resultado durable sin acciones salientes).
+    """
+
+    acquired: bool
+    claim_token: str | None = field(default=None, repr=False)
+    claim_fence: int | None = None
+    prepared_actions: tuple[Mapping[str, object], ...] | None = None
+    business_result: Mapping[str, object] | None = None
+    retryable: bool = False
+
+    def __bool__(self) -> bool:
+        return self.acquired
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionResult:
+    text: str
+    accepted: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
     text: str
     accepted: bool = True
 
@@ -96,8 +132,18 @@ class TelegramUpdateStore(Protocol):
         payload: Mapping[str, object],
         telegram_user_id: int | None,
         chat_id: int | None,
-    ) -> bool:
-        """Registra el update atómicamente y devuelve False si ya existía."""
+    ) -> bool | TelegramUpdateClaim:
+        """Reclama el update o describe por qué no debe procesarse otra vez."""
+
+    def prepare_telegram_actions(
+        self,
+        update_id: int,
+        actions: Sequence[Mapping[str, object]],
+        *,
+        claim_token: str,
+        claim_fence: int,
+    ) -> object:
+        """Persiste la respuesta antes de ejecutar efectos externos contra Telegram."""
 
 
 class TelegramAuthorizer(Protocol):
@@ -121,13 +167,65 @@ class CallbackNonceStore(Protocol):
     ) -> CallbackIntent | None:
         """Consume de forma atómica un nonce ligado al actor, chat y decisión."""
 
+    # PlatformStore expone además ``apply_callback_decision``. El procesador lo
+    # detecta por capacidad para conservar compatibilidad con stores simples de tests.
+
 
 class TelegramBotOperations(Protocol):
     def get_status(self, *, telegram_user_id: int, chat_id: int) -> str: ...
 
     def get_team(self, *, telegram_user_id: int, chat_id: int) -> str: ...
 
+    def get_calendar(
+        self,
+        *,
+        days: int,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> str: ...
+
+    def get_mode(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def set_mode(
+        self,
+        mode: BotAutomationMode,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Solo configura modos que el procesador permite cambiar desde Telegram."""
+
+    def generate_draft(
+        self,
+        brief: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Genera o solicita un borrador; nunca lo aprueba ni publica."""
+
+    def request_publication(
+        self,
+        post_id: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Crea una solicitud idempotente de cola; no llama a X."""
+
     def approve_post(
+        self,
+        *,
+        post_id: str,
+        snapshot_hash: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> DecisionResult: ...
+
+    def reject_post(
         self,
         *,
         post_id: str,
@@ -162,15 +260,6 @@ class TelegramActionClient(Protocol):
         text: str | None = None,
         show_alert: bool = False,
     ) -> object: ...
-
-    def reject_post(
-        self,
-        *,
-        post_id: str,
-        snapshot_hash: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> DecisionResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +296,23 @@ class WebhookResult:
     update_id: int
     duplicate: bool
     actions: tuple[BotAction, ...]
+    claim_token: str | None = field(default=None, repr=False)
+    claim_fence: int | None = None
+    retryable: bool = False
+    replayed: bool = False
+
+
+class ClaimedTelegramUpdateError(RuntimeError):
+    """Propaga credenciales de claim sin incluirlas en mensajes ni ``repr``."""
+
+    def __init__(self, update_id: int, claim_token: str, claim_fence: int) -> None:
+        super().__init__("Falló el procesamiento de un update reclamado")
+        self.update_id = update_id
+        self.claim_token = claim_token
+        self.claim_fence = claim_fence
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(update_id={self.update_id!r})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +326,12 @@ class _MessageEvent:
     actor: _Actor
     message_id: int
     text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedCommand:
+    name: str
+    argument: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,28 +381,65 @@ class TelegramWebhookProcessor:
         update_id = _required_integer(payload.get("update_id"), "update_id", positive=False)
         event = _parse_event(payload)
         actor = event.actor if isinstance(event, (_MessageEvent, _CallbackEvent)) else None
-        if not self._update_store.claim_update(
+        raw_claim = self._update_store.claim_update(
             update_id,
-            payload=payload,
+            payload=_durable_update_payload(payload),
             telegram_user_id=actor.telegram_user_id if actor else None,
             chat_id=actor.chat_id if actor else None,
-        ):
-            return WebhookResult(update_id=update_id, duplicate=True, actions=())
-        if isinstance(event, _MessageEvent):
-            actions = self._process_message(event)
-        elif isinstance(event, _CallbackEvent):
-            actions = self._process_callback(event)
-        else:
-            actions = ()
-        return WebhookResult(update_id=update_id, duplicate=False, actions=actions)
+        )
+        claim = _coerce_update_claim(raw_claim)
+        if not claim.acquired:
+            return WebhookResult(
+                update_id=update_id,
+                duplicate=True,
+                actions=(),
+                retryable=claim.retryable,
+            )
+
+        try:
+            replayed = claim.prepared_actions is not None or claim.business_result is not None
+            if claim.prepared_actions is not None:
+                actions = deserialize_bot_actions(claim.prepared_actions)
+            elif claim.business_result is not None:
+                actions = self._restore_business_result(event, claim.business_result)
+            elif isinstance(event, _MessageEvent):
+                actions = self._process_message(event, update_id=update_id)
+            elif isinstance(event, _CallbackEvent):
+                actions = self._process_callback(event, update_id=update_id, claim=claim)
+            else:
+                actions = ()
+            self._prepare_actions(update_id, actions, claim=claim)
+        except Exception as exc:
+            if claim.claim_token is None or claim.claim_fence is None:
+                raise
+            raise ClaimedTelegramUpdateError(
+                update_id,
+                claim.claim_token,
+                claim.claim_fence,
+            ) from exc
+        return WebhookResult(
+            update_id=update_id,
+            duplicate=False,
+            actions=actions,
+            claim_token=claim.claim_token,
+            claim_fence=claim.claim_fence,
+            replayed=replayed,
+        )
 
     # Alias breve para adaptadores web que ya nombran el cuerpo como update.
     process = process_update
 
-    def _process_message(self, event: _MessageEvent) -> tuple[BotAction, ...]:
-        command = _command_name(event.text)
-        if command is None:
+    def _process_message(
+        self,
+        event: _MessageEvent,
+        *,
+        update_id: int,
+    ) -> tuple[BotAction, ...]:
+        parsed = _parse_command(event.text)
+        if parsed is None:
             return ()
+        command = parsed.name
+        argument = parsed.argument
         if not self._allowed(event.actor, BotPermission.ACCESS):
             return (
                 SendMessage(
@@ -306,7 +455,7 @@ class TelegramWebhookProcessor:
             )
         if command == "start":
             text = (
-                "Colmat X está conectado. Puedes consultar /estado, /equipo y /ayuda. "
+                "Colmat X está conectado. Usa /ayuda para consultar los controles disponibles. "
                 "Las aprobaciones requieren un botón válido y permisos explícitos."
             )
         elif command in {"ayuda", "help"}:
@@ -314,10 +463,17 @@ class TelegramWebhookProcessor:
                 "Comandos disponibles:\n"
                 "/estado — estado editorial y operativo\n"
                 "/equipo — integrantes y roles visibles\n"
+                "/calendario [días] — agenda de los próximos 1-31 días\n"
+                "/modo [human_review|direct] — consultar o solicitar un modo operativo\n"
+                "/generar <brief> — crear un borrador sujeto a revisión\n"
+                "/publicar <id> — solicitar la cola de un borrador ya aprobado\n"
                 "/ayuda — esta guía\n"
-                "El bot no crea usuarios ni publica contenido automáticamente."
+                "El bot no crea usuarios. El modo direct exige autorización y doble compuerta; "
+                "el webhook no llama a X."
             )
         elif command == "estado":
+            if argument:
+                return (self._usage_message(event, "/estado"),)
             if not self._allowed(event.actor, BotPermission.VIEW_STATUS):
                 return (self._forbidden_message(event, "consultar el estado"),)
             text = self._operations.get_status(
@@ -325,12 +481,76 @@ class TelegramWebhookProcessor:
                 chat_id=event.actor.chat_id,
             )
         elif command == "equipo":
+            if argument:
+                return (self._usage_message(event, "/equipo"),)
             if not self._allowed(event.actor, BotPermission.VIEW_TEAM):
                 return (self._forbidden_message(event, "consultar el equipo"),)
             text = self._operations.get_team(
                 telegram_user_id=event.actor.telegram_user_id,
                 chat_id=event.actor.chat_id,
             )
+        elif command == "calendario":
+            if not self._allowed(event.actor, BotPermission.VIEW_CALENDAR):
+                return (self._forbidden_message(event, "consultar el calendario"),)
+            days = _calendar_days(argument)
+            if days is None:
+                return (self._usage_message(event, "/calendario [días entre 1 y 31]"),)
+            text = self._operations.get_calendar(
+                days=days,
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+        elif command == "modo":
+            if not self._allowed(event.actor, BotPermission.MANAGE_MODE):
+                return (self._forbidden_message(event, "consultar o cambiar el modo"),)
+            mode = _automation_mode(argument)
+            if not argument:
+                text = self._operations.get_mode(
+                    telegram_user_id=event.actor.telegram_user_id,
+                    chat_id=event.actor.chat_id,
+                )
+            elif mode is not None:
+                result = self._operations.set_mode(
+                    mode,
+                    request_id=_request_id(update_id, command),
+                    telegram_user_id=event.actor.telegram_user_id,
+                    chat_id=event.actor.chat_id,
+                )
+                if mode is BotAutomationMode.DIRECT:
+                    text = (
+                        "Advertencia: direct solo puede activarse con rol administrativo, "
+                        "kill switch y doble compuerta. " + result.text
+                    )
+                else:
+                    text = result.text
+            else:
+                return (self._usage_message(event, "/modo [human_review|direct]"),)
+        elif command == "generar":
+            if not self._allowed(event.actor, BotPermission.GENERATE):
+                return (self._forbidden_message(event, "generar borradores"),)
+            brief = _generation_brief(argument)
+            if brief is None:
+                return (self._usage_message(event, "/generar <brief de hasta 1000 caracteres>"),)
+            result = self._operations.generate_draft(
+                brief,
+                request_id=_request_id(update_id, command),
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+            text = result.text
+        elif command == "publicar":
+            if not self._allowed(event.actor, BotPermission.REQUEST_PUBLISH):
+                return (self._forbidden_message(event, "solicitar una publicación"),)
+            post_id = _publication_post_id(argument)
+            if post_id is None:
+                return (self._usage_message(event, "/publicar <id de borrador aprobado>"),)
+            result = self._operations.request_publication(
+                post_id,
+                request_id=_request_id(update_id, command),
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+            text = result.text
         else:
             text = "Comando desconocido. Usa /ayuda para ver las opciones disponibles."
         return (
@@ -342,7 +562,13 @@ class TelegramWebhookProcessor:
             ),
         )
 
-    def _process_callback(self, event: _CallbackEvent) -> tuple[BotAction, ...]:
+    def _process_callback(
+        self,
+        event: _CallbackEvent,
+        *,
+        update_id: int,
+        claim: TelegramUpdateClaim,
+    ) -> tuple[BotAction, ...]:
         parsed = _parse_callback_data(event.data)
         if parsed is None:
             return (self._callback_error(event, "Acción inválida o vencida."),)
@@ -355,26 +581,40 @@ class TelegramWebhookProcessor:
         ):
             return (self._callback_error(event, "No tienes permiso para esta acción."),)
 
-        intent = self._callback_nonces.consume_callback_nonce(
-            nonce,
-            decision=decision,
-            telegram_user_id=event.actor.telegram_user_id,
-            chat_id=event.actor.chat_id,
+        atomic_decider = getattr(self._callback_nonces, "apply_callback_decision", None)
+        uses_atomic_decision = (
+            callable(atomic_decider)
+            and claim.claim_token is not None
+            and claim.claim_fence is not None
         )
+        if uses_atomic_decision:
+            intent = atomic_decider(
+                nonce,
+                decision=decision,
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+                update_id=update_id,
+                claim_token=claim.claim_token,
+                claim_fence=claim.claim_fence,
+            )
+        else:
+            intent = self._callback_nonces.consume_callback_nonce(
+                nonce,
+                decision=decision,
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
         if not _valid_intent(intent, decision=decision, actor=event.actor):
             return (self._callback_error(event, "Acción inválida, usada o vencida."),)
         assert intent is not None
-        if decision is CallbackDecision.APPROVE:
+        if uses_atomic_decision:
+            result = _atomic_callback_result(decision, post_id=intent.post_id)
+        elif decision is CallbackDecision.APPROVE:
             result = self._operations.approve_post(
                 post_id=intent.post_id,
                 snapshot_hash=intent.snapshot_hash,
                 telegram_user_id=event.actor.telegram_user_id,
                 chat_id=event.actor.chat_id,
-            )
-            notice = (
-                "Aprobación registrada. La publicación seguirá los controles de la cola."
-                if result.accepted
-                else "No se registró la aprobación."
             )
         else:
             result = self._operations.reject_post(
@@ -383,8 +623,78 @@ class TelegramWebhookProcessor:
                 telegram_user_id=event.actor.telegram_user_id,
                 chat_id=event.actor.chat_id,
             )
-            notice = "Rechazo registrado." if result.accepted else "No se registró el rechazo."
 
+        return self._callback_decision_actions(event, decision=decision, result=result)
+
+    def _prepare_actions(
+        self,
+        update_id: int,
+        actions: tuple[BotAction, ...],
+        *,
+        claim: TelegramUpdateClaim,
+    ) -> None:
+        if claim.claim_token is None or claim.claim_fence is None:
+            return
+        prepare = getattr(self._update_store, "prepare_telegram_actions", None)
+        if not callable(prepare):
+            return
+        prepare(
+            update_id,
+            serialize_bot_actions(actions),
+            claim_token=claim.claim_token,
+            claim_fence=claim.claim_fence,
+        )
+
+    def _restore_business_result(
+        self,
+        event: _InboundEvent,
+        business_result: Mapping[str, object],
+    ) -> tuple[BotAction, ...]:
+        if not isinstance(event, _CallbackEvent):
+            raise MalformedTelegramUpdate("El resultado durable no corresponde al tipo de update")
+        if business_result.get("kind") != "callback_decision":
+            raise MalformedTelegramUpdate("El resultado durable de Telegram no es reconocido")
+        try:
+            decision = CallbackDecision(business_result.get("decision"))
+        except (TypeError, ValueError) as exc:
+            raise MalformedTelegramUpdate("La decisión durable no es válida") from exc
+        post_id = business_result.get("post_id")
+        snapshot_hash = business_result.get("snapshot_hash")
+        telegram_user_id = business_result.get("telegram_user_id")
+        chat_id = business_result.get("chat_id")
+        if (
+            not isinstance(post_id, str)
+            or _POST_ID_PATTERN.fullmatch(post_id) is None
+            or not isinstance(snapshot_hash, str)
+            or _SNAPSHOT_PATTERN.fullmatch(snapshot_hash) is None
+            or telegram_user_id != event.actor.telegram_user_id
+            or chat_id != event.actor.chat_id
+        ):
+            raise MalformedTelegramUpdate("El resultado durable no coincide con el callback")
+        parsed = _parse_callback_data(event.data)
+        if parsed is None or parsed[0] is not decision:
+            raise MalformedTelegramUpdate("El callback no coincide con la decisión durable")
+        return self._callback_decision_actions(
+            event,
+            decision=decision,
+            result=_atomic_callback_result(decision, post_id=post_id),
+        )
+
+    @staticmethod
+    def _callback_decision_actions(
+        event: _CallbackEvent,
+        *,
+        decision: CallbackDecision,
+        result: DecisionResult,
+    ) -> tuple[BotAction, ...]:
+        if decision is CallbackDecision.APPROVE:
+            notice = (
+                "Aprobación registrada. La publicación seguirá los controles de la cola."
+                if result.accepted
+                else "No se registró la aprobación."
+            )
+        else:
+            notice = "Rechazo registrado." if result.accepted else "No se registró el rechazo."
         result_text = _operation_text(result.text)
         return (
             AnswerCallbackQuery(
@@ -419,6 +729,15 @@ class TelegramWebhookProcessor:
         )
 
     @staticmethod
+    def _usage_message(event: _MessageEvent, usage: str) -> SendMessage:
+        return SendMessage(
+            telegram_user_id=event.actor.telegram_user_id,
+            chat_id=event.actor.chat_id,
+            text=f"Uso: {usage}",
+            reply_to_message_id=event.message_id,
+        )
+
+    @staticmethod
     def _callback_error(event: _CallbackEvent, text: str) -> AnswerCallbackQuery:
         return AnswerCallbackQuery(
             telegram_user_id=event.actor.telegram_user_id,
@@ -432,8 +751,15 @@ class TelegramWebhookProcessor:
 def execute_bot_actions(
     client: TelegramActionClient,
     actions: Sequence[BotAction],
+    *,
+    replay: bool = False,
 ) -> tuple[object, ...]:
-    """Ejecuta únicamente las acciones salientes producidas por el procesador."""
+    """Ejecuta acciones; en replay deja el ack efímero para el final.
+
+    Un ``answerCallbackQuery`` puede haber expirado cuando se recupera un update y
+    no debe impedir el ``editMessageText`` que retira los botones. Los mensajes
+    nuevos siguen siendo al-menos-una-vez: Telegram no ofrece idempotency keys.
+    """
 
     normalized = tuple(actions)
     if any(
@@ -442,30 +768,206 @@ def execute_bot_actions(
     ):
         raise TypeError("La secuencia contiene una acción de Telegram desconocida")
 
+    ordered = (
+        tuple(action for action in normalized if not isinstance(action, AnswerCallbackQuery))
+        + tuple(action for action in normalized if isinstance(action, AnswerCallbackQuery))
+        if replay
+        else normalized
+    )
     results: list[object] = []
-    for action in normalized:
-        if isinstance(action, SendMessage):
-            result = client.send_message(
-                action.chat_id,
-                action.text,
-                reply_to_message_id=action.reply_to_message_id,
-            )
-        elif isinstance(action, EditMessageText):
-            reply_markup = {"inline_keyboard": []} if action.remove_inline_keyboard else None
-            result = client.edit_message_text(
-                action.chat_id,
-                action.message_id,
-                action.text,
-                reply_markup=reply_markup,
-            )
-        else:
-            result = client.answer_callback_query(
-                action.callback_query_id,
-                text=action.text,
-                show_alert=action.show_alert,
-            )
+    for action in ordered:
+        try:
+            if isinstance(action, SendMessage):
+                result = client.send_message(
+                    action.chat_id,
+                    action.text,
+                    reply_to_message_id=action.reply_to_message_id,
+                )
+            elif isinstance(action, EditMessageText):
+                reply_markup = {"inline_keyboard": []} if action.remove_inline_keyboard else None
+                result = client.edit_message_text(
+                    action.chat_id,
+                    action.message_id,
+                    action.text,
+                    reply_markup=reply_markup,
+                )
+            else:
+                result = client.answer_callback_query(
+                    action.callback_query_id,
+                    text=action.text,
+                    show_alert=action.show_alert,
+                )
+        except Exception as exc:
+            if replay and isinstance(action, AnswerCallbackQuery):
+                results.append(None)
+                continue
+            if replay and isinstance(action, EditMessageText) and _edit_already_applied(exc):
+                results.append(None)
+                continue
+            raise
         results.append(result)
     return tuple(results)
+
+
+def serialize_bot_actions(actions: Sequence[BotAction]) -> tuple[dict[str, object], ...]:
+    """Convierte acciones validadas a JSON cerrado para la bandeja durable.
+
+    La bandeja evita repetir mutaciones internas. La entrega HTTP de Telegram sigue
+    siendo al-menos-una-vez porque Bot API no ofrece una clave de idempotencia.
+    """
+
+    serialized: list[dict[str, object]] = []
+    for action in actions:
+        if isinstance(action, SendMessage):
+            serialized.append(
+                {
+                    "kind": "send_message",
+                    "telegram_user_id": action.telegram_user_id,
+                    "chat_id": action.chat_id,
+                    "text": action.text,
+                    "reply_to_message_id": action.reply_to_message_id,
+                }
+            )
+        elif isinstance(action, EditMessageText):
+            serialized.append(
+                {
+                    "kind": "edit_message_text",
+                    "telegram_user_id": action.telegram_user_id,
+                    "chat_id": action.chat_id,
+                    "message_id": action.message_id,
+                    "text": action.text,
+                    "remove_inline_keyboard": action.remove_inline_keyboard,
+                }
+            )
+        elif isinstance(action, AnswerCallbackQuery):
+            serialized.append(
+                {
+                    "kind": "answer_callback_query",
+                    "telegram_user_id": action.telegram_user_id,
+                    "chat_id": action.chat_id,
+                    "callback_query_id": action.callback_query_id,
+                    "text": action.text,
+                    "show_alert": action.show_alert,
+                }
+            )
+        else:
+            raise TypeError("La secuencia contiene una acción de Telegram desconocida")
+    return tuple(serialized)
+
+
+def deserialize_bot_actions(
+    payload: Sequence[Mapping[str, object]],
+) -> tuple[BotAction, ...]:
+    """Reconstruye solo el esquema cerrado emitido por :func:`serialize_bot_actions`."""
+
+    actions: list[BotAction] = []
+    if len(payload) > 20:
+        raise ValueError("El resultado durable contiene demasiadas acciones")
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise ValueError("La acción durable debe ser un objeto")
+        kind = item.get("kind")
+        telegram_user_id = _stored_integer(item.get("telegram_user_id"), "telegram_user_id")
+        chat_id = _stored_integer(item.get("chat_id"), "chat_id", positive=False)
+        text = item.get("text")
+        if not isinstance(text, str):
+            raise ValueError("La acción durable requiere texto")
+        if kind == "send_message" and set(item) == {
+            "kind",
+            "telegram_user_id",
+            "chat_id",
+            "text",
+            "reply_to_message_id",
+        }:
+            reply = item.get("reply_to_message_id")
+            actions.append(
+                SendMessage(
+                    telegram_user_id,
+                    chat_id,
+                    _operation_text(text),
+                    reply_to_message_id=(
+                        None if reply is None else _stored_integer(reply, "reply_to_message_id")
+                    ),
+                )
+            )
+        elif kind == "edit_message_text" and set(item) == {
+            "kind",
+            "telegram_user_id",
+            "chat_id",
+            "message_id",
+            "text",
+            "remove_inline_keyboard",
+        }:
+            remove_keyboard = item.get("remove_inline_keyboard")
+            if not isinstance(remove_keyboard, bool):
+                raise ValueError("remove_inline_keyboard durable debe ser booleano")
+            actions.append(
+                EditMessageText(
+                    telegram_user_id,
+                    chat_id,
+                    _stored_integer(item.get("message_id"), "message_id"),
+                    _operation_text(text),
+                    remove_inline_keyboard=remove_keyboard,
+                )
+            )
+        elif kind == "answer_callback_query" and set(item) == {
+            "kind",
+            "telegram_user_id",
+            "chat_id",
+            "callback_query_id",
+            "text",
+            "show_alert",
+        }:
+            callback_query_id = item.get("callback_query_id")
+            show_alert = item.get("show_alert")
+            if not isinstance(callback_query_id, str) or not callback_query_id:
+                raise ValueError("callback_query_id durable no es válido")
+            if not isinstance(show_alert, bool):
+                raise ValueError("show_alert durable debe ser booleano")
+            actions.append(
+                AnswerCallbackQuery(
+                    telegram_user_id,
+                    chat_id,
+                    callback_query_id,
+                    _operation_text(text),
+                    show_alert=show_alert,
+                )
+            )
+        else:
+            raise ValueError("El esquema de la acción durable no es válido")
+    return tuple(actions)
+
+
+def _coerce_update_claim(value: bool | TelegramUpdateClaim) -> TelegramUpdateClaim:
+    if isinstance(value, bool):
+        return TelegramUpdateClaim(acquired=value)
+    if not isinstance(value, TelegramUpdateClaim):
+        raise TypeError("claim_update devolvió un resultado desconocido")
+    if value.acquired and (value.claim_token is None) != (value.claim_fence is None):
+        raise ValueError("El claim de Telegram está incompleto")
+    return value
+
+
+def _atomic_callback_result(decision: CallbackDecision, *, post_id: str) -> DecisionResult:
+    if decision is CallbackDecision.APPROVE:
+        return DecisionResult(f"El borrador {post_id} fue aprobado; todavía no se ha publicado.")
+    return DecisionResult(f"El borrador {post_id} fue rechazado.")
+
+
+def _stored_integer(value: object, field_name: str, *, positive: bool = True) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} durable debe ser un entero")
+    if positive and value <= 0:
+        raise ValueError(f"{field_name} durable debe ser positivo")
+    if not positive and value == 0:
+        raise ValueError(f"{field_name} durable no puede ser cero")
+    if abs(value) > MAX_TELEGRAM_INTEGER:
+        raise ValueError(f"{field_name} durable supera el rango permitido")
+    return value
+
+
+def _edit_already_applied(exc: Exception) -> bool:
+    return "message is not modified" in str(exc).casefold()
 
 
 def approval_callback_data(nonce: str) -> str:
@@ -502,6 +1004,81 @@ def _parse_callback_data(value: object) -> tuple[CallbackDecision, str] | None:
     except ValueError:
         return None
     return decision, nonce
+
+
+def _durable_update_payload(payload: Mapping[str, object]) -> Mapping[str, object]:
+    """Project an update for durable storage without retaining callback secrets.
+
+    The raw callback remains available in memory through ``_CallbackEvent`` for the
+    one-time decision.  Its stable digest lets the store compare retries byte for
+    byte without making the approve/reject nonce recoverable from
+    ``telegram_updates``.
+    """
+
+    projected_value = _redact_inline_callback_data(payload)
+    if not isinstance(projected_value, Mapping):  # pragma: no cover - raíz validada
+        raise MalformedTelegramUpdate("La proyección durable perdió el objeto raíz")
+    projected_payload = dict(projected_value)
+    callback = payload.get("callback_query")
+    if not isinstance(callback, Mapping) or "data" not in callback:
+        return projected_payload
+    projected_callback_value = projected_payload.get("callback_query")
+    if not isinstance(projected_callback_value, Mapping):  # pragma: no cover - misma topología
+        raise MalformedTelegramUpdate("La proyección durable perdió callback_query")
+    projected_callback = dict(projected_callback_value)
+    projected_callback["data"] = _callback_data_projection(
+        callback.get("data"),
+        field_name="callback_query.data",
+    )
+    projected_payload["callback_query"] = projected_callback
+    return projected_payload
+
+
+def _redact_inline_callback_data(value: object) -> object:
+    """Copia el JSON y sustituye cada callback de teclados, incluso los anidados."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                _callback_data_projection(item, field_name="callback_data")
+                if key == "callback_data"
+                else _redact_inline_callback_data(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_inline_callback_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_inline_callback_data(item) for item in value)
+    return value
+
+
+def _callback_data_projection(raw_data: object, *, field_name: str) -> dict[str, object]:
+    if isinstance(raw_data, str):
+        encoded = raw_data.encode("utf-8", errors="surrogatepass")
+        parsed = _parse_callback_data(raw_data)
+        decision = parsed[0].value if parsed is not None else None
+        data_kind = "text"
+    else:
+        try:
+            serialized = json.dumps(
+                raw_data,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            serialized = type(raw_data).__qualname__
+        encoded = serialized.encode("utf-8", errors="surrogatepass")
+        decision = None
+        data_kind = "non_text"
+    return {
+        "_redacted": field_name,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "byte_length": len(encoded),
+        "kind": data_kind,
+        "decision": decision,
+    }
 
 
 def _valid_intent(
@@ -604,12 +1181,58 @@ def _required_integer(
     return value
 
 
-def _command_name(text: str | None) -> str | None:
+def _parse_command(text: str | None) -> _ParsedCommand | None:
     if not isinstance(text, str) or len(text) > 4096:
         return None
-    first_token = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+    normalized = text.strip()
+    if not normalized:
+        return None
+    parts = normalized.split(maxsplit=1)
+    first_token = parts[0]
     match = _COMMAND_PATTERN.fullmatch(first_token)
-    return match.group(1).casefold() if match else None
+    if match is None:
+        return None
+    argument = parts[1].strip() if len(parts) == 2 else ""
+    return _ParsedCommand(name=match.group(1).casefold(), argument=argument)
+
+
+def _calendar_days(argument: str) -> int | None:
+    if not argument:
+        return 7
+    if re.fullmatch(r"[1-9][0-9]?", argument) is None:
+        return None
+    days = int(argument)
+    return days if days <= 31 else None
+
+
+def _automation_mode(argument: str) -> BotAutomationMode | None:
+    if not argument:
+        return None
+    try:
+        return BotAutomationMode(argument.casefold())
+    except ValueError:
+        return None
+
+
+def _generation_brief(argument: str) -> str | None:
+    if not argument or len(argument) > 1000 or "\x00" in argument:
+        return None
+    normalized = " ".join(argument.split())
+    if not normalized or len(normalized) > 1000:
+        return None
+    if any(ord(character) < 32 for character in normalized):
+        return None
+    return normalized
+
+
+def _publication_post_id(argument: str) -> str | None:
+    if not argument or _POST_ID_PATTERN.fullmatch(argument) is None:
+        return None
+    return argument
+
+
+def _request_id(update_id: int, command: str) -> str:
+    return f"telegram:{update_id}:{command}"
 
 
 def _operation_text(value: object) -> str:

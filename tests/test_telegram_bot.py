@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 
 import pytest
 
 from colmat_x.telegram_bot import (
     AnswerCallbackQuery,
+    BotAutomationMode,
     BotPermission,
     CallbackDecision,
     CallbackIntent,
+    CommandResult,
     DecisionResult,
     EditMessageText,
     MalformedTelegramUpdate,
@@ -89,6 +92,7 @@ class MemoryNonces:
 class FakeOperations:
     calls: list[tuple[object, ...]] = field(default_factory=list)
     decision_accepted: bool = True
+    command_accepted: bool = True
 
     def get_status(self, *, telegram_user_id: int, chat_id: int) -> str:
         self.calls.append(("status", telegram_user_id, chat_id))
@@ -97,6 +101,56 @@ class FakeOperations:
     def get_team(self, *, telegram_user_id: int, chat_id: int) -> str:
         self.calls.append(("team", telegram_user_id, chat_id))
         return "Administración: 1; Editores: 2"
+
+    def get_calendar(self, *, days: int, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("calendar", days, telegram_user_id, chat_id))
+        return f"Calendario para {days} días"
+
+    def get_mode(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("get_mode", telegram_user_id, chat_id))
+        return "Modo actual: human_review"
+
+    def set_mode(
+        self,
+        mode: BotAutomationMode,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("set_mode", mode, request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            f"Modo configurado: {mode.value}",
+            accepted=self.command_accepted,
+        )
+
+    def generate_draft(
+        self,
+        brief: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("generate", brief, request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            "Borrador generado; requiere revisión humana.",
+            accepted=self.command_accepted,
+        )
+
+    def request_publication(
+        self,
+        post_id: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("publication_request", post_id, request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            "Solicitud encolada; no se publicó durante el webhook.",
+            accepted=self.command_accepted,
+        )
 
     def approve_post(
         self,
@@ -161,6 +215,19 @@ class FakeActionClient:
     ) -> object:
         self.calls.append(("answer", callback_query_id, text, show_alert))
         return True
+
+
+@dataclass
+class ExpiredCallbackClient(FakeActionClient):
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> object:
+        self.calls.append(("answer", callback_query_id, text, show_alert))
+        raise RuntimeError("query is too old")
 
 
 def message_update(
@@ -268,6 +335,62 @@ def test_duplicate_update_is_idempotent_and_has_no_second_side_effect() -> None:
     assert updates.contexts[0] == (update, 101, -202)
 
 
+def test_callback_nonce_is_redacted_before_update_store_claim() -> None:
+    intent = CallbackIntent(
+        CallbackDecision.APPROVE,
+        "colmat-post-redaction",
+        SNAPSHOT,
+        telegram_user_id=101,
+        chat_id=-202,
+    )
+    nonces = MemoryNonces({NONCE: intent})
+    processor, updates, _, _, _ = make_processor(nonces=nonces)
+    raw_callback_data = approval_callback_data(NONCE)
+    update = callback_update(6, raw_callback_data)
+    callback = update["callback_query"]
+    assert isinstance(callback, dict)
+    message = callback["message"]
+    assert isinstance(message, dict)
+    message["reply_markup"] = {
+        "inline_keyboard": [
+            [
+                {"text": "Aprobar", "callback_data": raw_callback_data},
+                {"text": "Ayuda", "url": "https://example.test/help"},
+            ]
+        ]
+    }
+
+    processor.process_update(update, secret_token=SECRET)
+    replay = processor.process_update(update, secret_token=SECRET)
+
+    durable_payload = updates.contexts[0][0]
+    assert isinstance(durable_payload, dict)
+    durable_callback = durable_payload["callback_query"]
+    assert isinstance(durable_callback, dict)
+    assert durable_callback["data"] == {
+        "_redacted": "callback_query.data",
+        "sha256": hashlib.sha256(raw_callback_data.encode()).hexdigest(),
+        "byte_length": len(raw_callback_data.encode()),
+        "kind": "text",
+        "decision": "approve",
+    }
+    durable_button = durable_callback["message"]["reply_markup"]["inline_keyboard"][0][0]
+    assert durable_button["callback_data"] == {
+        "_redacted": "callback_data",
+        "sha256": hashlib.sha256(raw_callback_data.encode()).hexdigest(),
+        "byte_length": len(raw_callback_data.encode()),
+        "kind": "text",
+        "decision": "approve",
+    }
+    assert durable_callback["message"]["reply_markup"]["inline_keyboard"][0][1] == {
+        "text": "Ayuda",
+        "url": "https://example.test/help",
+    }
+    assert NONCE not in repr(durable_payload)
+    assert replay.duplicate
+    assert updates.contexts[1][0] == durable_payload
+
+
 def test_status_uses_numeric_user_and_chat_identity_not_username() -> None:
     processor, _, authorizer, _, operations = make_processor()
 
@@ -335,6 +458,218 @@ def test_team_requires_its_own_rbac_permission() -> None:
     action = result.actions[0]
     assert isinstance(action, SendMessage)
     assert "no tienes permiso" in action.text.casefold()
+    assert operations.calls == []
+
+
+@pytest.mark.parametrize(
+    ("command", "permission", "operation"),
+    [
+        ("/calendario", BotPermission.VIEW_CALENDAR, "calendar"),
+        ("/modo", BotPermission.MANAGE_MODE, "get_mode"),
+        ("/generar Un dato verificable", BotPermission.GENERATE, "generate"),
+        ("/publicar draft-001", BotPermission.REQUEST_PUBLISH, "publication_request"),
+    ],
+)
+def test_each_control_command_requires_its_explicit_permission(
+    command: str,
+    permission: BotPermission,
+    operation: str,
+) -> None:
+    processor, _, authorizer, _, operations = make_processor(permissions={BotPermission.ACCESS})
+
+    result = processor.process_update(message_update(21, command), secret_token=SECRET)
+
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert "no tienes permiso" in action.text.casefold()
+    assert (101, -202, permission) in authorizer.calls
+    assert all(call[0] != operation for call in operations.calls)
+
+
+@pytest.mark.parametrize(
+    ("argument", "expected_days"),
+    [("", 7), ("1", 1), ("31", 31)],
+)
+def test_calendar_has_a_bounded_horizon(argument: str, expected_days: int) -> None:
+    processor, _, _, _, operations = make_processor()
+    command = f"/calendario {argument}".rstrip()
+
+    result = processor.process_update(
+        message_update(22 + expected_days, command),
+        secret_token=SECRET,
+    )
+
+    assert operations.calls == [("calendar", expected_days, 101, -202)]
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text == f"Calendario para {expected_days} días"
+
+
+@pytest.mark.parametrize("argument", ["0", "32", "-1", "+2", "1.5", "7 extra"])
+def test_calendar_rejects_unbounded_or_ambiguous_arguments(argument: str) -> None:
+    processor, _, _, _, operations = make_processor()
+
+    result = processor.process_update(
+        message_update(70 + len(argument), f"/calendario {argument}"),
+        secret_token=SECRET,
+    )
+
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text.startswith("Uso: /calendario")
+    assert operations.calls == []
+
+
+def test_mode_can_be_queried_with_explicit_permission() -> None:
+    processor, _, authorizer, _, operations = make_processor()
+
+    result = processor.process_update(message_update(90, "/modo"), secret_token=SECRET)
+
+    assert operations.calls == [("get_mode", 101, -202)]
+    assert (101, -202, BotPermission.MANAGE_MODE) in authorizer.calls
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text == "Modo actual: human_review"
+
+
+def test_mode_can_only_be_forced_to_human_review_from_telegram() -> None:
+    processor, _, _, _, operations = make_processor()
+
+    result = processor.process_update(
+        message_update(91, "/modo HUMAN_REVIEW"),
+        secret_token=SECRET,
+    )
+
+    assert operations.calls == [
+        ("set_mode", BotAutomationMode.HUMAN_REVIEW, "telegram:91:modo", 101, -202)
+    ]
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text == "Modo configurado: human_review"
+
+
+def test_direct_mode_is_delegated_only_after_permission_with_risk_warning() -> None:
+    processor, _, authorizer, _, operations = make_processor()
+
+    result = processor.process_update(message_update(92, "/modo direct"), secret_token=SECRET)
+
+    assert (101, -202, BotPermission.MANAGE_MODE) in authorizer.calls
+    assert operations.calls == [
+        ("set_mode", BotAutomationMode.DIRECT, "telegram:92:modo", 101, -202)
+    ]
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert "advertencia" in action.text.casefold()
+    assert "kill switch" in action.text.casefold()
+    assert "doble compuerta" in action.text.casefold()
+
+
+@pytest.mark.parametrize("argument", ["automatico", "human_review extra", "direct now"])
+def test_mode_rejects_unknown_or_extra_arguments(argument: str) -> None:
+    processor, _, _, _, operations = make_processor()
+
+    result = processor.process_update(
+        message_update(93 + len(argument), f"/modo {argument}"),
+        secret_token=SECRET,
+    )
+
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text == "Uso: /modo [human_review|direct]"
+    assert operations.calls == []
+
+
+def test_generate_normalizes_and_bounds_brief_without_approving() -> None:
+    processor, _, _, _, operations = make_processor()
+
+    result = processor.process_update(
+        message_update(100, "/generar  Dato verificable\n  sobre Colombia  "),
+        secret_token=SECRET,
+    )
+
+    assert operations.calls == [
+        ("generate", "Dato verificable sobre Colombia", "telegram:100:generar", 101, -202)
+    ]
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert "requiere revisión humana" in action.text
+    assert all(call[0] not in {"approve", "publication_request"} for call in operations.calls)
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ["", "x" * 1001, "dato\x00oculto", "dato\x01oculto"],
+)
+def test_generate_rejects_missing_oversized_or_control_briefs(argument: str) -> None:
+    processor, _, _, _, operations = make_processor()
+    command = f"/generar {argument}"
+
+    result = processor.process_update(
+        message_update(110 + len(argument), command),
+        secret_token=SECRET,
+    )
+
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text.startswith("Uso: /generar")
+    assert operations.calls == []
+
+
+def test_publish_only_creates_an_idempotent_queue_request() -> None:
+    processor, _, _, _, operations = make_processor()
+    update = message_update(120, "/publicar 550e8400-e29b-41d4-a716-446655440000")
+
+    first = processor.process_update(update, secret_token=SECRET)
+    duplicate = processor.process_update(update, secret_token=SECRET)
+
+    assert duplicate.duplicate is True
+    assert operations.calls == [
+        (
+            "publication_request",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "telegram:120:publicar",
+            101,
+            -202,
+        )
+    ]
+    action = first.actions[0]
+    assert isinstance(action, SendMessage)
+    assert "solicitud encolada" in action.text.casefold()
+    assert "no se publicó durante el webhook" in action.text.casefold()
+    assert not hasattr(operations, "publish_post")
+    assert not hasattr(operations, "create_post")
+
+
+@pytest.mark.parametrize(
+    "post_id",
+    ["", "ab", "../draft-1", "draft:1", "draft 1", "x" * 81],
+)
+def test_publish_rejects_unsafe_or_ambiguous_identifiers(post_id: str) -> None:
+    processor, _, _, _, operations = make_processor()
+    command = f"/publicar {post_id}"
+
+    result = processor.process_update(
+        message_update(130 + len(post_id), command),
+        secret_token=SECRET,
+    )
+
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    assert action.text == "Uso: /publicar <id de borrador aprobado>"
+    assert operations.calls == []
+
+
+def test_help_describes_controls_and_keeps_direct_publication_disabled() -> None:
+    processor, _, _, _, operations = make_processor()
+
+    result = processor.process_update(message_update(140, "/ayuda"), secret_token=SECRET)
+
+    action = result.actions[0]
+    assert isinstance(action, SendMessage)
+    for command in ("/calendario", "/modo", "/generar", "/publicar"):
+        assert command in action.text
+    assert "direct exige autorización y doble compuerta" in action.text
+    assert "no llama a X" in action.text
     assert operations.calls == []
 
 
@@ -581,6 +916,22 @@ def test_execute_bot_actions_dispatches_without_network_and_removes_buttons() ->
         ("send", -202, "Estado", 7),
         ("answer", "query-70", "Registrado", False),
         ("edit", -202, 17, "Aprobado", {"inline_keyboard": []}),
+    ]
+
+
+def test_replayed_callback_edits_before_ignoring_an_expired_ephemeral_answer() -> None:
+    client = ExpiredCallbackClient()
+    actions = (
+        AnswerCallbackQuery(101, -202, "query-70", "Registrado"),
+        EditMessageText(101, -202, 17, "Aprobado"),
+    )
+
+    results = execute_bot_actions(client, actions, replay=True)
+
+    assert results == ({"message_id": 17}, None)
+    assert client.calls == [
+        ("edit", -202, 17, "Aprobado", {"inline_keyboard": []}),
+        ("answer", "query-70", "Registrado", False),
     ]
 
 

@@ -1,0 +1,44 @@
+version: 1
+timezone: America/Bogota
+daily_limit: 2
+
+# La publicación directa permanece cerrada por defecto. Activarla aquí no basta:
+# también exige COLMAT_DIRECT_PUBLISH_ENABLED=true en el entorno de ejecución.
+direct:
+  enabled: false
+  minimum_engagement_score: 85
+
+slots:
+  - id: dato-manana
+    at: "08:30"
+    weekdays:
+      - lunes
+    mode: human_review
+    category: dato_semana
+    institution: escuela_colombiana_de_filosofia
+    brief: >-
+      Selecciona una cifra colombiana reciente, cita una fuente primaria comprobable
+      y explica su relevancia territorial sin adjetivos inflados.
+    generate_image: true
+    # La IA nunca puede marcar su propia fuente como verificada. Un humano debe
+    # establecer verified=true y dejar aquí una referencia auditable antes de direct.
+    evidence:
+      verified: false
+      reference: null
+      expected_figure: null
+      expected_source: null
+
+  - id: territorio-tarde
+    at: "16:30"
+    mode: human_review
+    category: ficha_territorio
+    institution: colmat
+    brief: >-
+      Resume un diagnóstico municipal verificable con cifra, fuente y contexto local;
+      conserva la separación institucional definida en el manual.
+    generate_image: false
+    evidence:
+      verified: false
+      reference: null
+      expected_figure: null
+      expected_source: null

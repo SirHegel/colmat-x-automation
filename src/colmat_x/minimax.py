@@ -236,6 +236,7 @@ class MiniMaxClient:
     def _post_json(
         self, endpoint: str, request_body: Mapping[str, Any], *, read_timeout: float
     ) -> dict[str, Any]:
+        transport_error: str | None = None
         try:
             response = self.session.post(
                 endpoint,
@@ -246,12 +247,18 @@ class MiniMaxClient:
                 json=request_body,
                 timeout=(self.connect_timeout_seconds, read_timeout),
             )
-        except requests.Timeout as exc:
+        except requests.Timeout:
+            response = None
+            transport_error = "timeout"
+        except requests.RequestException:
+            response = None
+            transport_error = "request"
+        if transport_error == "timeout":
             raise MiniMaxTransportError(
                 "MiniMax agotó el tiempo de espera; no se obtuvo una respuesta"
-            ) from exc
-        except requests.RequestException as exc:
-            raise MiniMaxTransportError("No fue posible contactar la API de MiniMax") from exc
+            )
+        if response is None:
+            raise MiniMaxTransportError("No fue posible contactar la API de MiniMax")
 
         if response.status_code < 200 or response.status_code >= 300:
             detail = _http_error_detail(response, secret=self._api_key)
@@ -262,10 +269,13 @@ class MiniMaxClient:
             if response.status_code == 429:
                 raise MiniMaxAPIError(f"MiniMax respondió 429: límite de uso excedido; {detail}")
             raise MiniMaxAPIError(f"MiniMax respondió {response.status_code}: {detail}")
+        invalid_document = object()
         try:
             payload = response.json()
-        except ValueError as exc:
-            raise MiniMaxResponseError("MiniMax no devolvió JSON válido") from exc
+        except ValueError:
+            payload = invalid_document
+        if payload is invalid_document:
+            raise MiniMaxResponseError("MiniMax no devolvió JSON válido")
         if not isinstance(payload, dict):
             raise MiniMaxResponseError("La respuesta de MiniMax debe ser un objeto JSON")
         _validate_base_response(payload, secret=self._api_key)

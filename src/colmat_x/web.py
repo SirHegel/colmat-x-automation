@@ -4,16 +4,20 @@ import json
 import os
 import threading
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from json import JSONDecodeError
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from colmat_x.platform_store import (
+    CANONICAL_AUTOMATION_WEEKDAYS,
+    AutomationMode,
     ConflictError,
     DraftStatus,
     NotFoundError,
@@ -27,6 +31,9 @@ from colmat_x.telegram_api import (
     TelegramCredentials,
 )
 from colmat_x.telegram_bot import (
+    BotAutomationMode,
+    ClaimedTelegramUpdateError,
+    CommandResult,
     DecisionResult,
     MalformedTelegramUpdate,
     TelegramWebhookProcessor,
@@ -37,6 +44,76 @@ from colmat_x.telegram_bot import (
 
 MAX_TELEGRAM_UPDATE_BYTES = 1_048_576
 TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+PRIVILEGED_WORKER_ENVIRONMENT = frozenset(
+    {
+        "EXPECTED_X_USER_ID",
+        "EXPECTED_X_USERNAME",
+        "MINIMAX_API_KEY",
+        "X_ACCESS_TOKEN",
+        "X_ACCESS_TOKEN_SECRET",
+        "X_CONSUMER_KEY",
+        "X_CONSUMER_SECRET",
+    }
+)
+REQUIRED_DATABASE_COLUMNS: dict[str, frozenset[str]] = {
+    "approvals": frozenset({"revision_id", "snapshot_hash"}),
+    "automation_review_notifications": frozenset(
+        {
+            "automation_run_id",
+            "claim_fence",
+            "claim_token_hash",
+            "lease_expires_at",
+            "status",
+        }
+    ),
+    "automation_runs": frozenset({"settings_version", "slot_hash", "status"}),
+    "automation_settings": frozenset({"enabled", "mode", "slots", "version"}),
+    "callback_intents": frozenset({"nonce_hash", "snapshot_hash"}),
+    "drafts": frozenset({"approved_revision_id", "current_revision_id", "status"}),
+    "generation_notifications": frozenset(
+        {
+            "generation_request_id",
+            "claim_fence",
+            "claim_token_hash",
+            "lease_expires_at",
+            "status",
+        }
+    ),
+    "generation_requests": frozenset(
+        {
+            "claim_fence",
+            "claim_token_hash",
+            "idempotency_key",
+            "lease_expires_at",
+            "status",
+        }
+    ),
+    "media_assets": frozenset({"byte_size", "sha256"}),
+    "memberships": frozenset({"role", "user_id", "workspace_id"}),
+    "publication_requests": frozenset(
+        {
+            "claim_fence",
+            "claim_token_hash",
+            "lease_expires_at",
+            "publish_attempt_id",
+            "snapshot_hash",
+            "status",
+        }
+    ),
+    "publish_attempts": frozenset({"snapshot_hash", "status"}),
+    "revisions": frozenset({"image_sha256", "snapshot_hash"}),
+    "telegram_bindings": frozenset({"chat_id", "telegram_user_id", "user_id"}),
+    "telegram_updates": frozenset(
+        {
+            "business_result",
+            "claim_fence",
+            "claim_token_hash",
+            "lease_expires_at",
+            "prepared_actions",
+        }
+    ),
+    "users": frozenset({"username"}),
+}
 
 
 class WebConfigurationError(RuntimeError):
@@ -46,8 +123,18 @@ class WebConfigurationError(RuntimeError):
 class PlatformTelegramOperations:
     """Operaciones editoriales permitidas desde Telegram; nunca publica contenido."""
 
-    def __init__(self, store: PlatformStore) -> None:
+    def __init__(
+        self,
+        store: PlatformStore,
+        *,
+        generate_images: bool = True,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self.store = store
+        if not isinstance(generate_images, bool):
+            raise TypeError("generate_images debe ser booleano")
+        self._generate_images = generate_images
+        self._now = now or (lambda: datetime.now(UTC))
 
     def get_status(self, *, telegram_user_id: int, chat_id: int) -> str:
         actor = self.store.resolve_telegram_actor(
@@ -78,6 +165,163 @@ class PlatformTelegramOperations:
             state = "activo" if user.is_active else "inactivo"
             lines.append(f"• {user.display_name} — {membership.role} ({state})")
         return "\n".join(lines)
+
+    def get_calendar(
+        self,
+        *,
+        days: int,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> str:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        settings = self.store.get_automation_settings(actor_id=actor.id)
+        zone = ZoneInfo(settings.timezone)
+        first_day = self._now().astimezone(zone).date()
+        lines = [
+            "Agenda Colmat "
+            f"({settings.timezone}; {'activa' if settings.enabled else 'pausada'}; "
+            f"modo {settings.mode}):"
+        ]
+        slots = tuple(settings.slots or ())
+        if not slots:
+            lines.append("• No hay slots diarios configurados.")
+            return "\n".join(lines)
+        for offset in range(days):
+            local_day = first_day + timedelta(days=offset)
+            for raw_slot in slots:
+                if not isinstance(raw_slot, Mapping):
+                    continue
+                weekdays = raw_slot.get("weekdays")
+                if weekdays is not None and (
+                    not isinstance(weekdays, list)
+                    or CANONICAL_AUTOMATION_WEEKDAYS[local_day.weekday()] not in weekdays
+                ):
+                    continue
+                slot_id = str(raw_slot.get("id") or "slot")
+                at = str(raw_slot.get("at") or "--:--")
+                mode = str(raw_slot.get("mode") or settings.mode)
+                lines.append(f"• {local_day.isoformat()} {at} — {slot_id} [{mode}]")
+        return "\n".join(lines)
+
+    def get_mode(self, *, telegram_user_id: int, chat_id: int) -> str:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        settings = self.store.get_automation_settings(actor_id=actor.id)
+        state = "activa" if settings.enabled else "pausada"
+        return f"Modo actual: {settings.mode}; automatización {state}; versión {settings.version}."
+
+    def set_mode(
+        self,
+        mode: BotAutomationMode,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        del request_id  # La CAS persistida y el update_id deduplicado protegen este cambio.
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            current = self.store.get_automation_settings(actor_id=actor.id)
+            requested_mode = AutomationMode(mode.value)
+            slots = _automation_slots_for_mode(current.slots, requested_mode)
+            updated = self.store.update_automation_settings(
+                actor_id=actor.id,
+                expected_version=current.version,
+                mode=requested_mode,
+                slots=slots,
+            )
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return CommandResult(
+                "No se cambió el modo: faltan permisos, la versión cambió o el kill switch "
+                "direct sigue cerrado.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Modo configurado: {updated.mode}; versión {updated.version}. "
+            "Este cambio no publica contenido por sí solo."
+        )
+
+    def generate_draft(
+        self,
+        brief: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            generation_request = self.store.enqueue_generation_request(
+                brief,
+                actor_id=actor.id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                idempotency_key=request_id,
+                generate_image=self._generate_images,
+            )
+        except (
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            ValueError,
+        ):
+            return CommandResult(
+                "No se encoló la generación. Revisa permisos y el vínculo de Telegram; "
+                "no se llamó a MiniMax ni se realizó ninguna publicación.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Generación encolada como {generation_request.id}. OpenClaw la asignará a "
+            "MiniMax fuera del webhook; el resultado siempre exigirá revisión humana"
+            f"{' e incluirá imagen' if generation_request.generate_image else ''}."
+        )
+
+    def request_publication(
+        self,
+        post_id: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            revision = self.store.get_current_revision(post_id, actor_id=actor.id)
+            publication_request = self.store.enqueue_publication_request(
+                post_id,
+                actor_id=actor.id,
+                expected_snapshot_hash=revision.snapshot_hash,
+                idempotency_key=request_id,
+            )
+        except (
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            StaleSnapshotError,
+            ValueError,
+        ):
+            return CommandResult(
+                "No se encoló: el borrador debe estar aprobado, conservar el snapshot y ser "
+                "solicitado por un publisher autorizado.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Solicitud encolada como {publication_request.id}; no se publicó durante el webhook."
+        )
 
     def approve_post(
         self,
@@ -133,6 +377,30 @@ class PlatformTelegramOperations:
         return DecisionResult(f"El borrador {post_id} fue rechazado.")
 
 
+def _automation_slots_for_mode(
+    slots: object,
+    mode: AutomationMode,
+) -> list[dict[str, object]]:
+    if not isinstance(slots, list):
+        raise ValueError("Los slots persistidos no tienen formato de lista")
+    aligned: list[dict[str, object]] = []
+    for index, raw_slot in enumerate(slots):
+        if not isinstance(raw_slot, Mapping):
+            raise ValueError(f"El slot persistido {index} no tiene formato de objeto")
+        aligned.append({**raw_slot, "mode": mode.value})
+    return aligned
+
+
+def _generation_default_image(environ: Mapping[str, str]) -> bool:
+    raw_value = environ.get("COLMAT_GENERATION_DEFAULT_IMAGE", "true")
+    value = raw_value.strip().casefold() if isinstance(raw_value, str) else ""
+    if value not in {"true", "false"}:
+        raise WebConfigurationError(
+            "COLMAT_GENERATION_DEFAULT_IMAGE debe ser true o false exactamente"
+        )
+    return value == "true"
+
+
 @dataclass(frozen=True, slots=True)
 class WebRuntime:
     store: Any
@@ -166,6 +434,13 @@ class RuntimeProvider:
 
     def readiness(self) -> tuple[bool, dict[str, str]]:
         checks: dict[str, str] = {}
+        if self.environ.get("VERCEL"):
+            checks["worker_secrets"] = (
+                "error"
+                if any(self.environ.get(name, "") for name in PRIVILEGED_WORKER_ENVIRONMENT)
+                else "ok"
+            )
+
         if self._injected.processor is None:
             try:
                 TelegramWebhookSecret.from_environment(environ=self.environ)
@@ -196,6 +471,15 @@ class RuntimeProvider:
                 if engine is not None:
                     with engine.connect() as connection:
                         connection.execute(text("SELECT 1"))
+                        inspector = inspect(connection)
+                        for table_name, expected_columns in REQUIRED_DATABASE_COLUMNS.items():
+                            if not inspector.has_table(table_name):
+                                raise RuntimeError("El esquema operativo está incompleto")
+                            actual_columns = {
+                                column["name"] for column in inspector.get_columns(table_name)
+                            }
+                            if not expected_columns.issubset(actual_columns):
+                                raise RuntimeError("El esquema operativo está incompleto")
                 checks["database"] = "ok"
             except Exception:
                 checks["database"] = "error"
@@ -208,7 +492,10 @@ class RuntimeProvider:
             database_url = self.environ.get("DATABASE_URL", "").strip() or None
             if self.environ.get("VERCEL") and database_url is None:
                 raise WebConfigurationError("DATABASE_URL es obligatorio en Vercel")
-            store = PlatformStore(database_url=database_url)
+            store = PlatformStore(
+                database_url=database_url,
+                create_schema=not bool(self.environ.get("VERCEL")),
+            )
 
         processor = self._injected.processor
         if processor is None:
@@ -217,7 +504,10 @@ class RuntimeProvider:
                 webhook_secret=webhook_secret,
                 update_store=store,
                 authorizer=store,
-                operations=PlatformTelegramOperations(store),
+                operations=PlatformTelegramOperations(
+                    store,
+                    generate_images=_generation_default_image(self.environ),
+                ),
                 callback_nonces=store,
             )
 
@@ -299,6 +589,18 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="service unavailable",
             ) from exc
+        except ClaimedTelegramUpdateError as exc:
+            _finish_failed_update(
+                provider,
+                payload,
+                exc.__cause__ or exc,
+                claim_token=exc.claim_token,
+                claim_fence=exc.claim_fence,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="service unavailable",
+            ) from exc
         except Exception as exc:
             _finish_failed_update(provider, payload, exc)
             raise HTTPException(
@@ -307,13 +609,28 @@ def create_app(
             ) from exc
 
         if result.duplicate:
+            if result.retryable:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="service unavailable",
+                )
             return {"ok": True, "update_id": result.update_id, "duplicate": True}
 
         try:
-            execute_bot_actions(runtime.telegram_client, result.actions)
-            runtime.store.finish_telegram_update(result.update_id)
+            execute_bot_actions(
+                runtime.telegram_client,
+                result.actions,
+                replay=result.replayed,
+            )
+            _finish_update(runtime.store, result.update_id, result=result)
         except Exception as exc:
-            _finish_failed_update(provider, payload, exc)
+            _finish_failed_update(
+                provider,
+                payload,
+                exc,
+                claim_token=result.claim_token,
+                claim_fence=result.claim_fence,
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="service unavailable",
@@ -365,15 +682,45 @@ def _finish_failed_update(
     provider: RuntimeProvider,
     payload: Mapping[str, object],
     exc: Exception,
+    *,
+    claim_token: str | None = None,
+    claim_fence: int | None = None,
 ) -> None:
     update_id = payload.get("update_id")
     if isinstance(update_id, bool) or not isinstance(update_id, int) or update_id < 0:
         return
     try:
         runtime = provider.get()
-        runtime.store.finish_telegram_update(
+        _finish_update(
+            runtime.store,
             update_id,
             error=f"webhook_failed:{type(exc).__name__}",
+            claim_token=claim_token,
+            claim_fence=claim_fence,
         )
     except Exception:
         return
+
+
+def _finish_update(
+    store: object,
+    update_id: int,
+    *,
+    result: object | None = None,
+    error: str | None = None,
+    claim_token: str | None = None,
+    claim_fence: int | None = None,
+) -> object:
+    """Finaliza stores cercados sin romper fakes/implementaciones heredadas."""
+
+    if result is not None:
+        claim_token = getattr(result, "claim_token", None)
+        claim_fence = getattr(result, "claim_fence", None)
+    kwargs: dict[str, object] = {}
+    if error is not None:
+        kwargs["error"] = error
+    if claim_token is not None and claim_fence is not None:
+        kwargs["claim_token"] = claim_token
+        kwargs["claim_fence"] = claim_fence
+    finish = store.finish_telegram_update  # type: ignore[attr-defined]
+    return finish(update_id, **kwargs)
