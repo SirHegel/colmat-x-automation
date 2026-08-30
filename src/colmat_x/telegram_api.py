@@ -17,6 +17,7 @@ DEFAULT_TOKEN_FILE_ENVIRONMENT_VARIABLE = "TELEGRAM_BOT_TOKEN_FILE"
 MAX_TOKEN_FILE_BYTES = 1024
 _COMMAND_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 _WEBHOOK_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+_TOKEN_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class TelegramConfigurationError(ValueError):
@@ -59,6 +60,7 @@ class TelegramCredentials:
         variable: str = DEFAULT_TOKEN_ENVIRONMENT_VARIABLE,
         *,
         file_variable: str = DEFAULT_TOKEN_FILE_ENVIRONMENT_VARIABLE,
+        token_directory: str | Path | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> TelegramCredentials:
         if not isinstance(variable, str) or not variable or not isinstance(file_variable, str):
@@ -75,7 +77,10 @@ class TelegramCredentials:
                 f"{variable} y {file_variable} son mutuamente excluyentes"
             )
         if token_file:
-            token = _read_token_file(token_file)
+            token = _read_token_file(
+                Path(token_directory) if token_directory is not None else Path.cwd() / ".state",
+                _safe_token_filename(token_file),
+            )
         if not token:
             raise TelegramConfigurationError(
                 f"Falta la credencial requerida: {variable} o {file_variable}"
@@ -383,8 +388,23 @@ def _validate_webhook_url(url: object) -> None:
         )
 
 
-def _read_token_file(raw_path: str) -> str:
-    path = Path(raw_path).expanduser()
+def _safe_token_filename(raw_path: str) -> str:
+    """Reduce la entrada de entorno a un nombre, nunca a una expresión de ruta."""
+
+    normalized = raw_path.replace("\\", "/")
+    filename = os.path.basename(normalized)
+    if _TOKEN_FILE_NAME_PATTERN.fullmatch(filename) is None or normalized not in {
+        filename,
+        f".state/{filename}",
+    }:
+        raise TelegramConfigurationError(
+            "TELEGRAM_BOT_TOKEN_FILE solo admite un nombre dentro de .state"
+        )
+    return filename
+
+
+def _read_token_file(token_directory: Path, filename: str) -> str:
+    path = token_directory / filename
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
