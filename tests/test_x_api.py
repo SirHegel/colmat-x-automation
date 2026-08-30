@@ -5,12 +5,14 @@ import requests
 
 from colmat_x.config import XCredentials
 from colmat_x.x_api import (
+    MAX_IMAGE_BYTES,
     AmbiguousMediaError,
     AmbiguousPublishError,
     XApiClient,
     XApiError,
     XIdentityMismatchError,
 )
+from tests.factories import ONE_PIXEL_JPEG, ONE_PIXEL_PNG, ONE_PIXEL_WEBP
 
 
 class FakeResponse:
@@ -91,6 +93,39 @@ def test_create_post_reports_definite_4xx(monkeypatch) -> None:
         api.create_post("Hola")
 
 
+def test_provider_error_redacts_all_x_credentials(monkeypatch) -> None:
+    api = client()
+    monkeypatch.setattr(
+        api.session,
+        "post",
+        lambda *args, **kwargs: FakeResponse(
+            400,
+            {"detail": "reflected key token secret"},
+        ),
+    )
+
+    with pytest.raises(XApiError) as captured:
+        api.create_post("Hola")
+
+    assert "token" not in str(captured.value)
+    assert "secret" not in str(captured.value)
+    assert "[REDACTED]" in str(captured.value)
+
+
+def test_invalid_success_document_is_not_retained_as_exception_context(monkeypatch) -> None:
+    api = client()
+    monkeypatch.setattr(
+        api.session,
+        "post",
+        lambda *args, **kwargs: FakeResponse(201, ValueError("reflected secret")),
+    )
+
+    with pytest.raises(AmbiguousPublishError) as captured:
+        api.create_post("Hola")
+
+    assert captured.value.__context__ is None
+
+
 def test_create_post_treats_timeout_as_ambiguous(monkeypatch) -> None:
     api = client()
 
@@ -99,8 +134,9 @@ def test_create_post_treats_timeout_as_ambiguous(monkeypatch) -> None:
 
     monkeypatch.setattr(api.session, "post", timeout)
 
-    with pytest.raises(AmbiguousPublishError, match="revisa la cuenta"):
+    with pytest.raises(AmbiguousPublishError, match="revisa la cuenta") as captured:
         api.create_post("Hola")
+    assert captured.value.__context__ is None
 
 
 def test_create_post_treats_broken_response_body_as_ambiguous(monkeypatch) -> None:
@@ -170,7 +206,7 @@ def test_upload_image_sets_alt_text_before_returning(monkeypatch) -> None:
     monkeypatch.setattr(api.session, "post", post)
 
     result = api.upload_image(
-        b"image-bytes", filename="dato.png", mime_type="image/png", alt_text="Gráfica"
+        ONE_PIXEL_PNG, filename="dato.png", mime_type="image/png", alt_text="Gráfica"
     )
 
     assert result.id == "777"
@@ -193,7 +229,10 @@ def test_upload_image_blocks_when_alt_text_is_not_confirmed(monkeypatch) -> None
 
     with pytest.raises(AmbiguousMediaError, match="bloqueada"):
         api.upload_image(
-            b"image-bytes", filename="dato.png", mime_type="image/png", alt_text="Gráfica"
+            ONE_PIXEL_PNG,
+            filename="dato.png",
+            mime_type="image/png",
+            alt_text="Gráfica",
         )
 
 
@@ -201,9 +240,9 @@ def test_upload_image_blocks_when_alt_text_is_not_confirmed(monkeypatch) -> None
     ("content", "mime_type", "alt_text", "message"),
     [
         (b"", "image/png", "Gráfica", "vacía"),
-        (b"ok", "image/svg+xml", "Gráfica", "JPEG"),
-        (b"ok", "image/png", "", "obligatorio"),
-        (b"ok", "image/png", "x" * 1001, "1000"),
+        (ONE_PIXEL_PNG, "image/svg+xml", "Gráfica", "JPEG"),
+        (ONE_PIXEL_PNG, "image/png", "", "obligatorio"),
+        (ONE_PIXEL_PNG, "image/png", "x" * 1001, "1000"),
     ],
 )
 def test_upload_image_validates_input(content, mime_type, alt_text, message) -> None:
@@ -213,6 +252,81 @@ def test_upload_image_validates_input(content, mime_type, alt_text, message) -> 
             filename="dato.png",
             mime_type=mime_type,
             alt_text=alt_text,
+        )
+
+
+@pytest.mark.parametrize(
+    ("content", "mime_type"),
+    [
+        (ONE_PIXEL_JPEG, "image/jpeg"),
+        (ONE_PIXEL_PNG, "image/png"),
+        (ONE_PIXEL_WEBP, "image/webp"),
+    ],
+)
+def test_upload_image_accepts_only_matching_supported_signatures(
+    monkeypatch, content: bytes, mime_type: str
+) -> None:
+    api = client()
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse(200, {"data": {"id": "777"}})
+
+    monkeypatch.setattr(api.session, "post", post)
+
+    api.upload_image(
+        content,
+        filename="imagen.bin",
+        mime_type=mime_type,
+        alt_text="Descripción accesible",
+    )
+
+    assert calls[0][1]["files"]["media"][2] == mime_type
+
+
+@pytest.mark.parametrize(
+    ("content", "mime_type", "message"),
+    [
+        (b"contenido que no es una imagen", "image/png", "firma"),
+        (ONE_PIXEL_PNG, "image/jpeg", "no coincide"),
+        (ONE_PIXEL_JPEG, "image/webp", "no coincide"),
+    ],
+)
+def test_upload_image_rejects_false_or_mismatched_bytes_before_network(
+    monkeypatch, content: bytes, mime_type: str, message: str
+) -> None:
+    api = client()
+
+    def unexpected_post(*_args, **_kwargs):
+        pytest.fail("No debe contactar a X con bytes no confiables")
+
+    monkeypatch.setattr(api.session, "post", unexpected_post)
+
+    with pytest.raises(ValueError, match=message):
+        api.upload_image(
+            content,
+            filename="imagen.bin",
+            mime_type=mime_type,
+            alt_text="Descripción accesible",
+        )
+
+
+def test_upload_image_preserves_five_mib_limit_before_network(monkeypatch) -> None:
+    api = client()
+    oversized = ONE_PIXEL_PNG + b"x" * (MAX_IMAGE_BYTES - len(ONE_PIXEL_PNG) + 1)
+
+    def unexpected_post(*_args, **_kwargs):
+        pytest.fail("No debe contactar a X con una imagen sobredimensionada")
+
+    monkeypatch.setattr(api.session, "post", unexpected_post)
+
+    with pytest.raises(ValueError, match="5 MB"):
+        api.upload_image(
+            oversized,
+            filename="imagen.png",
+            mime_type="image/png",
+            alt_text="Descripción accesible",
         )
 
 

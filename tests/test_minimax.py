@@ -195,8 +195,9 @@ def test_clear_http_and_transport_errors(monkeypatch, policy) -> None:
         monkeypatch,
         RecordingSession(error=requests.Timeout("late")),
     )
-    with pytest.raises(MiniMaxTransportError, match="tiempo de espera"):
+    with pytest.raises(MiniMaxTransportError, match="tiempo de espera") as captured:
         timeout.generate_draft("Dato", policy)
+    assert captured.value.__context__ is None
 
 
 def test_base_response_error_is_not_treated_as_success(monkeypatch, policy) -> None:

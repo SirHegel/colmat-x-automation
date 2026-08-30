@@ -10,6 +10,10 @@ from requests_oauthlib import OAuth1Session
 
 from colmat_x.config import XCredentials
 from colmat_x.domain import is_canonical_x_post_id
+from colmat_x.image_validation import (
+    SUPPORTED_IMAGE_MIME_TYPES,
+    sniff_supported_image_mime,
+)
 
 
 class XApiError(RuntimeError):
@@ -53,7 +57,7 @@ class XUserResponse:
 
 
 MEDIA_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,18}$")
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_IMAGE_TYPES = set(SUPPORTED_IMAGE_MIME_TYPES)
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_ALT_TEXT_LENGTH = 1000
 
@@ -65,6 +69,12 @@ class XApiClient:
         self.media_metadata_endpoint = "https://api.x.com/2/media/metadata"
         self.identity_endpoint = "https://api.x.com/2/users/me"
         self.timeout_seconds = timeout_seconds
+        self._redactions = (
+            credentials.consumer_key,
+            credentials.consumer_secret,
+            credentials.access_token,
+            credentials.access_token_secret,
+        )
         self.session = OAuth1Session(
             client_key=credentials.consumer_key,
             client_secret=credentials.consumer_secret,
@@ -97,15 +107,17 @@ class XApiClient:
                 json=payload,
                 timeout=self.timeout_seconds,
             )
-        except requests.RequestException as exc:
+        except requests.RequestException:
+            response = None
+        if response is None:
             raise AmbiguousPublishError(
                 "La conexión terminó sin una respuesta concluyente; revisa la cuenta de X "
                 "antes de reintentar"
-            ) from exc
+            )
 
         if response.status_code == 429:
             reset = response.headers.get("x-rate-limit-reset")
-            detail = _error_detail(response)
+            detail = _error_detail(response, secrets=self._redactions)
             suffix = f"; reset={reset}" if reset else ""
             raise XApiRateLimitError(f"X respondió 429: {detail}{suffix}")
         if response.status_code in {408, 409, 425} or response.status_code >= 500:
@@ -113,8 +125,12 @@ class XApiClient:
                 f"X respondió {response.status_code}; revisa la cuenta antes de reintentar"
             )
         if response.status_code != 201:
-            raise XApiError(f"X respondió {response.status_code}: {_error_detail(response)}")
+            raise XApiError(
+                f"X respondió {response.status_code}: "
+                f"{_error_detail(response, secrets=self._redactions)}"
+            )
 
+        invalid_document = object()
         try:
             payload: Any = response.json()
             data = payload["data"]
@@ -124,10 +140,12 @@ class XApiClient:
             post_id = raw_post_id
             raw_returned_text = data.get("text")
             returned_text = raw_returned_text if isinstance(raw_returned_text, str) else text
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError):
+            payload = invalid_document
+        if payload is invalid_document:
             raise AmbiguousPublishError(
                 "X respondió con éxito, pero no fue posible leer el ID de la publicación"
-            ) from exc
+            )
         return XPostResponse(id=post_id, text=returned_text)
 
     def upload_image(
@@ -146,6 +164,11 @@ class XApiClient:
             raise ValueError("La imagen supera el máximo de 5 MB de X")
         if mime_type not in ALLOWED_IMAGE_TYPES:
             raise ValueError("La imagen debe ser JPEG, PNG o WebP")
+        detected_mime_type = sniff_supported_image_mime(content)
+        if detected_mime_type is None:
+            raise ValueError("Los bytes no tienen una firma de imagen JPEG, PNG o WebP válida")
+        if detected_mime_type != mime_type:
+            raise ValueError("El MIME declarado no coincide con la firma de la imagen")
         normalized_alt_text = alt_text.strip()
         if not normalized_alt_text:
             raise ValueError("El texto alternativo es obligatorio")
@@ -159,12 +182,19 @@ class XApiClient:
                 files={"media": (filename, content, mime_type)},
                 timeout=self.timeout_seconds,
             )
-        except requests.RequestException as exc:
+        except requests.RequestException:
+            response = None
+        if response is None:
             raise AmbiguousMediaError(
                 "La conexión terminó sin confirmar la carga de la imagen; no se publicó nada"
-            ) from exc
+            )
 
-        _raise_media_response_error(response, operation="subir la imagen")
+        _raise_media_response_error(
+            response,
+            operation="subir la imagen",
+            secrets=self._redactions,
+        )
+        invalid_document = object()
         try:
             payload: Any = response.json()
             data = payload["data"]
@@ -175,10 +205,12 @@ class XApiClient:
             media_key = raw_media_key if isinstance(raw_media_key, str) else None
             raw_expiry = data.get("expires_after_secs")
             expiry = raw_expiry if isinstance(raw_expiry, int) and raw_expiry >= 0 else None
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError):
+            payload = invalid_document
+        if payload is invalid_document:
             raise AmbiguousMediaError(
                 "X aceptó la imagen, pero no fue posible leer su identificador"
-            ) from exc
+            )
 
         self.set_media_alt_text(media_id, normalized_alt_text)
         return XMediaResponse(id=media_id, media_key=media_key, expires_after_secs=expiry)
@@ -195,11 +227,17 @@ class XApiClient:
                 json={"id": media_id, "metadata": {"alt_text": {"text": normalized_alt_text}}},
                 timeout=self.timeout_seconds,
             )
-        except requests.RequestException as exc:
+        except requests.RequestException:
+            response = None
+        if response is None:
             raise AmbiguousMediaError(
                 "No fue posible confirmar el texto alternativo; la publicación quedó bloqueada"
-            ) from exc
-        _raise_media_response_error(response, operation="asociar el texto alternativo")
+            )
+        _raise_media_response_error(
+            response,
+            operation="asociar el texto alternativo",
+            secrets=self._redactions,
+        )
 
     def verify_identity(
         self,
@@ -211,13 +249,16 @@ class XApiClient:
 
         try:
             response = self.session.get(self.identity_endpoint, timeout=self.timeout_seconds)
-        except requests.RequestException as exc:
-            raise XApiError("No fue posible verificar la identidad de la cuenta en X") from exc
+        except requests.RequestException:
+            response = None
+        if response is None:
+            raise XApiError("No fue posible verificar la identidad de la cuenta en X")
         if response.status_code != 200:
             raise XApiError(
                 f"X respondió {response.status_code} al verificar la cuenta: "
-                f"{_error_detail(response)}"
+                f"{_error_detail(response, secrets=self._redactions)}"
             )
+        invalid_document = object()
         try:
             payload: Any = response.json()
             data = payload["data"]
@@ -228,8 +269,10 @@ class XApiClient:
                 raise TypeError("data.id no tiene formato canónico")
             if not all(isinstance(value, str) and value.strip() for value in (username, name)):
                 raise TypeError("faltan datos de identidad")
-        except (ValueError, KeyError, TypeError) as exc:
-            raise XApiError("X devolvió una identidad incompleta") from exc
+        except (ValueError, KeyError, TypeError):
+            payload = invalid_document
+        if payload is invalid_document:
+            raise XApiError("X devolvió una identidad incompleta")
 
         if expected_user_id and user_id != expected_user_id.strip():
             raise XIdentityMismatchError("Las credenciales de X no pertenecen al user_id esperado")
@@ -238,27 +281,33 @@ class XApiClient:
         return XUserResponse(id=user_id, username=username, name=name)
 
 
-def _error_detail(response: requests.Response) -> str:
+def _error_detail(response: requests.Response, *, secrets: Sequence[str] = ()) -> str:
     try:
         payload = response.json()
     except ValueError:
-        return response.text.strip()[:500] or "sin detalle"
+        detail = response.text.strip()[:500] or "sin detalle"
+        return _redact(detail, secrets)
     if isinstance(payload, dict):
         detail = payload.get("detail") or payload.get("title")
         if detail:
-            return str(detail)[:500]
+            return _redact(str(detail)[:500], secrets)
         errors = payload.get("errors")
         if errors:
-            return str(errors)[:500]
-    return str(payload)[:500]
+            return _redact(str(errors)[:500], secrets)
+    return _redact(str(payload)[:500], secrets)
 
 
-def _raise_media_response_error(response: requests.Response, *, operation: str) -> None:
+def _raise_media_response_error(
+    response: requests.Response,
+    *,
+    operation: str,
+    secrets: Sequence[str] = (),
+) -> None:
     if response.status_code == 429:
         reset = response.headers.get("x-rate-limit-reset")
         suffix = f"; reset={reset}" if reset else ""
         raise XApiRateLimitError(
-            f"X respondió 429 al {operation}: {_error_detail(response)}{suffix}"
+            f"X respondió 429 al {operation}: {_error_detail(response, secrets=secrets)}{suffix}"
         )
     if response.status_code in {408, 409, 425} or response.status_code >= 500:
         raise AmbiguousMediaError(
@@ -266,5 +315,14 @@ def _raise_media_response_error(response: requests.Response, *, operation: str) 
         )
     if response.status_code != 200:
         raise XApiError(
-            f"X respondió {response.status_code} al {operation}: {_error_detail(response)}"
+            f"X respondió {response.status_code} al {operation}: "
+            f"{_error_detail(response, secrets=secrets)}"
         )
+
+
+def _redact(value: str, secrets: Sequence[str]) -> str:
+    redacted = value
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted

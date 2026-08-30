@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -13,6 +14,9 @@ TELEGRAM_API_ROOT = "https://api.telegram.org"
 DEFAULT_TOKEN_ENVIRONMENT_VARIABLE = "TELEGRAM_BOT_TOKEN"
 _COMMAND_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 _WEBHOOK_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+_PHOTO_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
+_PHOTO_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
 
 
 class TelegramConfigurationError(ValueError):
@@ -181,6 +185,20 @@ class TelegramApiClient:
             payload["language_code"] = language_code
         return self._call("setMyCommands", payload)
 
+    def get_my_commands(
+        self,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        language_code: str | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {}
+        if scope is not None:
+            payload["scope"] = dict(scope)
+        if language_code is not None:
+            _required_text(language_code, field_name="language_code", maximum=2)
+            payload["language_code"] = language_code
+        return self._call("getMyCommands", payload)
+
     def send_message(
         self,
         chat_id: int | str,
@@ -225,6 +243,47 @@ class TelegramApiClient:
         if reply_markup is not None:
             payload["reply_markup"] = dict(reply_markup)
         return self._call("sendPhoto", payload)
+
+    def send_photo_bytes(
+        self,
+        chat_id: int | str,
+        content: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        caption: str | None = None,
+        reply_markup: Mapping[str, Any] | None = None,
+        disable_notification: bool = False,
+    ) -> Any:
+        """Envía una imagen local sin publicarla antes en una URL accesible."""
+
+        _validate_chat_id(chat_id)
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("content debe ser una imagen no vacía")
+        if len(content) > MAX_PHOTO_BYTES:
+            raise ValueError("La foto supera el máximo local de 10 MB")
+        if not isinstance(filename, str) or _PHOTO_FILENAME_PATTERN.fullmatch(filename) is None:
+            raise ValueError("filename no tiene un formato seguro")
+        if mime_type not in _PHOTO_MIME_TYPES:
+            raise ValueError("mime_type debe ser image/jpeg, image/png o image/webp")
+        data: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "disable_notification": "true" if disable_notification else "false",
+        }
+        if caption is not None:
+            _required_text(caption, field_name="caption", maximum=1024)
+            data["caption"] = caption
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(
+                dict(reply_markup),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        return self._call_multipart(
+            "sendPhoto",
+            data=data,
+            files={"photo": (filename, content, mime_type)},
+        )
 
     def edit_message_text(
         self,
@@ -296,6 +355,55 @@ class TelegramApiClient:
                 f"Telegram respondió {response.status_code} con un cuerpo no válido"
             )
 
+        if not isinstance(document, dict):
+            raise TelegramProtocolError(
+                f"Telegram respondió {response.status_code} con un cuerpo no válido"
+            )
+        if not 200 <= response.status_code < 300 or document.get("ok") is not True:
+            error_code = document.get("error_code")
+            code = error_code if isinstance(error_code, int) else response.status_code
+            description = _redacted_description(
+                document.get("description"),
+                self._credentials.token,
+            )
+            retry_after = _retry_after(document.get("parameters"))
+            suffix = f"; retry_after={retry_after}" if retry_after is not None else ""
+            raise TelegramApiError(f"Telegram respondió {code}: {description}{suffix}")
+        if "result" not in document:
+            raise TelegramProtocolError("Telegram respondió sin el campo result")
+        return document["result"]
+
+    def _call_multipart(
+        self,
+        method: str,
+        *,
+        data: Mapping[str, Any],
+        files: Mapping[str, tuple[str, bytes, str]],
+    ) -> Any:
+        encoded_token = quote(self._credentials.token, safe=":")
+        endpoint = f"{TELEGRAM_API_ROOT}/bot{encoded_token}/{method}"
+        try:
+            response = self.session.post(
+                endpoint,
+                data=dict(data),
+                files=dict(files),
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException:
+            response = None
+        if response is None:
+            raise TelegramTransportError(
+                "No fue posible obtener una respuesta de Telegram; reintenta de forma segura"
+            )
+        invalid_document = object()
+        try:
+            document = response.json()
+        except (TypeError, ValueError):
+            document = invalid_document
+        if document is invalid_document:
+            raise TelegramProtocolError(
+                f"Telegram respondió {response.status_code} con un cuerpo no válido"
+            )
         if not isinstance(document, dict):
             raise TelegramProtocolError(
                 f"Telegram respondió {response.status_code} con un cuerpo no válido"
