@@ -51,6 +51,16 @@ class RecordingSession:
         return self.response
 
 
+class SequenceSession(RecordingSession):
+    def __init__(self, *responses: FakeResponse) -> None:
+        super().__init__()
+        self.responses = list(responses)
+
+    def post(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        return self.responses.pop(0)
+
+
 @pytest.fixture
 def policy():
     return load_editorial_policy(POLICY_PATH)
@@ -142,7 +152,89 @@ def test_generate_draft_uses_official_endpoint_and_closed_tool(
     assert call["timeout"] == (3.0, 17.0)
     assert call["json"]["stream"] is False
     assert call["json"]["tools"][0]["function"]["parameters"]["additionalProperties"] is False
-    assert call["json"]["tool_choice"] == "auto"
+    assert call["json"]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": DRAFT_TOOL_NAME},
+    }
+    assert "visual.tipo='ninguna'" in call["json"]["messages"][0]["content"]
+
+
+def test_generate_draft_repairs_one_locally_invalid_tool_call(
+    monkeypatch, policy, draft_payload
+) -> None:
+    invalid_payload = json.loads(json.dumps(draft_payload))
+    invalid_payload["visual"]["tipo"] = "ninguna"
+    first = tool_response(json.dumps(invalid_payload))
+    first_message = first["choices"][0]["message"]
+    first_message["tool_calls"][0]["id"] = "call-invalid-1"
+    first_message["reasoning_details"] = [{"type": "reasoning.text", "text": "revisión"}]
+    second = tool_response(json.dumps(draft_payload))
+    session = SequenceSession(FakeResponse(200, first), FakeResponse(200, second))
+    client = make_client(monkeypatch, session)
+
+    draft = client.generate_draft("Dato entregado", policy)
+
+    assert draft.figure == "10 %"
+    assert len(session.calls) == 2
+    repair_messages = session.calls[1]["json"]["messages"]
+    assert repair_messages[-2] == first_message
+    assert repair_messages[-1]["role"] == "tool"
+    assert repair_messages[-1]["tool_call_id"] == "call-invalid-1"
+    feedback = json.loads(repair_messages[-1]["content"])
+    assert feedback["accepted"] is False
+    assert "colores=[]" in feedback["validation_error"]
+    assert feedback["texto_debe_contener_literalmente"] == {
+        "cifra": draft_payload["cifra"],
+        "fuente": draft_payload["fuente"],
+    }
+
+
+def test_generate_draft_repairs_malformed_tool_arguments(
+    monkeypatch, policy, draft_payload
+) -> None:
+    first = tool_response('{"categoria":"dato_semana",')
+    first["choices"][0]["message"]["tool_calls"][0]["id"] = "call-broken-json"
+    second = tool_response(json.dumps(draft_payload))
+    session = SequenceSession(FakeResponse(200, first), FakeResponse(200, second))
+    client = make_client(monkeypatch, session)
+
+    draft = client.generate_draft("Dato entregado", policy)
+
+    assert draft.figure == "10 %"
+    feedback = json.loads(session.calls[1]["json"]["messages"][-1]["content"])
+    assert "JSON inválidos" in feedback["validation_error"]
+
+
+def test_generate_draft_repairs_without_inventing_a_missing_tool_call_id(
+    monkeypatch, policy, draft_payload
+) -> None:
+    invalid_payload = json.loads(json.dumps(draft_payload))
+    invalid_payload["visual"]["tipo"] = "ninguna"
+    first = tool_response(json.dumps(invalid_payload))
+    second = tool_response(json.dumps(draft_payload))
+    session = SequenceSession(FakeResponse(200, first), FakeResponse(200, second))
+    client = make_client(monkeypatch, session)
+
+    assert client.generate_draft("Dato entregado", policy).figure == "10 %"
+    repair_message = session.calls[1]["json"]["messages"][-1]
+    assert repair_message["role"] == "user"
+    assert "colores=[]" in repair_message["content"]
+    assert "tool_call_id" not in repair_message
+
+
+def test_generate_draft_fails_closed_after_one_repair(monkeypatch, policy, draft_payload) -> None:
+    invalid_payload = json.loads(json.dumps(draft_payload))
+    invalid_payload["visual"]["tipo"] = "ninguna"
+    first = tool_response(json.dumps(invalid_payload))
+    first["choices"][0]["message"]["tool_calls"][0]["id"] = "call-invalid-1"
+    second = tool_response(json.dumps(invalid_payload))
+    session = SequenceSession(FakeResponse(200, first), FakeResponse(200, second))
+    client = make_client(monkeypatch, session)
+
+    with pytest.raises(MiniMaxResponseError, match=r"colores=\[\]"):
+        client.generate_draft("Dato entregado", policy)
+
+    assert len(session.calls) == 2
 
 
 def test_generate_draft_accepts_strict_fenced_json_fallback(
@@ -161,6 +253,25 @@ def test_generate_draft_accepts_strict_fenced_json_fallback(
     client = make_client(monkeypatch, RecordingSession(response))
 
     assert client.generate_draft("Dato entregado", policy).figure == "10 %"
+
+
+def test_generate_draft_reports_plain_text_refusal_without_reflecting_it(
+    monkeypatch, policy
+) -> None:
+    refusal = "No puedo crear la pieza sin una cifra y una fuente verificables."
+    response = FakeResponse(
+        200,
+        {
+            "choices": [{"finish_reason": "stop", "message": {"content": refusal}}],
+            "base_resp": {"status_code": 0},
+        },
+    )
+    client = make_client(monkeypatch, RecordingSession(response))
+
+    with pytest.raises(MiniMaxResponseError, match="llamada de herramienta requerida") as captured:
+        client.generate_draft("Encargo conceptual sin evidencia", policy)
+
+    assert refusal not in str(captured.value)
 
 
 def test_generate_draft_rejects_duplicate_json_keys(monkeypatch, policy, draft_payload) -> None:

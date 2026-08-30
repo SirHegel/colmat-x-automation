@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from sqlalchemy import (
     case,
     create_engine,
     event,
+    exists,
     func,
     select,
     text,
@@ -39,7 +41,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 from sqlalchemy.types import DateTime, TypeDecorator
 
 from colmat_x.editorial import EditorialCategory, Institution
@@ -79,6 +81,9 @@ DEFAULT_PUBLICATION_LEASE_SECONDS = 300
 MAX_PUBLICATION_LEASE_SECONDS = 3600
 DEFAULT_GENERATION_LEASE_SECONDS = 900
 MAX_GENERATION_LEASE_SECONDS = 3600
+MAX_GENERATION_REQUESTS_PER_USER_PER_DAY = 20
+MAX_GENERATION_REQUESTS_PER_WORKSPACE_PER_DAY = 100
+MAX_PENDING_GENERATION_REQUESTS_PER_WORKSPACE = 25
 DEFAULT_GENERATION_NOTIFICATION_LEASE_SECONDS = 120
 MAX_GENERATION_NOTIFICATION_LEASE_SECONDS = 600
 DEFAULT_AUTOMATION_REVIEW_NOTIFICATION_LEASE_SECONDS = 120
@@ -1274,6 +1279,13 @@ class AuditEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
 
 
+@dataclass(frozen=True, slots=True)
+class DashboardSnapshot:
+    settings: AutomationSettings
+    drafts: tuple[tuple[Draft, Revision], ...]
+    team: tuple[tuple[Membership, User, bool], ...]
+
+
 def approval_snapshot_hash(
     *,
     text: str,
@@ -1320,13 +1332,25 @@ class PlatformStore:
         *,
         create_schema: bool = True,
         echo: bool = False,
+        serverless: bool = False,
     ) -> None:
+        _register_platform_models()
+        if not isinstance(serverless, bool):
+            raise TypeError("serverless debe ser booleano")
         self.database_url = resolve_database_url(database_url)
-        engine_options: dict[str, Any] = {"future": True, "echo": echo}
+        engine_options: dict[str, Any] = {
+            "future": True,
+            "echo": echo,
+            "pool_pre_ping": True,
+        }
         if self.database_url.startswith("sqlite"):
             engine_options["connect_args"] = {"check_same_thread": False}
             if _is_sqlite_memory_url(self.database_url):
                 engine_options["poolclass"] = StaticPool
+        elif serverless:
+            # La DSN web apunta a un pooler externo; no multiplica conexiones
+            # persistentes por cada instancia efímera de Vercel.
+            engine_options["poolclass"] = NullPool
         self.engine = create_engine(self.database_url, **engine_options)
         if self.database_url.startswith("sqlite"):
             event.listen(self.engine, "connect", _enable_sqlite_foreign_keys)
@@ -1467,6 +1491,75 @@ class PlatformStore:
                 now=timestamp,
             )
             return user
+
+    def create_team_member(
+        self,
+        *,
+        actor_id: str,
+        email: str,
+        display_name: str,
+        role: Role | str,
+        username: str | None = None,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        user_id: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[User, Membership]:
+        """Crea la identidad y su membresía como una sola operación atómica."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        target_role = _normalize_role(role)
+        target_id = _normalize_entity_id(user_id) if user_id else _new_id()
+        timestamp = _normalize_now(now)
+        with (
+            _workspace_rbac_lock(workspace),
+            _user_rbac_lock(target_id),
+            self._sessions.begin() as session,
+        ):
+            self._serialize_workspace_rbac(session, workspace)
+            self._serialize_user_rbac(session, target_id)
+            actor_role = self._authorize(session, actor, workspace, Permission.MANAGE_USERS)
+            require_role_assignment(actor_role, target_role)
+            user = self._new_user(
+                session,
+                email=email,
+                display_name=display_name,
+                username=username,
+                password_hash=None,
+                user_id=target_id,
+                now=timestamp,
+            )
+            membership = Membership(
+                workspace_id=workspace,
+                user_id=user.id,
+                role=target_role.value,
+                created_by=actor,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            session.add(membership)
+            session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="user.created",
+                entity_type="user",
+                entity_id=user.id,
+                detail={"email": user.email},
+                now=timestamp,
+            )
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="membership.granted",
+                entity_type="membership",
+                entity_id=membership.id,
+                detail={"user_id": user.id, "role": target_role.value},
+                now=timestamp,
+            )
+            return user, membership
 
     def set_user_active(
         self,
@@ -2029,6 +2122,72 @@ class PlatformStore:
                 statement = statement.where(Draft.status == normalized_status.value)
             return list(session.scalars(statement.order_by(Draft.created_at, Draft.id)))
 
+    def get_dashboard_snapshot(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        draft_limit: int = 25,
+    ) -> DashboardSnapshot:
+        """Obtiene agenda, piezas recientes y equipo con autorización única."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        normalized_limit = _normalize_bounded_int(
+            draft_limit,
+            "draft_limit",
+            minimum=1,
+            maximum=100,
+        )
+        private_binding = exists(
+            select(TelegramBinding.id).where(
+                TelegramBinding.workspace_id == workspace,
+                TelegramBinding.user_id == User.id,
+                TelegramBinding.is_active.is_(True),
+                TelegramBinding.purpose == "control",
+                TelegramBinding.chat_id == TelegramBinding.telegram_user_id,
+                ~TelegramBinding.chat_id.like("-%"),
+            )
+        )
+        with self._sessions() as session:
+            role = self._authorize(session, actor, workspace, Permission.VIEW_WORKSPACE)
+            for permission in (
+                Permission.VIEW_DRAFTS,
+                Permission.VIEW_AUTOMATION,
+                Permission.VIEW_TELEGRAM,
+            ):
+                require_permission(role, permission)
+            settings = session.get(AutomationSettings, workspace)
+            if settings is None:
+                raise NotFoundError(
+                    f"El espacio '{workspace}' no tiene configuración de automatización"
+                )
+            draft_rows = tuple(
+                session.execute(
+                    select(Draft, Revision)
+                    .join(Revision, Revision.id == Draft.current_revision_id)
+                    .where(Draft.workspace_id == workspace)
+                    .order_by(Draft.created_at.desc(), Draft.id.desc())
+                    .limit(normalized_limit)
+                ).tuples()
+            )
+            for draft, revision in draft_rows:
+                _require_current_revision_integrity(draft, revision)
+            team_rows = tuple(
+                (membership, user, bool(login_ready))
+                for membership, user, login_ready in session.execute(
+                    select(Membership, User, private_binding.label("login_ready"))
+                    .join(User, User.id == Membership.user_id)
+                    .where(Membership.workspace_id == workspace)
+                    .order_by(Membership.created_at, Membership.id)
+                ).tuples()
+            )
+            return DashboardSnapshot(
+                settings=settings,
+                drafts=draft_rows,
+                team=team_rows,
+            )
+
     def register_media_asset(
         self,
         *,
@@ -2130,12 +2289,18 @@ class PlatformStore:
         timestamp = _normalize_now(now)
         normalized_chat = _normalize_chat_id(chat_id)
         normalized_telegram_user = _normalize_telegram_user_id(telegram_user_id)
+        target_id = _normalize_entity_id(user_id)
         if purpose not in {"control", "review", "alerts"}:
             raise ValueError("purpose debe ser control, review o alerts")
         with self._sessions.begin() as session:
-            self._authorize(session, actor, workspace, Permission.MANAGE_TELEGRAM)
-            self._get_user(session, user_id)
-            self._required_membership(session, user_id, workspace)
+            actor_role = self._authorize(session, actor, workspace, Permission.MANAGE_TELEGRAM)
+            self._get_user(session, target_id)
+            target_membership = self._required_membership(session, target_id, workspace)
+            self._require_can_manage_existing_role(actor_role, Role(target_membership.role))
+            if actor != target_id and actor_role is not Role.OWNER:
+                raise AuthorizationError(
+                    "Solo el owner puede vincular Telegram a la cuenta de otra persona"
+                )
             binding = session.scalar(
                 select(TelegramBinding).where(
                     TelegramBinding.workspace_id == workspace,
@@ -2155,7 +2320,11 @@ class PlatformStore:
                 )
                 session.add(binding)
                 action = "telegram.binding_created"
-            binding.user_id = user_id
+            elif binding.user_id != target_id:
+                raise ConflictError(
+                    "La identidad Telegram ya está vinculada a otra cuenta y no se transfiere"
+                )
+            binding.user_id = target_id
             binding.purpose = purpose
             binding.is_active = bool(active)
             binding.updated_at = timestamp
@@ -2170,13 +2339,42 @@ class PlatformStore:
                 detail={
                     "chat_id": normalized_chat,
                     "telegram_user_id": normalized_telegram_user,
-                    "user_id": user_id,
+                    "user_id": target_id,
                     "purpose": purpose,
                     "active": bool(active),
                 },
                 now=timestamp,
             )
             return binding
+
+    def has_private_control_binding(
+        self,
+        user_id: str,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> bool:
+        """Indica si una cuenta humana puede recibir su OTP web en chat privado."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        target_id = _normalize_entity_id(user_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.VIEW_TELEGRAM)
+            self._required_membership(session, target_id, workspace)
+            binding_id = session.scalar(
+                select(TelegramBinding.id)
+                .where(
+                    TelegramBinding.workspace_id == workspace,
+                    TelegramBinding.user_id == target_id,
+                    TelegramBinding.is_active.is_(True),
+                    TelegramBinding.purpose == "control",
+                    TelegramBinding.chat_id == TelegramBinding.telegram_user_id,
+                    ~TelegramBinding.chat_id.like("-%"),
+                )
+                .limit(1)
+            )
+            return binding_id is not None
 
     def resolve_telegram_actor(
         self,
@@ -2991,7 +3189,12 @@ class PlatformStore:
         normalized_category = EditorialCategory(category).value if category is not None else None
         normalized_institution = Institution(institution).value if institution is not None else None
         timestamp = _normalize_now(now)
-        with self._sessions.begin() as session:
+        with _workspace_rbac_lock(f"generation:{workspace}"), self._sessions.begin() as session:
+            self._serialize_rbac_scope(
+                session,
+                scope="generation-quota",
+                identifier=workspace,
+            )
             resolved_user, membership = self._resolve_telegram_identity(
                 session,
                 workspace_id=workspace,
@@ -3019,6 +3222,37 @@ class PlatformStore:
                     institution=normalized_institution,
                 )
                 return existing
+            day_start = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+            actor_daily_count = session.scalar(
+                select(func.count(GenerationRequest.id)).where(
+                    GenerationRequest.workspace_id == workspace,
+                    GenerationRequest.requested_by == actor,
+                    GenerationRequest.created_at >= day_start,
+                )
+            )
+            if int(actor_daily_count or 0) >= MAX_GENERATION_REQUESTS_PER_USER_PER_DAY:
+                raise ConflictError("Se alcanzó el cupo diario de generación de la cuenta")
+            workspace_daily_count = session.scalar(
+                select(func.count(GenerationRequest.id)).where(
+                    GenerationRequest.workspace_id == workspace,
+                    GenerationRequest.created_at >= day_start,
+                )
+            )
+            if int(workspace_daily_count or 0) >= MAX_GENERATION_REQUESTS_PER_WORKSPACE_PER_DAY:
+                raise ConflictError("Se alcanzó el cupo diario de generación del espacio")
+            pending_count = session.scalar(
+                select(func.count(GenerationRequest.id)).where(
+                    GenerationRequest.workspace_id == workspace,
+                    GenerationRequest.status.in_(
+                        (
+                            GenerationRequestStatus.QUEUED.value,
+                            GenerationRequestStatus.CLAIMED.value,
+                        )
+                    ),
+                )
+            )
+            if int(pending_count or 0) >= MAX_PENDING_GENERATION_REQUESTS_PER_WORKSPACE:
+                raise ConflictError("La cola de generación está llena; espera a que avance")
             request = GenerationRequest(
                 workspace_id=workspace,
                 idempotency_key=normalized_key,
@@ -7070,17 +7304,8 @@ class PlatformStore:
     @staticmethod
     def _current_revision(session: Session, draft: Draft) -> Revision:
         revision = session.get(Revision, draft.current_revision_id)
-        if revision is None or revision.draft_id != draft.id:
-            raise ConflictError("El draft no tiene una revisión actual válida")
-        calculated = approval_snapshot_hash(
-            text=revision.text,
-            category=revision.category,
-            publish_at=revision.publish_at,
-            evidence=revision.evidence,
-            image_sha256=revision.image_sha256,
-        )
-        if calculated != revision.snapshot_hash:
-            raise StaleSnapshotError("La revisión persistida no coincide con su snapshot")
+        _require_current_revision_integrity(draft, revision)
+        assert revision is not None  # Refinamiento tras la validación cerrada.
         return revision
 
     @staticmethod
@@ -8198,6 +8423,24 @@ def _normalize_prepared_telegram_actions(
     return tuple(normalized)
 
 
+def _require_current_revision_integrity(draft: Draft, revision: Revision | None) -> None:
+    if (
+        revision is None
+        or revision.draft_id != draft.id
+        or revision.id != draft.current_revision_id
+    ):
+        raise ConflictError("El draft no tiene una revisión actual válida")
+    calculated = approval_snapshot_hash(
+        text=revision.text,
+        category=revision.category,
+        publish_at=revision.publish_at,
+        evidence=revision.evidence,
+        image_sha256=revision.image_sha256,
+    )
+    if calculated != revision.snapshot_hash:
+        raise StaleSnapshotError("La revisión persistida no coincide con su snapshot")
+
+
 def _normalize_now(value: datetime | None) -> datetime:
     selected = value or _utc_now()
     if selected.tzinfo is None or selected.utcoffset() is None:
@@ -8215,4 +8458,11 @@ def _normalize_role(value: Role | str) -> Role:
 def table_names() -> Sequence[str]:
     """Lista estable para health checks y migraciones externas."""
 
+    _register_platform_models()
     return tuple(sorted(Base.metadata.tables))
+
+
+def _register_platform_models() -> None:
+    """Carga modelos externos antes de consultar o materializar metadata."""
+
+    importlib.import_module("colmat_x.web_auth")

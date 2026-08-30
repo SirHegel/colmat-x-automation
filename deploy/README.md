@@ -40,11 +40,19 @@ persistente; su filesystem efímero no admite la SQLite local ni la media del wo
 web se conecta con creación de esquema deshabilitada: Vercel no ejecuta DDL, migraciones ni
 workers.
 
+`DATABASE_URL` debe ser la DSN **pooled** del proveedor para el tráfico serverless. Conserva
+`DATABASE_URL_UNPOOLED` únicamente fuera de Vercel y úsala solo para aplicar el DDL.
+
 Aplica el esquema fuera de Vercel, antes del primer despliegue, y vuelve a aplicar el archivo antes
 de actualizar una instalación existente. El script es repetible y conserva los registros:
 
 ```bash
-psql "$DATABASE_URL_UNPOOLED" -v ON_ERROR_STOP=1 -f deploy/postgres.sql
+: "${DATABASE_URL_UNPOOLED:?DATABASE_URL_UNPOOLED es obligatoria}"
+case "$DATABASE_URL_UNPOOLED" in
+  postgres://*|postgresql://*) ;;
+  *) echo "DATABASE_URL_UNPOOLED no es una DSN PostgreSQL" >&2; exit 1 ;;
+esac
+psql -X "$DATABASE_URL_UNPOOLED" -v ON_ERROR_STOP=1 -f deploy/postgres.sql
 ```
 
 Usa la DSN no agrupada equivalente de tu proveedor para este paso transaccional; no ejecutes el
@@ -56,9 +64,14 @@ Configura como secretos de Vercel:
 DATABASE_URL=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_WEBHOOK_SECRET=
+COLMAT_WEB_TELEGRAM_TIMEOUT_SECONDS=3
+WEB_AUTH_PEPPER=
 COLMAT_LIVE_ENABLED=false
 COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```
+
+`WEB_AUTH_PEPPER` debe ser aleatorio y contener al menos 32 caracteres. Solo protege HMAC de
+códigos y sesiones del panel; no se copia a OpenClaw ni a los workers.
 
 No cargues `MINIMAX_API_KEY` ni credenciales de X en Vercel. `/generar` solo inserta una solicitud
 durable; el worker persistente llama a MiniMax. El webhook no genera ni publica.

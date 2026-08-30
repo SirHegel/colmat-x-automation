@@ -1,0 +1,538 @@
+{% extends "base.html" %}
+
+{% set me = principal|default({}) %}
+{% set schedule = automation|default({}) %}
+{% set counts = draft_counts|default({}) %}
+{% set draft_items = drafts|default([]) %}
+{% set team_items = team|default([]) %}
+{% set calendar_items = calendar|default([]) %}
+{% set status_labels = {
+  "draft": "Borrador",
+  "in_review": "En revisión",
+  "approved": "Aprobado",
+  "rejected": "Rechazado",
+  "published": "Publicado"
+} %}
+{% set category_labels = {
+  "dato_semana": "El dato de la semana",
+  "ficha_territorio": "Ficha de territorio",
+  "lamina": "Lámina",
+  "correccion_publica": "Corrección pública"
+} %}
+{% set role_labels = {
+  "admin": "Administrador",
+  "editor": "Editor",
+  "reviewer": "Revisor",
+  "publisher": "Publicador",
+  "scheduler": "Programador",
+  "auditor": "Auditor"
+} %}
+{% set base_assignable_roles = ["editor", "reviewer", "publisher", "scheduler", "auditor"] %}
+{% if assignable_roles is defined %}
+  {% set available_roles = assignable_roles %}
+{% elif me.role|default("") == "owner" %}
+  {% set available_roles = ["admin"] + base_assignable_roles %}
+{% else %}
+  {% set available_roles = base_assignable_roles %}
+{% endif %}
+
+{% block title %}Centro de operaciones · Colmat{% endblock %}
+{% block body_class %}dashboard-page{% endblock %}
+
+{% block body %}
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/app" aria-label="Colmat, centro de operaciones">
+        <span class="brand__mark" aria-hidden="true">C</span>
+        <span class="brand__copy">
+          <strong>COLMAT</strong>
+          <small>Centro de operaciones</small>
+        </span>
+      </a>
+
+      <nav class="primary-nav" aria-label="Secciones del panel">
+        <a href="#resumen">Resumen</a>
+        <a href="#borradores">Borradores</a>
+        <a href="#agenda">Agenda</a>
+        <a href="#equipo">Equipo</a>
+      </nav>
+
+      <div class="account-menu">
+        <span class="account-menu__avatar" aria-hidden="true">
+          {{ me.display_name|default("C", true)|first|upper }}
+        </span>
+        <span class="account-menu__identity">
+          <strong>{{ me.display_name|default("Equipo Colmat", true) }}</strong>
+          <small>{{ me.role|default("miembro", true)|replace("_", " ") }}</small>
+        </span>
+        <form method="post" action="/auth/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="button button--quiet button--small" type="submit">Salir</button>
+        </form>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard" id="contenido">
+    {% if flash|default("") %}
+      <div class="notice notice--success dashboard__notice" role="status">
+        <strong>Listo.</strong>
+        <span>{{ flash }}</span>
+      </div>
+    {% endif %}
+    {% if error|default("") %}
+      <div class="notice notice--error dashboard__notice" role="alert">
+        <strong>La acción no se completó.</strong>
+        <span>{{ error }}</span>
+      </div>
+    {% endif %}
+
+    <section class="hero" id="resumen" aria-labelledby="dashboard-heading">
+      <div>
+        <p class="eyebrow">Centro de operaciones</p>
+        <h1 id="dashboard-heading">Buen trabajo, {{ me.display_name|default("equipo", true) }}.</h1>
+        <p>Este es el estado editorial de Colmat. Cada acción queda vinculada a una persona y a una revisión exacta.</p>
+      </div>
+      <div class="hero__state" aria-label="Estado de la automatización">
+        {% if schedule.enabled|default(false) %}
+          <span class="status-dot status-dot--active">Automatización activa</span>
+        {% else %}
+          <span class="status-dot status-dot--paused">Automatización pausada</span>
+        {% endif %}
+        <span class="mode-label">Modo: {{ schedule.mode|default("human_review", true)|replace("_", " ") }}</span>
+      </div>
+    </section>
+
+    <section class="stat-grid" aria-label="Resumen de borradores">
+      <article class="stat-card">
+        <span class="stat-card__label">Borradores</span>
+        <strong>{{ counts.get("draft", 0) }}</strong>
+        <span>En preparación</span>
+      </article>
+      <article class="stat-card stat-card--review">
+        <span class="stat-card__label">En revisión</span>
+        <strong>{{ counts.get("in_review", 0) }}</strong>
+        <span>Esperan decisión humana</span>
+      </article>
+      <article class="stat-card stat-card--approved">
+        <span class="stat-card__label">Aprobados</span>
+        <strong>{{ counts.get("approved", 0) }}</strong>
+        <span>Listos para publicar</span>
+      </article>
+      <article class="stat-card stat-card--published">
+        <span class="stat-card__label">Publicados</span>
+        <strong>{{ counts.get("published", 0) }}</strong>
+        <span>Histórico del espacio</span>
+      </article>
+    </section>
+
+    <div class="dashboard-grid">
+      <section class="panel panel--automation" aria-labelledby="automation-heading">
+        <div class="panel__header">
+          <div>
+            <p class="eyebrow">OpenClaw</p>
+            <h2 id="automation-heading">Automatización editorial</h2>
+          </div>
+          <span class="panel__meta">v{{ schedule.version|default(1, true) }}</span>
+        </div>
+
+        {% if can_manage_automation|default(false) %}
+          <form class="settings-form" method="post" action="/app/automation">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="expected_version" value="{{ schedule.version|default(1, true) }}">
+
+            <label class="switch-row" for="automation-enabled">
+              <span>
+                <strong>Agenda automática</strong>
+                <small>Permite que OpenClaw procese los espacios programados.</small>
+              </span>
+              <span class="switch">
+                <input
+                  id="automation-enabled"
+                  name="enabled"
+                  type="checkbox"
+                  value="true"
+                  {% if schedule.enabled|default(false) %}checked{% endif %}
+                >
+                <span class="switch__track" aria-hidden="true"></span>
+              </span>
+            </label>
+
+            <fieldset class="mode-picker">
+              <legend>Flujo de publicación</legend>
+              <label class="choice-card">
+                <input
+                  name="mode"
+                  type="radio"
+                  value="human_review"
+                  {% if schedule.mode|default("human_review", true) == "human_review" %}checked{% endif %}
+                  {% if not can_manage_automation_mode|default(false) %}disabled{% endif %}
+                >
+                <span>
+                  <strong>Revisión humana</strong>
+                  <small>MiniMax prepara; una persona revisa y aprueba.</small>
+                </span>
+              </label>
+              <label class="choice-card{% if not direct_available|default(false) %} choice-card--disabled{% endif %}">
+                <input
+                  name="mode"
+                  type="radio"
+                  value="direct"
+                  {% if schedule.mode|default("") == "direct" %}checked{% endif %}
+                  {% if not direct_available|default(false) or not can_manage_automation_mode|default(false) %}disabled{% endif %}
+                >
+                <span>
+                  <strong>Publicación directa</strong>
+                  {% if direct_available|default(false) %}
+                    <small>Solo texto elegible; respeta los interruptores de seguridad.</small>
+                  {% else %}
+                    <small>Disponible cuando X tenga saldo y se habiliten los interruptores.</small>
+                  {% endif %}
+                </span>
+              </label>
+            </fieldset>
+
+            {% if schedule.slots|default([]) %}
+              <fieldset class="slot-editor">
+                <legend>Horas del día</legend>
+                <p class="field__hint">La categoría y el encargo siguen la agenda editorial validada.</p>
+                <div class="slot-editor__grid">
+                  {% for slot in schedule.slots %}
+                    <div class="field field--compact">
+                      <label for="slot-at-{{ loop.index0 }}">{{ slot.id }}</label>
+                      <input
+                        id="slot-at-{{ loop.index0 }}"
+                        name="slot_at_{{ loop.index0 }}"
+                        type="time"
+                        value="{{ slot.at }}"
+                        required
+                      >
+                      <span class="field__hint">{{ category_labels.get(slot.category, slot.category|replace("_", " ")) }}</span>
+                    </div>
+                  {% endfor %}
+                </div>
+              </fieldset>
+            {% endif %}
+
+            <div class="field field--compact">
+              <label for="max-posts">Máximo de publicaciones al día</label>
+              <input
+                id="max-posts"
+                name="max_posts_per_day"
+                type="number"
+                min="1"
+                max="24"
+                value="{{ schedule.max_posts_per_day|default(3, true) }}"
+                required
+              >
+              <span class="field__hint">Zona horaria: {{ schedule.timezone|default("America/Bogota", true) }}</span>
+            </div>
+
+            <button class="button button--primary" type="submit">Guardar configuración</button>
+          </form>
+        {% else %}
+          <div class="read-only-state">
+            <span aria-hidden="true">◎</span>
+            <p><strong>Configuración de solo lectura.</strong> Un administrador puede cambiar la agenda y el modo de publicación.</p>
+          </div>
+        {% endif %}
+      </section>
+
+      <section class="panel panel--generate" aria-labelledby="generate-heading">
+        <div class="panel__header">
+          <div>
+            <p class="eyebrow">MiniMax</p>
+            <h2 id="generate-heading">Crear una pieza</h2>
+          </div>
+          <span class="ai-badge">IA asistida</span>
+        </div>
+        <p class="panel__lead">Describe la idea, la cifra y la fuente. OpenClaw asignará el trabajo y lo dejará listo para revisión.</p>
+
+        {% if can_generate|default(false) %}
+          <form class="stack-form" method="post" action="/app/generate">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="request_id" value="{{ generation_request_id }}">
+            <div class="field">
+              <div class="field__label-row">
+                <label for="brief">Instrucción editorial</label>
+                <span class="character-count" data-character-output="generation-brief">0 / 1.000</span>
+              </div>
+              <textarea
+                id="generation-brief"
+                name="brief"
+                rows="7"
+                maxlength="1000"
+                required
+                data-character-input="generation-brief"
+                placeholder="Ejemplo: una cifra verificable sobre empleo regional, su fuente completa y el ángulo de análisis…"
+              ></textarea>
+              <span class="field__hint">Incluye una cifra y una fuente que el equipo pueda verificar.</span>
+            </div>
+            <label class="check-row" for="generate-image">
+              <input id="generate-image" name="generate_image" type="checkbox" value="true" checked>
+              <span>
+                <strong>Proponer una imagen</strong>
+                <small>Las imágenes generadas siempre pasan por revisión humana.</small>
+              </span>
+            </label>
+            <button class="button button--accent button--wide" type="submit">
+              Encargar a MiniMax
+              <span aria-hidden="true">↗</span>
+            </button>
+          </form>
+        {% else %}
+          <div class="read-only-state">
+            <span aria-hidden="true">◎</span>
+            <p><strong>Generación no disponible para tu rol.</strong> Solicita la pieza a una persona editora.</p>
+          </div>
+        {% endif %}
+      </section>
+    </div>
+
+    <section class="panel panel--full" id="borradores" aria-labelledby="drafts-heading">
+      <div class="panel__header panel__header--split">
+        <div>
+          <p class="eyebrow">Flujo editorial</p>
+          <h2 id="drafts-heading">Borradores recientes</h2>
+        </div>
+        <span class="panel__meta">{{ draft_items|length }} piezas visibles</span>
+      </div>
+
+      {% if draft_items %}
+        <div class="draft-list">
+          {% for draft in draft_items %}
+            <article class="draft-card" data-status="{{ draft.status|default('draft', true) }}">
+              <div class="draft-card__rail" aria-hidden="true"></div>
+              <div class="draft-card__body">
+                <header class="draft-card__header">
+                  <div class="draft-card__tags">
+                    <span class="status-badge">{{ status_labels.get(draft.status, draft.status|replace("_", " ")) }}</span>
+                    <span class="category-badge">{{ category_labels.get(draft.category, draft.category|default("Sin categoría", true)|replace("_", " ")) }}</span>
+                  </div>
+                  <span class="draft-card__id">#{{ draft.id }}</span>
+                </header>
+
+                <p class="draft-card__text">{{ draft.text|default("Sin texto disponible.", true) }}</p>
+
+                <dl class="draft-meta">
+                  <div>
+                    <dt>Programación</dt>
+                    <dd>{{ draft.publish_at|default("Sin programar", true) }}</dd>
+                  </div>
+                  <div>
+                    <dt>Estado</dt>
+                    <dd>{{ status_labels.get(draft.status, draft.status|default("Borrador", true)|replace("_", " ")) }}</dd>
+                  </div>
+                </dl>
+
+                <details class="draft-evidence">
+                  <summary>Evidencia y material firmado</summary>
+                  <p><strong>Evidencia:</strong> <code>{{ draft.evidence|default("{}", true) }}</code></p>
+                  {% if draft.evidence_truncated %}
+                    <p><strong>Vista parcial:</strong> la evidencia supera el límite seguro del panel.</p>
+                  {% endif %}
+                  {% if draft.image_fingerprint %}
+                    <p><strong>Imagen:</strong> huella <code>{{ draft.image_fingerprint }}…</code></p>
+                  {% else %}
+                    <p><strong>Imagen:</strong> esta revisión no incluye imagen.</p>
+                  {% endif %}
+                </details>
+
+                {% if draft.requires_telegram_review %}
+                  <div class="notice notice--info draft-review-note" role="note">
+                    Esta revisión incluye una imagen. Apruébala, recházala o publícala desde
+                    Telegram, donde se muestra el material visual exacto.
+                  </div>
+                {% elif draft.evidence_truncated %}
+                  <div class="notice notice--info draft-review-note" role="note">
+                    Las decisiones web están deshabilitadas porque la evidencia no cabe completa
+                    en esta vista. Revísala mediante el flujo operativo antes de aprobar.
+                  </div>
+                {% endif %}
+
+                {% if draft.can_approve or draft.can_reject or draft.can_publish %}
+                  <footer class="draft-actions" aria-label="Acciones para el borrador {{ draft.id }}">
+                    {% if draft.can_approve %}
+                      <form method="post" action="/app/drafts/{{ draft.id }}/approve">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="snapshot_hash" value="{{ draft.snapshot_hash }}">
+                        <button class="button button--success button--small" type="submit">Aprobar</button>
+                      </form>
+                    {% endif %}
+                    {% if draft.can_reject %}
+                      <form method="post" action="/app/drafts/{{ draft.id }}/reject" data-confirm="¿Rechazar esta revisión exacta?">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="snapshot_hash" value="{{ draft.snapshot_hash }}">
+                        <button class="button button--danger button--small" type="submit">Rechazar</button>
+                      </form>
+                    {% endif %}
+                    {% if draft.can_publish %}
+                      <form method="post" action="/app/drafts/{{ draft.id }}/publish" data-confirm="¿Enviar este borrador aprobado a la cola de publicación?">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="snapshot_hash" value="{{ draft.snapshot_hash }}">
+                        <button class="button button--primary button--small" type="submit">Publicar</button>
+                      </form>
+                    {% endif %}
+                  </footer>
+                {% endif %}
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state">
+          <span class="empty-state__icon" aria-hidden="true">＋</span>
+          <h3>Todavía no hay borradores</h3>
+          <p>Crea la primera pieza con MiniMax o envía una instrucción desde Telegram.</p>
+          {% if can_generate|default(false) %}<a class="button button--secondary" href="#generate-heading">Crear una pieza</a>{% endif %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel panel--full" id="agenda" aria-labelledby="calendar-heading">
+      <div class="panel__header panel__header--split">
+        <div>
+          <p class="eyebrow">Próximos espacios</p>
+          <h2 id="calendar-heading">Agenda editorial</h2>
+        </div>
+        <span class="panel__meta">{{ schedule.timezone|default("America/Bogota", true) }}</span>
+      </div>
+
+      {% if calendar_items %}
+        <div class="table-wrap">
+          <table>
+            <caption class="sr-only">Próximos espacios programados para publicaciones</caption>
+            <thead>
+              <tr>
+                <th scope="col">Fecha</th>
+                <th scope="col">Hora</th>
+                <th scope="col">Espacio</th>
+                <th scope="col">Categoría</th>
+                <th scope="col">Modo</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for entry in calendar_items %}
+                <tr>
+                  <td data-label="Fecha">{{ entry.date }}</td>
+                  <td data-label="Hora"><strong>{{ entry.time }}</strong></td>
+                  <td data-label="Espacio">{{ entry.slot }}</td>
+                  <td data-label="Categoría">{{ category_labels.get(entry.category, entry.category|default("Por definir", true)|replace("_", " ")) }}</td>
+                  <td data-label="Modo"><span class="mode-chip">{{ entry.mode|default("human_review", true)|replace("_", " ") }}</span></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state empty-state--compact">
+          <h3>No hay espacios próximos</h3>
+          <p>La agenda aparecerá aquí cuando tenga franjas configuradas.</p>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel panel--full" id="equipo" aria-labelledby="team-heading">
+      <div class="panel__header panel__header--split">
+        <div>
+          <p class="eyebrow">Personas y permisos</p>
+          <h2 id="team-heading">Equipo Colmat</h2>
+        </div>
+        <span class="panel__meta">{{ team_items|length }} integrantes</span>
+      </div>
+
+      {% if can_manage_team|default(false) %}
+        <details class="team-create">
+          <summary>
+            <span aria-hidden="true">＋</span>
+            Crear una cuenta de equipo
+          </summary>
+          <form class="team-form" method="post" action="/app/team">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field">
+              <label for="team-email">Correo</label>
+              <input id="team-email" name="email" type="email" autocomplete="off" maxlength="254" required placeholder="persona@equipo.co">
+            </div>
+            <div class="field">
+              <label for="team-username">Usuario</label>
+              <input id="team-username" name="username" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="64" required placeholder="nombre.apellido">
+            </div>
+            <div class="field">
+              <label for="team-name">Nombre visible</label>
+              <input id="team-name" name="display_name" type="text" autocomplete="off" maxlength="120" required placeholder="Nombre y apellido">
+            </div>
+            <div class="field">
+              <label for="team-role">Rol inicial</label>
+              <select id="team-role" name="role" required>
+                {% for role in available_roles %}
+                  {% set role_value = role.value if role.value is defined else role %}
+                  {% set role_label = role.label if role.label is defined else role_labels.get(role_value, role_value|replace("_", " ")|title) %}
+                  <option value="{{ role_value }}">{{ role_label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="team-form__action">
+              <button class="button button--primary" type="submit">Crear cuenta</button>
+            </div>
+            <p class="team-form__note">Después de crearla, vincula la cuenta de Telegram de la persona antes de su primer acceso.</p>
+          </form>
+        </details>
+      {% endif %}
+
+      {% if team_items %}
+        <div class="table-wrap team-table">
+          <table>
+            <caption class="sr-only">Integrantes y permisos del equipo Colmat</caption>
+            <thead>
+              <tr>
+                <th scope="col">Persona</th>
+                <th scope="col">Usuario</th>
+                <th scope="col">Rol</th>
+                <th scope="col">Estado</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for member in team_items %}
+                <tr>
+                  <td data-label="Persona">
+                    <span class="person-cell">
+                      <span class="person-cell__avatar" aria-hidden="true">{{ member.display_name|default("C", true)|first|upper }}</span>
+                      <span>
+                        <strong>{{ member.display_name|default("Sin nombre", true) }}</strong>
+                        <small>{{ member.email }}</small>
+                      </span>
+                    </span>
+                  </td>
+                  <td data-label="Usuario">@{{ member.username }}</td>
+                  <td data-label="Rol"><span class="role-chip">{{ member.role|default("miembro", true)|replace("_", " ") }}</span></td>
+                  <td data-label="Estado">
+                    {% if member.active %}
+                      <span class="status-dot status-dot--active">Cuenta activa</span>
+                    {% else %}
+                      <span class="status-dot status-dot--inactive">Cuenta inactiva</span>
+                    {% endif %}
+                    {% if member.login_ready %}
+                      <small class="access-state access-state--ready">Telegram listo</small>
+                    {% else %}
+                      <small class="access-state">Telegram pendiente</small>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state empty-state--compact">
+          <h3>No hay integrantes visibles</h3>
+          <p>Las cuentas vinculadas a este espacio aparecerán aquí.</p>
+        </div>
+      {% endif %}
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span>COLMAT · Materialismo colombiano</span>
+    <span>Persistencia y territorio</span>
+  </footer>
+{% endblock %}

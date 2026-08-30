@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Verificar acceso · Colmat{% endblock %}
+{% block body_class %}auth-page{% endblock %}
+
+{% block body %}
+  <main class="auth-shell" id="contenido">
+    <section class="auth-intro" aria-labelledby="verify-heading">
+      <a class="brand brand--light" href="/" aria-label="Colmat, inicio">
+        <span class="brand__mark" aria-hidden="true">C</span>
+        <span class="brand__copy">
+          <strong>COLMAT</strong>
+          <small>Materialismo colombiano</small>
+        </span>
+      </a>
+      <div class="auth-intro__message">
+        <p class="eyebrow eyebrow--light">Segundo paso</p>
+        <h1 id="verify-heading">Confirma que eres tú.</h1>
+        <p>El código es temporal y solo funciona para este intento de acceso.</p>
+      </div>
+      <p class="auth-intro__motto">Persistencia y territorio</p>
+    </section>
+
+    <section class="auth-panel" aria-labelledby="code-heading">
+      <div class="auth-card">
+        <a class="back-link" href="/login"><span aria-hidden="true">←</span> Volver</a>
+        <p class="eyebrow">Código de verificación</p>
+        <h2 id="code-heading">Revisa Telegram</h2>
+        <p class="muted">Introduce los ocho dígitos que el bot de Colmat acaba de enviarte.</p>
+
+        {% if error|default("") %}
+          <div class="notice notice--error" role="alert">
+            <strong>El código no fue aceptado.</strong>
+            <span>{{ error }}</span>
+          </div>
+        {% endif %}
+        {% if message|default("") %}
+          <div class="notice notice--info" role="status">
+            <span>{{ message }}</span>
+          </div>
+        {% endif %}
+
+        <form class="stack-form" method="post" action="/auth/verify">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="challenge_id" value="{{ challenge_id }}">
+          <div class="field">
+            <label for="code">Código de ocho dígitos</label>
+            <input
+              class="code-input"
+              id="code"
+              name="code"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              pattern="[0-9]{8}"
+              minlength="8"
+              maxlength="8"
+              required
+              autofocus
+              placeholder="00000000"
+              aria-describedby="code-help"
+            >
+            <span class="field__hint" id="code-help">El código caduca pronto y solo puede usarse una vez.</span>
+          </div>
+          <button class="button button--primary button--wide" type="submit">
+            Verificar y entrar
+            <span aria-hidden="true">→</span>
+          </button>
+        </form>
+
+        <p class="auth-resend">¿No llegó? <a href="/login">Solicita un código nuevo</a>.</p>
+      </div>
+    </section>
+  </main>
+{% endblock %}
