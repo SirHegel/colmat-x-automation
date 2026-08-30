@@ -4,23 +4,28 @@ build-backend = "hatchling.build"
 
 [project]
 name = "colmat-x-automation"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automatización segura de publicaciones en X para la escuela de pensamiento Colmat"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Colmat" }]
 dependencies = [
+  "fastapi>=0.116,<1",
   "Jinja2>=3.1.6,<4",
+  "psycopg[binary]>=3.2,<4",
   "PyYAML>=6.0.2,<7",
   "python-dotenv>=1.1.0,<2",
   "requests>=2.32.4,<3",
   "requests-oauthlib>=2.0.0,<3",
+  "SQLAlchemy>=2.0,<3",
   "typer>=0.16.0,<1",
+  "uvicorn>=0.35,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "httpx>=0.28,<1",
   "pytest>=8.4.1,<9",
   "pytest-cov>=6.2.1,<7",
   "ruff>=0.12.8,<1",

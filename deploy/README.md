@@ -1,4 +1,28 @@
-# Despliegue con systemd
+# Despliegues
+
+## Vercel + PostgreSQL
+
+La API y el bot usan `api/index.py` y `vercel.json`. Vercel necesita una `DATABASE_URL` PostgreSQL
+persistente; no uses la SQLite local porque el filesystem de una función es efímero. Las variables
+mínimas son:
+
+```dotenv
+DATABASE_URL=postgresql://...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_WEBHOOK_SECRET=...
+COLMAT_LIVE_ENABLED=false
+```
+
+Conecta la base, crea el owner y los bindings mediante los comandos `team-*`/`telegram-bind`,
+carga secretos en los entornos de Vercel y despliega. Verifica `/api/health` y `/api/ready` antes
+de llamar `setWebhook`. El webhook no crea usuarios ni publica en X.
+
+No se incluye un cron serverless de publicación en esta versión. Un worker futuro debe reclamar
+filas de forma transaccional, protegerse con `CRON_SECRET` y dejar resultados ambiguos para
+conciliación. Vercel Hobby solo permite cron diarios; el sondeo cada cinco minutos requiere Pro o
+un worker externo.
+
+## Host persistente con systemd
 
 Las unidades asumen Linux con `systemd`, Python 3.11 o posterior, el proyecto en
 `/opt/colmat-x-automation` y un usuario de servicio sin privilegios llamado `colmat`.
