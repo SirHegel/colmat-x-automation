@@ -1,0 +1,117 @@
+version: 1
+
+canonical_source:
+  drive_file_id: 1S_870mC8iixpNRv2FYtnnLZauO0eDGww
+  drive_url: https://drive.google.com/file/d/1S_870mC8iixpNRv2FYtnnLZauO0eDGww/view
+  title: TIERRA FIRME — Manual de doctrina y símbolos
+  edition: Tercera edición, corregida y aumentada
+  modified_time: "2026-08-30T03:29:04.422Z"
+  extracted_text_sha256: 5cd4c51a48cb1d01e90f4dde3bb91effcbc7eebe3a5c871ff7cde4470ce46746
+  relevant_sections:
+    - "0. El nombre de la doctrina, de la escuela y del partido"
+    - "4. La regla de los símbolos"
+    - "24. La bandera"
+    - "25. Los colores"
+    - "52. La propaganda"
+    - "54. La organización"
+    - "60. Proporciones y usos"
+    - "61. Prohibiciones"
+
+institutions:
+  colmat:
+    canonical_name: COLMAT · materialismo colombiano
+    kind: doctrina
+    responsibilities:
+      - Designar el cuerpo teórico y el método materialista colombiano.
+      - Explicar las tres capas, los nueve poderes y la persistencia como criterio.
+    prohibitions:
+      - Presentarse como escuela, partido, candidatura u órgano electoral.
+  escuela_colombiana_de_filosofia:
+    canonical_name: Escuela Colombiana de Filosofía
+    kind: escuela
+    responsibilities:
+      - Elaborar, enseñar, publicar y corregir la doctrina y el atlas.
+      - Formar y certificar niveles de estudio.
+    prohibitions:
+      - Competir en elecciones, presentar candidatos o dar órdenes al partido.
+  tierra_firme:
+    canonical_name: Tierra Firme
+    kind: partido
+    responsibilities:
+      - Aplicar la doctrina como instrumento político.
+      - Competir en elecciones, presentar candidatos y gobernar.
+    prohibitions:
+      - Producir doctrina o dar cátedra en nombre de la Escuela.
+
+taxonomy:
+  dato_semana:
+    label: El dato de la semana
+    format: Una cifra, una fuente y una frase de máximo tres líneas.
+    rules:
+      - Se programa cada lunes.
+      - La cifra debe poder verificarse en la fuente citada.
+  ficha_territorio:
+    label: La ficha de territorio
+    format: Diagnóstico de capas de un municipio.
+    rules:
+      - La produce la célula del lugar, no la capital.
+      - Identifica municipio y autoría local antes de aprobación.
+  lamina:
+    label: La lámina
+    format: Una gráfica sin texto visual adicional.
+    rules:
+      - La serie completa debe estar publicada por la fuente.
+      - Está prohibido truncar el eje de la gráfica.
+  correccion_publica:
+    label: La corrección pública
+    format: Rectificación de un dato equivocado.
+    rules:
+      - Se publica en el mismo canal y con el mismo tamaño que la pieza original.
+      - No admite explicaciones atenuantes.
+
+mandatory_content:
+  max_text_characters: 280
+  figure_required: true
+  source_required: true
+  text_must_include_figure: true
+  text_must_include_source: true
+  ai_role: draft_only
+
+visual_identity:
+  typography:
+    family: Arial
+    body_weight: regular
+    title_weight: bold
+  palette:
+    oro: "#D9A227"
+    carmin: "#8E1F1A"
+    ocre_basal: "#C68A14"
+    azul_cortical: "#12457A"
+    rojo_conjuntivo: "#9E2820"
+    tinta: "#2A2723"
+  palette_rules:
+    - Los colores deben ser graves, no saturados, estridentes ni fluorescentes.
+    - Oro y carmín son exclusivos del emblema.
+    - El oro se coloca sobre color, nunca sobre fondo metálico.
+  symbol_rules:
+    - "El nudo del Macizo tiene exactamente siete trazos: tres cordilleras y cuatro ríos."
+    - El anillo tiene exactamente treinta y tres estrellas.
+    - Las tres bandas son verticales y ocupan tercios exactamente iguales.
+    - El emblema mayor siempre conserva el engranaje.
+    - El lema es exactamente PERSISTENCIA Y TERRITORIO.
+    - El isotipo se reproduce en una tinta, con mínimo 8 mm y área de respeto de dos módulos.
+  prohibitions:
+    - Añadir figuras de virtudes como laureles, cornucopias, antorchas, gorros, cadenas rotas, manos unidas, palomas o espadas flamígeras.
+    - Añadir figuras religiosas, salvo la cruz latina austera del ápice, o fundamentos anteriores al Estado.
+    - Alterar los siete trazos del nudo del Macizo.
+    - Alterar las treinta y tres estrellas.
+    - Alterar los tercios iguales y verticales de las bandas.
+    - Usar colores saturados o fluorescentes, o colocar oro sobre fondo metálico.
+    - Reproducir el emblema sin el engranaje.
+    - Acompañar los símbolos con retratos de personas vivas.
+    - Traducir el lema a formulaciones morales como Persistencia y Justicia o Territorio y Dignidad.
+  generation_directives:
+    - No reconstruyas ni improvises el emblema, el isotipo ni el nudo; un activo oficial se incorpora después.
+    - No incluyas retratos de personas vivas ni símbolos de virtudes o religiosos.
+    - No uses colores fluorescentes, saturados, estridentes ni fondos metálicos.
+    - No alteres siete trazos, treinta y tres estrellas, tercios verticales, engranaje ni lema.

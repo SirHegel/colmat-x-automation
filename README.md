@@ -1,28 +1,37 @@
 # Colmat X Automation
 
-Proyecto en Python para preparar, aprobar, programar y publicar contenido de la escuela de
-pensamiento **Colmat** en X. Está pensado para una sola cuenta institucional y usa únicamente
-la API oficial.
+Proyecto en Python para preparar, clasificar, revisar y publicar contenido institucional en X,
+con control operativo por Telegram. Usa exclusivamente las API oficiales de X, Telegram y
+MiniMax; nunca automatiza la interfaz web de X.
 
-El proyecto nace en modo seguro: el contenido de ejemplo entra como borrador, las URL están
-bloqueadas y una ejecución normal solo simula. Para publicar de verdad deben coincidir tres
-condiciones: el snapshot fue aprobado por CLI, `COLMAT_LIVE_ENABLED=true` y el operador usa
-`--live`.
+El proyecto nace en modo seguro: toda salida de IA es un borrador, una persona distinta del autor
+debe aprobar el snapshot exacto y la publicación real exige dos seguros explícitos. El bot puede
+consultar y registrar decisiones; no crea usuarios ni publica por sí mismo.
 
-## Alcance de esta primera versión
+## Capacidades
 
 - Publicaciones originales de texto, programadas en YAML.
 - Plantillas Jinja reutilizables y vista previa del texto final.
 - Aprobación humana auditada y ligada al hash exacto del texto y la hora revisados.
 - Estimación conservadora de longitud ponderada y controles preventivos de URL, cashtags y
   duplicados exactos.
-- Cola SQLite con auditoría, límite diario y protección contra doble publicación local.
+- Cola SQLite heredada para un host persistente y store SQLAlchemy para SQLite local o PostgreSQL
+  en despliegues serverless.
 - Autenticación OAuth 1.0a de usuario para una cuenta de Colmat.
 - Modo simulación, diagnóstico, reintentos controlados y conciliación de resultados ambiguos.
+- RBAC explícito para `owner`, `admin`, `editor`, `reviewer`, `publisher` y `auditor`, con
+  separación entre autoría y aprobación.
+- Webhook de Telegram autenticado, deduplicación de `update_id` y callbacks de un solo uso ligados
+  a persona, chat, revisión y snapshot.
+- MiniMax para proponer borradores e imágenes en memoria, con validación local cerrada y sin
+  capacidad de aprobar, programar o publicar.
+- Carga de hasta cuatro imágenes en X, texto alternativo obligatorio y marca `made_with_ai` para
+  media generada con IA.
+- FastAPI con `/api/health`, `/api/ready` y `/api/telegram/webhook`, desplegable en Vercel.
 
-No automatiza respuestas, mensajes directos, likes, follows, tendencias, scraping de la web,
-generación de contenido con IA ni archivos multimedia. Esas capacidades requieren decisiones
-editoriales, permisos o controles adicionales.
+No automatiza respuestas, mensajes directos, likes, follows, tendencias, scraping ni segmentación
+de personas. Tampoco promete viralidad: la rúbrica de engagement compara claridad, cifra temprana,
+atribución y legibilidad, pero exige verificación editorial y no autoriza una publicación.
 
 ## Instalación
 
@@ -40,6 +49,58 @@ colmat-x doctor
 La base `.state/colmat.db` se crea al primer uso con permisos locales restrictivos y nunca se
 incluye en Git. En sistemas sin `install`, copia el archivo y aplica permisos equivalentes para
 que solo su propietario pueda leer `.env`.
+
+## Manual canónico y política editorial
+
+La fuente de control es el PDF de Drive con ID
+`1S_870mC8iixpNRv2FYtnnLZauO0eDGww`. La política local fija tanto el ID como la huella SHA-256 del
+texto extraído para contrastarla en cada nueva auditoría. Sus reglas principales están codificadas en
+`config/editorial-policy.yaml`:
+
+- `dato_semana`, `ficha_territorio`, `lamina` y `correccion_publica` son la taxonomía cerrada.
+- Toda pieza incluye literalmente una cifra y una fuente que el equipo debe verificar.
+- COLMAT es doctrina, la Escuela Colombiana de Filosofía es escuela y Tierra Firme es partido;
+  el generador no puede confundir sus funciones.
+- Las láminas exigen serie completa y eje no truncado; las correcciones no admiten atenuantes.
+- La IA no reconstruye el emblema ni el Nudo del Macizo, no usa retratos de personas vivas y solo
+  propone colores generativos de la paleta permitida. Los activos oficiales se incorporan después.
+
+`colmat-x ai-draft` devuelve JSON validado con `status=draft`, una evaluación explicable y
+`publication_authorized=false`:
+
+```bash
+colmat-x ai-draft "Cifra y fuente ya verificadas para el dato semanal" \
+  --category dato_semana \
+  --institution escuela_colombiana_de_filosofia
+```
+
+La clave se recibe solo por `MINIMAX_API_KEY`. Usa `MiniMax-M2.7` para texto e `image-01` para
+imagen salvo que la documentación oficial y las pruebas justifiquen otro modelo. Nunca subas una
+clave a Git; si apareció en un chat, log o captura, rótala antes de usar producción.
+
+## Equipo, jerarquía y Telegram
+
+El primer propietario se crea una sola vez y luego administra identidades explícitas. No inventes
+cuentas compartidas: cada integrante debe tener email propio y, si usa el bot, su `from.id` real.
+
+```bash
+colmat-x team-bootstrap --email owner@example.org --display "Propietario"
+colmat-x team-add --actor-id OWNER_ID --email admin@example.org \
+  --display "Administración" --role admin
+colmat-x team-add --actor-id OWNER_ID --email editora@example.org \
+  --display "Editora" --role editor
+colmat-x team-list --actor-id OWNER_ID
+colmat-x telegram-bind --actor-id OWNER_ID --user-id USER_ID \
+  --telegram-user-id FROM_ID --chat-id CHAT_ID --purpose control
+```
+
+`owner` puede delegar cualquier rol. `admin` gestiona las funciones operativas, pero no owners ni
+otros admins. `editor` crea y modifica; `reviewer` decide; `publisher` publica; `auditor` solo
+consulta trazabilidad. Un autor no puede aprobar su propia revisión.
+
+El bot expone `/start`, `/estado`, `/equipo` y `/ayuda`. Telegram autentica por `from.id`, nunca por
+`username`, y además exige el chat autorizado. Los botones llevan nonces expirables y de un solo
+uso; editar texto, fecha, evidencia o imagen invalida la aprobación anterior.
 
 ## Flujo editorial
 
@@ -98,6 +159,8 @@ colmat-x status --state scheduled
 colmat-x run-due                 # simulación, nunca llama a X
 colmat-x doctor
 colmat-x doctor --credentials    # comprueba secretos sin habilitar publicación
+colmat-x x-whoami --expected-username CUENTA_INSTITUCIONAL
+colmat-x team-list --actor-id USER_ID
 ```
 
 `run-due` en simulación no llama a X, pero sí sincroniza YAML y puede crear, actualizar o cancelar
@@ -136,11 +199,10 @@ X_ACCESS_TOKEN_SECRET=...
 COLMAT_LIVE_ENABLED=false
 ```
 
-Después ejecuta `colmat-x doctor --credentials`. Este diagnóstico es local: valida archivos y
-presencia de los cuatro secretos, pero no contacta X ni confirma la identidad de la cuenta,
-permisos, créditos o conectividad. `colmat-x doctor` sin esa opción solo exige los secretos cuando
-el modo real ya está habilitado. Comprueba esos datos en la consola y realiza la primera prueba
-con una cuenta controlada. Solo entonces cambia el seguro y publica:
+Después ejecuta `colmat-x doctor --credentials` y `colmat-x x-whoami` con el usuario o ID esperado.
+El primero valida presencia local; el segundo contacta X y bloquea una cuenta distinta. Ninguno
+confirma saldo, precios o capacidad de escritura, que deben revisarse en la consola. Realiza la
+primera prueba con una cuenta controlada y una sola pieza. Solo entonces cambia el seguro:
 
 ```bash
 # En .env: COLMAT_LIVE_ENABLED=true
@@ -176,6 +238,35 @@ Una alternativa sencilla con cron es:
 ```cron
 */5 * * * * cd /ruta/colmat-x-automation && .venv/bin/colmat-x run-due --live >> .state/cron.log 2>&1
 ```
+
+## FastAPI, PostgreSQL y Vercel
+
+SQLite no es almacenamiento persistente válido en Vercel. Conecta un PostgreSQL serverless (por
+ejemplo Neon) y define `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` y `TELEGRAM_WEBHOOK_SECRET` como
+secretos del proyecto. Despliega después de ejecutar la suite:
+
+```bash
+pytest -q
+vercel link
+vercel --prod
+curl -fsS https://TU_DOMINIO/api/health
+curl -fsS https://TU_DOMINIO/api/ready
+```
+
+Solo cuando `ready` responda `200`, registra en BotFather/API de Telegram la URL HTTPS
+`https://TU_DOMINIO/api/telegram/webhook` con el mismo secreto. No configures un cron de
+publicación hasta implementar un worker de cola protegido y probar idempotencia en producción. En
+Vercel Hobby, además, los cron solo pueden ejecutarse una vez al día y sin precisión al minuto.
+
+Para desarrollo local:
+
+```bash
+uvicorn colmat_x.web:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+El endpoint de salud no inicializa integraciones ni devuelve secretos. Readiness solo informa
+`ok`, `missing` o `error`. El webhook limita el cuerpo a 1 MiB, exige JSON y el header
+`X-Telegram-Bot-Api-Secret-Token`, y responde sin exponer errores internos.
 
 El workflow de GitHub incluido ejecuta calidad y pruebas, pero no publica. Una tarea programada
 de GitHub Actions no conserva SQLite de forma fiable entre ejecuciones y podría romper la

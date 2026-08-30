@@ -1,17 +1,39 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from colmat_x.config import ConfigError, XCredentials, live_enabled, load_settings
 from colmat_x.content import ContentCollectionError, load_rendered_posts
 from colmat_x.domain import ContentError, PostStatus, weighted_length
+from colmat_x.editorial import (
+    DEFAULT_POLICY_PATH,
+    EditorialCategory,
+    EditorialPolicyError,
+    EditorialValidationError,
+    Institution,
+    assess_engagement,
+    load_editorial_policy,
+    validate_ai_draft,
+)
+from colmat_x.minimax import MiniMaxClient, MiniMaxError
+from colmat_x.platform_store import (
+    Membership,
+    PlatformStore,
+    PlatformStoreError,
+    User,
+)
+from colmat_x.rbac import AuthorizationError, Role, require_role_assignment
 from colmat_x.service import Outcome, run_due_posts
 from colmat_x.state import StateError, StateStore
-from colmat_x.x_api import XApiClient
+from colmat_x.x_api import XApiClient, XApiError
 
 app = typer.Typer(
     name="colmat-x",
@@ -25,6 +47,24 @@ ConfigOption = Annotated[
         "--config",
         "-c",
         help="Archivo de configuración (por defecto config/colmat.yaml).",
+    ),
+]
+
+DatabaseUrlOption = Annotated[
+    str | None,
+    typer.Option(
+        "--database-url",
+        envvar="DATABASE_URL",
+        metavar="URL",
+        help="Base de plataforma; también puede definirse con DATABASE_URL.",
+    ),
+]
+
+PolicyOption = Annotated[
+    Path,
+    typer.Option(
+        "--policy",
+        help="Política editorial que debe validar el borrador.",
     ),
 ]
 
@@ -321,6 +361,330 @@ def doctor(
     except (ConfigError, ContentError, StateError) as exc:
         _abort(exc)
     typer.echo(f"OK: configuración, {len(posts)} contenido(s) y base local; modo: {mode}.")
+
+
+@app.command("team-bootstrap")
+def team_bootstrap(
+    email: Annotated[str, typer.Option("--email", help="Email de la cuenta owner.")],
+    display_name: Annotated[
+        str,
+        typer.Option("--display", help="Nombre visible de la cuenta owner."),
+    ],
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", help="ID estable opcional para la cuenta owner."),
+    ] = None,
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Crea el primer owner; solo funciona en una base de plataforma vacía."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            _require_empty_platform(store)
+            user, membership = store.bootstrap_owner(
+                email=email,
+                display_name=display_name,
+                user_id=user_id,
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Owner creado: id={user.id} | display={user.display_name} | "
+        f"email={user.email} | role={membership.role} | activo=sí"
+    )
+
+
+@app.command("team-add")
+def team_add(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="ID del owner o admin que realiza el alta."),
+    ],
+    email: Annotated[str, typer.Option("--email", help="Email de la nueva cuenta.")],
+    display_name: Annotated[
+        str,
+        typer.Option("--display", help="Nombre visible de la nueva cuenta."),
+    ],
+    role: Annotated[
+        str,
+        typer.Option(
+            "--role",
+            help="Rol: owner, admin, editor, reviewer, publisher o auditor.",
+        ),
+    ],
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", help="ID estable opcional para la cuenta."),
+    ] = None,
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Crea una cuenta y le concede un rol con compensación si el alta queda incompleta."""
+
+    try:
+        target_role = Role(role.strip().casefold())
+        with PlatformStore(database_url) as store:
+            actor_membership = next(
+                (
+                    item
+                    for item in store.list_memberships(actor_id=actor_id)
+                    if item.user_id == actor_id
+                ),
+                None,
+            )
+            if actor_membership is None:
+                raise AuthorizationError("El actor no pertenece al equipo activo")
+            require_role_assignment(Role(actor_membership.role), target_role)
+
+            user = store.create_user(
+                actor_id=actor_id,
+                email=email,
+                display_name=display_name,
+                user_id=user_id,
+            )
+            try:
+                membership = store.grant_membership(
+                    user.id,
+                    target_role,
+                    actor_id=actor_id,
+                )
+            except (PlatformStoreError, AuthorizationError, ValueError, SQLAlchemyError) as exc:
+                if not _cleanup_unassigned_user(store, user.id):
+                    raise PlatformStoreError(
+                        "No se concedió el rol y la cuenta incompleta requiere revisión manual"
+                    ) from exc
+                raise
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Miembro creado: id={user.id} | display={user.display_name} | "
+        f"email={user.email} | role={membership.role} | activo=sí"
+    )
+
+
+@app.command("team-list")
+def team_list(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="ID de un miembro autorizado del equipo."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Lista cuentas, roles y estado activo del equipo."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            memberships = store.list_memberships(actor_id=actor_id)
+            rows = [(membership, store.get_user(membership.user_id)) for membership in memberships]
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    if not rows:
+        typer.echo("El equipo no tiene miembros.")
+        return
+    typer.echo(f"{'ID':<36}  {'DISPLAY':<24}  {'EMAIL':<32}  {'ROLE':<10}  ACTIVO")
+    for membership, user in rows:
+        active = "sí" if user.is_active else "no"
+        typer.echo(
+            f"{user.id:<36}  {user.display_name:<24}  {user.email:<32}  "
+            f"{membership.role:<10}  {active}"
+        )
+
+
+@app.command("telegram-bind")
+def telegram_bind(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="ID del owner o admin que autoriza el vínculo."),
+    ],
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", help="ID de la cuenta de plataforma que se vincula."),
+    ],
+    telegram_user_id: Annotated[
+        int,
+        typer.Option("--telegram-user-id", help="Valor numérico from.id de Telegram."),
+    ],
+    chat_id: Annotated[
+        int,
+        typer.Option("--chat-id", help="ID numérico del chat autorizado."),
+    ],
+    purpose: Annotated[
+        str,
+        typer.Option("--purpose", help="Uso del chat: control, review o alerts."),
+    ] = "control",
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Vincula una identidad de Telegram a una cuenta y un chat concretos."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            binding = store.bind_telegram_chat(
+                chat_id,
+                telegram_user_id=telegram_user_id,
+                actor_id=actor_id,
+                user_id=user_id,
+                purpose=purpose.strip().casefold(),
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Telegram vinculado: user_id={binding.user_id} | "
+        f"telegram_user_id={binding.telegram_user_id} | chat_id={binding.chat_id} | "
+        f"purpose={binding.purpose} | activo={'sí' if binding.is_active else 'no'}"
+    )
+
+
+@app.command("x-whoami")
+def x_whoami(
+    config: ConfigOption = None,
+    expected_username: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-username",
+            help="Usuario institucional esperado, con o sin @.",
+        ),
+    ] = None,
+    expected_user_id: Annotated[
+        str | None,
+        typer.Option("--expected-user-id", help="ID numérico institucional esperado."),
+    ] = None,
+) -> None:
+    """Verifica la cuenta autenticada en X sin revelar credenciales."""
+
+    try:
+        load_settings(config)
+        credentials = XCredentials.from_environment()
+        expected_username = _first_environment_value(
+            expected_username,
+            "EXPECTED_X_USERNAME",
+            "X_EXPECTED_USERNAME",
+        )
+        expected_user_id = _first_environment_value(
+            expected_user_id,
+            "EXPECTED_X_USER_ID",
+            "X_EXPECTED_USER_ID",
+        )
+        identity = XApiClient(credentials).verify_identity(
+            expected_username=expected_username,
+            expected_user_id=expected_user_id,
+        )
+    except (ConfigError, XApiError, ValueError) as exc:
+        _abort(exc)
+    typer.echo(
+        json.dumps(
+            {"id": identity.id, "username": identity.username, "name": identity.name},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("ai-draft")
+def ai_draft(
+    brief: Annotated[str, typer.Argument(help="Brief factual para el borrador editorial.")],
+    policy_path: PolicyOption = DEFAULT_POLICY_PATH,
+    category: Annotated[
+        str | None,
+        typer.Option(
+            "--category",
+            help="Categoría editorial canónica opcional.",
+        ),
+    ] = None,
+    institution: Annotated[
+        str | None,
+        typer.Option(
+            "--institution",
+            help="Institución canónica opcional.",
+        ),
+    ] = None,
+    config: ConfigOption = None,
+) -> None:
+    """Genera un borrador validado; nunca lo aprueba, programa ni publica."""
+
+    try:
+        settings = load_settings(config)
+        resolved_policy = policy_path if policy_path.is_absolute() else settings.root / policy_path
+        policy = load_editorial_policy(resolved_policy)
+        requested_category = EditorialCategory(category) if category is not None else None
+        requested_institution = Institution(institution) if institution is not None else None
+        generated = MiniMaxClient().generate_draft(
+            brief,
+            policy,
+            category=requested_category,
+            institution=requested_institution,
+        )
+        validated = validate_ai_draft(generated.to_mapping(), policy)
+        assessment = assess_engagement(validated)
+    except (
+        ConfigError,
+        EditorialPolicyError,
+        EditorialValidationError,
+        MiniMaxError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+
+    payload = validated.to_mapping()
+    payload.update(
+        {
+            "assessment": assessment.to_mapping(),
+            "status": "draft",
+            "publication_authorized": False,
+            "requires_human_approval": True,
+            "notice": "Borrador generado por IA; no se publicó ni se programó.",
+        }
+    )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _require_empty_platform(store: PlatformStore) -> None:
+    with store.session() as session:
+        users = session.scalar(select(func.count(User.id))) or 0
+        memberships = session.scalar(select(func.count(Membership.id))) or 0
+    if users or memberships:
+        raise PlatformStoreError(
+            "team-bootstrap solo puede ejecutarse en una base de plataforma vacía"
+        )
+
+
+def _cleanup_unassigned_user(store: PlatformStore, user_id: str) -> bool:
+    """Compensa el alta si la concesión de rol falla después de crear la cuenta."""
+
+    try:
+        with store.session() as session:
+            has_membership = session.scalar(
+                select(Membership.id).where(Membership.user_id == user_id).limit(1)
+            )
+            if has_membership is not None:
+                return False
+            user = session.get(User, user_id)
+            if user is not None:
+                session.delete(user)
+                session.commit()
+        return True
+    except SQLAlchemyError:
+        return False
+
+
+def _first_environment_value(explicit: str | None, *names: str) -> str | None:
+    if explicit is not None and explicit.strip():
+        return explicit.strip()
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _abort_database() -> None:
+    _abort("No se pudo abrir la base de plataforma; revisa DATABASE_URL y el controlador")
 
 
 def _abort(error: Exception | str) -> None:
