@@ -34,6 +34,7 @@ from colmat_x.automation import (
 )
 from colmat_x.editorial import EditorialPolicy
 from colmat_x.image_validation import sniff_supported_image_mime
+from colmat_x.media_paths import configured_worker_media_root, require_trusted_media_root
 from colmat_x.minimax import MiniMaxClient
 from colmat_x.platform_store import (
     AutomationReviewNotificationClaim,
@@ -60,7 +61,7 @@ from colmat_x.x_api import (
 )
 
 LIVE_PUBLISH_ENV = "COLMAT_LIVE_ENABLED"
-DEFAULT_MEDIA_ROOT = Path(".state/media/automation")
+DEFAULT_MEDIA_ROOT = configured_worker_media_root(None)
 DEFAULT_REVIEW_NOTIFICATION_LIMIT = 5
 MAX_REVIEW_NOTIFICATION_LIMIT = 20
 MAX_TELEGRAM_PHOTO_BYTES = 10 * 1024 * 1024
@@ -195,7 +196,7 @@ class PlatformAutomationRepository:
         author_actor_id: str,
         reviewer_telegram_user_id: int | str | None = None,
         review_chat_id: int | str | None = None,
-        media_root: str | Path = DEFAULT_MEDIA_ROOT,
+        media_root: Path = DEFAULT_MEDIA_ROOT,
         workspace_id: str = "colmat",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -209,7 +210,7 @@ class PlatformAutomationRepository:
         self.reviewer_telegram_user_id = reviewer_telegram_user_id
         self.review_chat_id = review_chat_id
         self.workspace_id = _required_identifier(workspace_id, "workspace_id")
-        self.media_root = Path(media_root).expanduser().resolve()
+        self.media_root = require_trusted_media_root(media_root)
         self._clock = _UniqueUtcClock(clock or (lambda: datetime.now(UTC)))
         self._records: dict[str, StoredAutomation] = {}
         self._records_lock = threading.RLock()
@@ -692,13 +693,13 @@ class AutomationReviewNotificationWorker:
         store: PlatformStore,
         telegram_client: TelegramApiClient,
         actor_id: str,
-        media_root: str | Path = DEFAULT_MEDIA_ROOT,
+        media_root: Path = DEFAULT_MEDIA_ROOT,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
         self.telegram_client = telegram_client
         self.actor_id = _required_identifier(actor_id, "actor_id")
-        self.media_root = Path(media_root).expanduser().resolve()
+        self.media_root = require_trusted_media_root(media_root)
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def drain(

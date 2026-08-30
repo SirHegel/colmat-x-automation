@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from colmat_x.automation import AutomationError, PublicationAmbiguousError
+from colmat_x.media_paths import require_trusted_media_root
 from colmat_x.platform_store import (
     AutomationRun,
     AutomationRunStatus,
@@ -62,7 +63,7 @@ class QueuedPublicationWorker:
         x_client: XApiClient,
         publisher_actor_id: str,
         scheduler_actor_id: str,
-        media_root: str | Path,
+        media_root: Path,
         environ: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -72,7 +73,7 @@ class QueuedPublicationWorker:
         self.scheduler_actor_id = _identifier(scheduler_actor_id, "scheduler_actor_id")
         if self.publisher_actor_id == self.scheduler_actor_id:
             raise ValueError("publisher_actor_id y scheduler_actor_id deben ser distintos")
-        self.media_root = Path(media_root).expanduser().resolve()
+        self.media_root = require_trusted_media_root(media_root)
         self.environ = os.environ if environ is None else environ
         self.clock = clock or (lambda: datetime.now(UTC))
 

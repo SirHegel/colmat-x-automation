@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlsplit
 from colmat_x.automation import AutomationError
 from colmat_x.editorial import EditorialPolicy, assess_engagement
 from colmat_x.image_validation import sniff_supported_image_mime
+from colmat_x.media_paths import configured_worker_media_root, require_trusted_media_root
 from colmat_x.minimax import GeneratedImage, MiniMaxClient, MiniMaxError
 from colmat_x.platform_store import (
     GenerationClaim,
@@ -32,7 +33,7 @@ from colmat_x.telegram_api import (
 from colmat_x.telegram_bot import approval_callback_data, rejection_callback_data
 
 GENERATION_ENABLED_ENV = "COLMAT_GENERATION_ENABLED"
-DEFAULT_GENERATION_MEDIA_ROOT = Path(".state/media/generation")
+DEFAULT_GENERATION_MEDIA_ROOT = configured_worker_media_root(None)
 DEFAULT_QUEUE_LIMIT = 5
 MAX_QUEUE_LIMIT = 20
 MAX_TELEGRAM_PHOTO_BYTES = 10 * 1024 * 1024
@@ -75,7 +76,7 @@ class QueuedGenerationWorker:
         policy: EditorialPolicy,
         worker_actor_id: str,
         author_actor_id: str,
-        media_root: str | Path = DEFAULT_GENERATION_MEDIA_ROOT,
+        media_root: Path = DEFAULT_GENERATION_MEDIA_ROOT,
         environ: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -89,7 +90,7 @@ class QueuedGenerationWorker:
         self.author_actor_id = _identifier(author_actor_id, "author_actor_id")
         if self.worker_actor_id == self.author_actor_id:
             raise ValueError("worker_actor_id y author_actor_id deben ser distintos")
-        self.media_root = Path(media_root).expanduser().resolve()
+        self.media_root = require_trusted_media_root(media_root)
         self.environ = os.environ if environ is None else environ
         self.clock = clock or (lambda: datetime.now(UTC))
 

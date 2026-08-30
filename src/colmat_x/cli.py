@@ -52,6 +52,7 @@ from colmat_x.generation_worker import (
     QueuedGenerationWorker,
     QueueGenerationStatus,
 )
+from colmat_x.media_paths import configured_worker_media_root
 from colmat_x.minimax import MiniMaxClient, MiniMaxError
 from colmat_x.platform_store import AutomationMode as StoredAutomationMode
 from colmat_x.platform_store import (
@@ -1027,6 +1028,7 @@ def automation_run(
     try:
         _load_trusted_worker_environment(env_file)
         scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
+        media_root = configured_worker_media_root(os.getenv("COLMAT_AUTOMATION_MEDIA_ROOT"))
         telegram: TelegramApiClient | None = None
         with PlatformStore(database_url) as store:
             reconciliation_now = datetime.now(UTC)
@@ -1054,10 +1056,7 @@ def automation_run(
                         store=store,
                         telegram_client=telegram,
                         actor_id=scheduler_actor_id,
-                        media_root=os.getenv(
-                            "COLMAT_AUTOMATION_MEDIA_ROOT",
-                            ".state/media/automation",
-                        ),
+                        media_root=media_root,
                     ).drain()
                 )
             settings = store.get_automation_settings(actor_id=scheduler_actor_id)
@@ -1124,7 +1123,7 @@ def automation_run(
                 store,
                 scheduler_actor_id=scheduler_actor_id,
                 author_actor_id=author_actor_id,
-                media_root=os.getenv("COLMAT_AUTOMATION_MEDIA_ROOT", ".state/media/automation"),
+                media_root=media_root,
             )
             notifier = TelegramAutomationNotifier(
                 telegram,
@@ -1297,10 +1296,7 @@ def publication_run(
                 x_client=x_client,
                 publisher_actor_id=publisher_actor_id,
                 scheduler_actor_id=scheduler_actor_id,
-                media_root=os.getenv(
-                    "COLMAT_AUTOMATION_MEDIA_ROOT",
-                    ".state/media/automation",
-                ),
+                media_root=configured_worker_media_root(os.getenv("COLMAT_AUTOMATION_MEDIA_ROOT")),
                 environ=os.environ,
             ).run(limit=limit)
     except (
@@ -1372,10 +1368,7 @@ def generation_run(
                 policy=policy,
                 worker_actor_id=worker_actor_id,
                 author_actor_id=author_actor_id,
-                media_root=os.getenv(
-                    "COLMAT_GENERATION_MEDIA_ROOT",
-                    ".state/media/generation",
-                ),
+                media_root=configured_worker_media_root(os.getenv("COLMAT_GENERATION_MEDIA_ROOT")),
                 environ=os.environ,
             ).run(limit=limit)
     except (

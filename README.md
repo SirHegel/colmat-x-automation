@@ -226,6 +226,12 @@ duplicarla en los archivos del job. `COLMAT_AUTOMATION_MEDIA_ROOT` y
 publicador lea media de las dos colas. Una imagen mayor de 5 MiB se descarta antes de crear el
 draft.
 
+La raíz no es una ruta libre: el worker acepta únicamente los perfiles exactos `project`, `user`
+o `system` (respectivamente `.state/media`, `~/.local/share/colmat/media` y
+`/var/lib/colmat-x/media`), además de esas rutas canónicas exactas. Los alias locales heredados
+`.state/media/automation` y `.state/media/generation` convergen en `.state/media`; valores con
+`..`, subdirectorios o prefijos parecidos se rechazan antes de tocar el sistema de archivos.
+
 ## Flujo editorial YAML heredado
 
 Este flujo manual usa `content/posts/*.yaml`, `sync` y `run-due`; es distinto de la agenda de

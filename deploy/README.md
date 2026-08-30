@@ -221,6 +221,12 @@ COLMAT_GENERATION_MEDIA_ROOT=/var/lib/colmat-x/media
 ```
 
 No añadas ninguna variable `X_*` a ese archivo: `generation-run` las rechaza.
+
+Las variables de media son una selección cerrada, no una ruta arbitraria. Usa el perfil `system`
+o su ruta exacta `/var/lib/colmat-x/media` en este despliegue. Para ejecución local también se
+admiten `project` (`.state/media`) y `user` (`~/.local/share/colmat/media`). Traversals,
+subdirectorios y rutas con prefijos similares fallan antes de cualquier `mkdir`, `chmod` o lectura.
+
 `/var/lib/colmat-x/publication-worker.env` opera X sobre snapshots ya aprobados, pero nunca
 MiniMax:
 
