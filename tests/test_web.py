@@ -106,7 +106,7 @@ def test_health_does_not_initialize_integrations_or_return_secrets() -> None:
     assert response.json() == {"status": "ok", "service": "colmat-x-automation"}
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "same-origin"
     assert "sensitive-value" not in response.text
     assert app.state.runtime_provider._runtime is None
 

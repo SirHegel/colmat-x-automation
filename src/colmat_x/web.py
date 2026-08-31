@@ -893,7 +893,7 @@ def create_app(
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Referrer-Policy"] = "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
@@ -1366,7 +1366,9 @@ def _render_login(
     message: str | None = None,
     response_status: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
-    csrf_token = secrets.token_urlsafe(32)
+    csrf_token = request.cookies.get(LOGIN_CSRF_COOKIE, "")
+    if not _valid_request_nonce(csrf_token):
+        csrf_token = secrets.token_urlsafe(32)
     response = templates.TemplateResponse(
         request=request,
         name="login.html",
