@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
+import colmat_x.cli as cli_module
+from colmat_x.automation import AutomationResult, AutomationStatus, ClaimDecision, SlotClaim
 from colmat_x.cli import _load_trusted_worker_environment, app
+from colmat_x.config import ConfigError
 from colmat_x.domain import PostStatus
 from colmat_x.platform_store import AutomationRunStatus, PlatformStore
 from colmat_x.rbac import Role
@@ -21,6 +25,24 @@ AUTOMATION_PATH = Path("config/automation.yaml").resolve()
 
 def platform_database_url(tmp_path: Path) -> str:
     return f"sqlite+pysqlite:///{tmp_path / 'platform.db'}"
+
+
+def test_worker_store_disables_schema_creation_only_for_postgresql(monkeypatch) -> None:
+    captured: list[tuple[str, bool]] = []
+
+    class FakePlatformStore:
+        def __init__(self, database_url: str, *, create_schema: bool) -> None:
+            captured.append((database_url, create_schema))
+
+    monkeypatch.setattr(cli_module, "PlatformStore", FakePlatformStore)
+
+    cli_module._worker_platform_store("postgresql://db.example/colmat")
+    cli_module._worker_platform_store("sqlite+pysqlite:///:memory:")
+
+    assert captured == [
+        ("postgresql+psycopg://db.example/colmat", False),
+        ("sqlite+pysqlite:///:memory:", True),
+    ]
 
 
 def persisted_test_slot(*, mode: str = "human_review") -> dict[str, object]:
@@ -285,6 +307,95 @@ def test_worker_env_loader_preserves_literals_without_interpolation(
     assert os.environ["COLMAT_TEST_BACKSLASH"] == "back\\slash"
 
 
+def test_worker_env_loader_loads_minimax_file_literally_and_overrides_inherited_key(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    secret_file = tmp_path / "minimax.env"
+    secret_file.write_text("MINIMAX_API_KEY='fresh${HOME}'\n", encoding="utf-8")
+    secret_file.chmod(0o600)
+    primary_file = tmp_path / "generation-worker.env"
+    primary_file.write_text(
+        f"COLMAT_MINIMAX_ENV_FILE='{secret_file}'\n",
+        encoding="utf-8",
+    )
+    primary_file.chmod(0o600)
+    monkeypatch.setenv("HOME", "/must/not/be/interpolated")
+    monkeypatch.setenv("MINIMAX_API_KEY", "inherited-key")
+
+    _load_trusted_worker_environment(primary_file)
+
+    assert os.environ["MINIMAX_API_KEY"] == "fresh${HOME}"
+
+
+def test_worker_env_loader_ignores_minimax_path_inherited_outside_primary_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    secret_file = tmp_path / "minimax.env"
+    secret_file.write_text("MINIMAX_API_KEY=must-not-load\n", encoding="utf-8")
+    secret_file.chmod(0o600)
+    primary_file = tmp_path / "generation-worker.env"
+    primary_file.write_text("COLMAT_GENERATION_ENABLED=false\n", encoding="utf-8")
+    primary_file.chmod(0o600)
+    monkeypatch.setenv("COLMAT_MINIMAX_ENV_FILE", str(secret_file))
+    monkeypatch.setenv("MINIMAX_API_KEY", "keep-inherited-key")
+
+    _load_trusted_worker_environment(primary_file)
+
+    assert os.environ["MINIMAX_API_KEY"] == "keep-inherited-key"
+
+
+@pytest.mark.parametrize(
+    ("invalid_kind", "expected_message"),
+    [
+        ("symlink", "regular, no un enlace"),
+        ("permissions", "permisos 0600 exactos"),
+        ("extra-key", "debe contener solo MINIMAX_API_KEY"),
+        ("oversized", "tamaño no permitido"),
+    ],
+)
+def test_worker_env_loader_rejects_invalid_minimax_secret_files(
+    tmp_path: Path,
+    invalid_kind: str,
+    expected_message: str,
+    monkeypatch,
+) -> None:
+    protected_secret = "sensitive-value-that-must-not-be-shown"
+    secret_file = tmp_path / "minimax.env"
+    secret_file.write_text(f"MINIMAX_API_KEY={protected_secret}\n", encoding="utf-8")
+    secret_file.chmod(0o600)
+    configured_path = secret_file
+    if invalid_kind == "symlink":
+        configured_path = tmp_path / "minimax-linked.env"
+        configured_path.symlink_to(secret_file)
+    elif invalid_kind == "permissions":
+        secret_file.chmod(0o640)
+    elif invalid_kind == "extra-key":
+        secret_file.write_text(
+            f"MINIMAX_API_KEY={protected_secret}\nUNEXPECTED=value\n",
+            encoding="utf-8",
+        )
+    elif invalid_kind == "oversized":
+        secret_file.write_text(
+            f"MINIMAX_API_KEY={protected_secret}{'x' * 4096}\n",
+            encoding="utf-8",
+        )
+    primary_file = tmp_path / "worker.env"
+    primary_file.write_text(
+        f"COLMAT_MINIMAX_ENV_FILE='{configured_path}'\n",
+        encoding="utf-8",
+    )
+    primary_file.chmod(0o600)
+    monkeypatch.setenv("MINIMAX_API_KEY", "inherited-key")
+
+    with pytest.raises(ConfigError, match=expected_message) as error:
+        _load_trusted_worker_environment(primary_file)
+
+    assert protected_secret not in str(error.value)
+    assert os.environ["MINIMAX_API_KEY"] == "inherited-key"
+
+
 def test_worker_env_loader_rejects_missing_symlink_and_broad_permissions(tmp_path: Path) -> None:
     missing = runner.invoke(
         app,
@@ -341,6 +452,12 @@ def test_telegram_commands_registers_and_verifies_private_menu(
         "commands": [
             "estado",
             "equipo",
+            "usuarios",
+            "invitar",
+            "vincular",
+            "linea",
+            "patrones",
+            "investigar",
             "calendario",
             "modo",
             "generar",
@@ -531,6 +648,7 @@ def test_automation_status_returns_settings_and_recent_runs(tmp_path: Path) -> N
     assert payload["settings"]["direct_authorized"] is False
     assert payload["runs"] == [
         {
+            "attempt_count": 1,
             "claimed_at": run.claimed_at.isoformat(),
             "draft_id": None,
             "error": None,
@@ -543,8 +661,65 @@ def test_automation_status_returns_settings_and_recent_runs(tmp_path: Path) -> N
             "slot_hash": run.slot_hash,
             "slot_id": "dato-manana",
             "status": "claimed",
+            "retry_requested_at": None,
+            "retry_requested_by": None,
         }
     ]
+
+
+def test_automation_retry_cli_requeues_failed_run_without_executing_it(tmp_path: Path) -> None:
+    url = platform_database_url(tmp_path)
+    with PlatformStore(url) as store:
+        owner, _membership = store.bootstrap_owner(
+            email="owner@example.org",
+            display_name="Owner",
+            user_id="owner-1",
+        )
+        slot = persisted_test_slot()
+        store.update_automation_settings(
+            actor_id=owner.id,
+            expected_version=1,
+            enabled=True,
+            slots=[slot],
+        )
+        run = store.claim_automation_run(
+            actor_id=owner.id,
+            idempotency_key="colmat:auto:v1:2026-08-29:dato-manana",
+            slot_id="dato-manana",
+            scheduled_for="2026-08-29T08:30:00-05:00",
+            slot_snapshot=slot,
+        )
+        store.finish_automation_run(
+            run.id,
+            AutomationRunStatus.FAILED,
+            actor_id=owner.id,
+            error="MiniMax falló antes de crear el draft",
+        )
+
+    result = runner.invoke(
+        app,
+        [
+            "automation-retry",
+            run.id,
+            "--actor-id",
+            "owner-1",
+            "--database-url",
+            url,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["id"] == run.id
+    assert payload["status"] == "failed"
+    assert payload["attempt_count"] == 1
+    assert payload["retry_requested_by"] == "owner-1"
+    assert payload["retry_requested_at"] is not None
+    with PlatformStore(url) as store:
+        queued = store.list_automation_runs(actor_id="owner-1")[0]
+        assert queued.status_value is AutomationRunStatus.FAILED
+        assert queued.retry_requested_at is not None
+        assert queued.attempt_count == 1
 
 
 def test_automation_mode_and_enable_use_cas_and_existing_direct_kill_switch(
@@ -900,6 +1075,11 @@ def test_automation_run_builds_runtime_only_from_persisted_settings(
             user_id="author-1",
         )
         store.grant_membership(author.id, Role.EDITOR, actor_id=owner.id)
+        store.set_editorial_line(
+            "2026-08",
+            "Analizar conflictos históricos desde el materialismo filosófico.",
+            actor_id=owner.id,
+        )
         store.update_automation_settings(
             actor_id=owner.id,
             expected_version=1,
@@ -943,4 +1123,126 @@ def test_automation_run_builds_runtime_only_from_persisted_settings(
     assert runtime_config.daily_limit == 1
     assert runtime_config.direct_min_engagement_score == 91
     assert runtime_config.slots[0].brief == slot["brief"]
+    assert captured["generator"].editorial_line_resolver("2026-08") == (
+        "Analizar conflictos históricos desde el materialismo filosófico.",
+        1,
+    )
     assert json.loads(result.output)["processed"] == 0
+
+
+def test_automation_run_scans_retry_from_previous_local_date(tmp_path: Path, monkeypatch) -> None:
+    url = platform_database_url(tmp_path)
+    slot_mapping = persisted_test_slot()
+    scheduled_for = datetime(2026, 8, 29, 13, 30, tzinfo=UTC)
+    with PlatformStore(url) as store:
+        owner, _membership = store.bootstrap_owner(
+            email="owner@example.org",
+            display_name="Owner",
+            user_id="owner-1",
+        )
+        author = store.create_user(
+            actor_id=owner.id,
+            email="author@example.org",
+            display_name="Automation Author",
+            user_id="author-1",
+        )
+        store.grant_membership(author.id, Role.EDITOR, actor_id=owner.id)
+        store.set_editorial_line(
+            "2026-08",
+            "Analizar conflictos históricos desde el materialismo filosófico.",
+            actor_id=owner.id,
+        )
+        store.update_automation_settings(
+            actor_id=owner.id,
+            expected_version=1,
+            enabled=True,
+            slots=[slot_mapping],
+            min_engagement_score=80,
+        )
+        run = store.claim_automation_run(
+            actor_id=owner.id,
+            idempotency_key="colmat:auto:v1:2026-08-29:dato-manana",
+            slot_id="dato-manana",
+            scheduled_for=scheduled_for,
+            slot_snapshot=slot_mapping,
+        )
+        store.finish_automation_run(
+            run.id,
+            AutomationRunStatus.FAILED,
+            actor_id=owner.id,
+            error="Fallo confirmado antes del borrador",
+        )
+        store.request_automation_run_retry(run.id, actor_id=owner.id)
+
+    monkeypatch.setenv("COLMAT_AUTOMATION_SCHEDULER_ID", "owner-1")
+    monkeypatch.setenv("COLMAT_AUTOMATION_AUTHOR_ID", "author-1")
+    monkeypatch.setenv("COLMAT_TELEGRAM_ALERT_CHAT_ID", "778899")
+    monkeypatch.setenv("COLMAT_TELEGRAM_REVIEWER_USER_ID", "778899")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token-for-cli")
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-key-no-network")
+    retry_calls: list[dict[str, object]] = []
+
+    class FakeDailyAutomation:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+            self.repository = kwargs["repository"]
+
+        def run_due(self, *, environ, progress):
+            return ()
+
+        def run_retry(self, *, slot_id, local_date, idempotency_key, environ, progress):
+            retry_calls.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "local_date": local_date,
+                    "slot_id": slot_id,
+                }
+            )
+            slot = next(item for item in self.config.slots if item.id == slot_id)
+            claim = SlotClaim(
+                idempotency_key=idempotency_key,
+                local_date=local_date,
+                scheduled_for=datetime.combine(
+                    local_date,
+                    slot.at,
+                    tzinfo=self.config.zoneinfo,
+                ),
+                slot=slot,
+            )
+            assert (
+                self.repository.claim_retry_slot(claim, daily_limit=self.config.daily_limit)
+                is ClaimDecision.CLAIMED
+            )
+            return AutomationResult(
+                slot_id=slot_id,
+                idempotency_key=idempotency_key,
+                status=AutomationStatus.FAILED,
+                detail="Retry histórico reclamado por la prueba.",
+                scheduled_for=claim.scheduled_for,
+            )
+
+    monkeypatch.setattr("colmat_x.cli.DailyAutomation", FakeDailyAutomation)
+
+    result = runner.invoke(
+        app,
+        [
+            "automation-run",
+            "--database-url",
+            url,
+            "--policy",
+            str(POLICY_PATH),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert retry_calls == [
+        {
+            "idempotency_key": "colmat:auto:v1:2026-08-29:dato-manana",
+            "local_date": date(2026, 8, 29),
+            "slot_id": "dato-manana",
+        }
+    ], result.output
+    with PlatformStore(url) as store:
+        retried = store.list_automation_runs(actor_id="owner-1")[0]
+        assert retried.attempt_count == 2
+        assert retried.retry_requested_at is None

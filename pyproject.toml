@@ -37,6 +37,9 @@ colmat-x = "colmat_x.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/colmat_x"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"config/gustavo-bueno-books.yaml" = "colmat_x/data/gustavo-bueno-books.yaml"
+
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"
 testpaths = ["tests"]

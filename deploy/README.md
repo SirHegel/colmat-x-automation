@@ -38,7 +38,8 @@ impresiones ni crecimiento.
 La API usa `api/index.py` y `vercel.json`. Vercel necesita una `DATABASE_URL` PostgreSQL
 persistente; su filesystem efímero no admite la SQLite local ni la media del worker. El proceso
 web se conecta con creación de esquema deshabilitada: Vercel no ejecuta DDL, migraciones ni
-workers.
+workers. `automation-run`, `generation-run` y `publication-run` también deshabilitan la creación
+de esquema cuando la DSN es PostgreSQL; solo SQLite local conserva auto-inicialización.
 
 `DATABASE_URL` debe ser la DSN **pooled** del proveedor para el tráfico serverless. Conserva
 `DATABASE_URL_UNPOOLED` únicamente fuera de Vercel y úsala solo para aplicar el DDL.
@@ -200,8 +201,10 @@ porque ejecuta el pipeline diario completo:
 ```dotenv
 DATABASE_URL=
 TELEGRAM_BOT_TOKEN=
+MINIMAX_API_STYLE=anthropic
 MINIMAX_MODEL=MiniMax-M2.7
 MINIMAX_IMAGE_MODEL=image-01
+COLMAT_MINIMAX_ENV_FILE=/var/lib/colmat-x/minimax.env
 COLMAT_TELEGRAM_ALERT_CHAT_ID=
 COLMAT_TELEGRAM_REVIEWER_USER_ID=
 COLMAT_AUTOMATION_SCHEDULER_ID=
@@ -224,8 +227,10 @@ COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```dotenv
 DATABASE_URL=
 TELEGRAM_BOT_TOKEN=
+MINIMAX_API_STYLE=anthropic
 MINIMAX_MODEL=MiniMax-M2.7
 MINIMAX_IMAGE_MODEL=image-01
+COLMAT_MINIMAX_ENV_FILE=/var/lib/colmat-x/minimax.env
 COLMAT_AUTOMATION_SCHEDULER_ID=
 COLMAT_AUTOMATION_AUTHOR_ID=
 COLMAT_GENERATION_ENABLED=false
@@ -262,10 +267,18 @@ La última asignación está deliberadamente vacía: no es una credencial. Evita
 herede MiniMax si el proceso padre de OpenClaw lo recibió. Los valores de cada `--env-file`
 prevalecen sobre el entorno heredado, por lo que también los gates `false` quedan cerrados.
 
-Guarda la clave real una sola vez en otro `EnvironmentFile` de systemd, modo `0600`, y haz que
-llegue al contexto que ejecuta automation y generation. No la repitas en los tres envs, en la
-configuración de OpenClaw ni en el repositorio. Si la unidad padre también la expone al command job
-de publication, el valor vacío de `publication-worker.env` debe enmascararla como se muestra.
+Guarda la clave real una sola vez en `/var/lib/colmat-x/minimax.env`, regular, propiedad del usuario
+del worker, modo `0600`, máximo 4 KiB y con exactamente este único nombre:
+
+```dotenv
+MINIMAX_API_KEY=
+```
+
+Automation y generation siguen esa ruta porque sus envs primarios declaran explícitamente
+`COLMAT_MINIMAX_ENV_FILE`; una ruta presente solo en el entorno heredado se ignora. El parser no
+interpola el contenido y la clave leída prevalece sobre una clave heredada. No la repitas en los
+tres envs, en la configuración de OpenClaw ni en el repositorio. Publication no declara la ruta y
+el valor vacío de `MINIMAX_API_KEY` sigue enmascarando cualquier clave heredada.
 
 No pases secretos como argumentos ni los pegues en prompts. Crea `/var/lib/colmat-x/media` con
 modo `0700` y usa esa misma raíz para ambas variables: `publication-run` debe verificar y leer las
@@ -309,9 +322,9 @@ OPENCLAW_STATE_DIR=/var/lib/openclaw-colmat openclaw cron add \
   --name colmat-generation \
   --agent colmat-editorial \
   --every 2m \
-  --timeout-seconds 1800 \
+  --timeout-seconds 2400 \
   --command-argv \
-  '["/opt/colmat-x-automation/.venv/bin/colmat-x","generation-run","--env-file","/var/lib/colmat-x/generation-worker.env","--limit","5"]' \
+  '["/opt/colmat-x-automation/.venv/bin/colmat-x","generation-run","--env-file","/var/lib/colmat-x/generation-worker.env","--limit","1"]' \
   --command-cwd /opt/colmat-x-automation \
   --disabled
 
@@ -331,8 +344,10 @@ efectiva viene del `COLMAT_AUTOMATION_SCHEDULER_ID` fijo en el archivo protegido
 puede editar los tres envs, el `EnvironmentFile` de MiniMax y el perfil de OpenClaw; la definición
 del job no administra RBAC, no aprueba borradores ni llama por sí misma a MiniMax o X. Conserva
 los tres jobs deshabilitados hasta validar cada comando con su mismo usuario y entorno. Conserva
-timeouts explícitos: generación y automatización pueden encadenar varias llamadas acotadas de
-texto e imagen; el timeout implícito no cubre el peor caso de cada lote.
+timeouts explícitos: `--limit 1` evita ráfagas contra el cupo del proveedor; una solicitud todavía
+puede encadenar recuperación acotada de fuentes, hasta dos lecturas de texto de 90 s, una imagen de
+180 s, persistencia y entrega de outbox. El job reserva 2400 s para ese peor caso y la sobrecarga de
+OpenClaw. La lease de generación es de 900 s por solicitud.
 
 Deja el job deshabilitado hasta que el comando manual funcione. Después programa el sondeo con la
 frecuencia operativa elegida y alerta ante un código distinto de cero o estados `failed`,
@@ -432,6 +447,20 @@ OPENCLAW_STATE_DIR=/var/lib/openclaw-colmat openclaw cron edit JOB_ID \
 Un resultado `unknown` significa que X pudo haber recibido la solicitud. No reintentes a ciegas:
 comprueba la cuenta, conserva los logs y concilia el intento antes de reanudar. Respalda PostgreSQL
 y el directorio de media con el worker detenido o mediante mecanismos consistentes del proveedor.
+
+Un `failed` previo tampoco se convierte en verde por ejecuciones duplicadas posteriores. Si falló
+antes de crear un draft, un owner, admin o scheduler puede reencolar el mismo run de forma auditada:
+
+```bash
+colmat-x automation-retry RUN_ID --actor-id SCHEDULER_ID
+```
+
+El comando no invoca MiniMax ni X. El siguiente `automation-run` escanea también fechas históricas,
+cerca el claim por el `run_id` original y aumenta `attempt_count`; nunca crea un run retroactivo.
+Un flag que ya no coincide con la agenda se retira con auditoría para que no quede varado.
+`unknown` y los runs que ya tienen draft quedan fuera de este mecanismo. Los slots autónomos además
+exigen la línea editorial versionada del mes programado antes de llamar a MiniMax; si falta, fallan
+cerrado y no publican.
 
 ## Unidades systemd heredadas
 

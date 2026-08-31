@@ -35,12 +35,18 @@ from colmat_x.platform_store import (
     StaleSnapshotError,
 )
 from colmat_x.rbac import AuthorizationError, Permission, Role, can_assign_role, has_permission
+from colmat_x.research_registry import (
+    RESEARCH_ONLY_BRIEF_PREFIX,
+    ResearchRegistry,
+    load_gustavo_bueno_registry,
+)
 from colmat_x.telegram_api import (
     TelegramApiClient,
     TelegramConfigurationError,
     TelegramCredentials,
 )
 from colmat_x.telegram_bot import (
+    RESEARCH_PATTERN_STEPS,
     BotAutomationMode,
     ClaimedTelegramUpdateError,
     CommandResult,
@@ -99,12 +105,16 @@ class PlatformTelegramOperations:
         store: PlatformStore,
         *,
         generate_images: bool = True,
+        research_registry: ResearchRegistry | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
         if not isinstance(generate_images, bool):
             raise TypeError("generate_images debe ser booleano")
         self._generate_images = generate_images
+        if research_registry is not None and not isinstance(research_registry, ResearchRegistry):
+            raise TypeError("research_registry debe ser ResearchRegistry")
+        self._research_registry = research_registry
         self._now = now or (lambda: datetime.now(UTC))
 
     def get_status(self, *, telegram_user_id: int, chat_id: int) -> str:
@@ -136,6 +146,271 @@ class PlatformTelegramOperations:
             state = "activo" if user.is_active else "inactivo"
             lines.append(f"• {user.display_name} — {membership.role} ({state})")
         return "\n".join(lines)
+
+    def list_telegram_users(self, *, telegram_user_id: int, chat_id: int) -> str:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            memberships = self.store.list_memberships(actor_id=actor.id)
+            bindings = self.store.list_telegram_bindings(actor_id=actor.id)
+        except (AuthorizationError, NotFoundError, ValueError):
+            return "No se pudieron consultar los vínculos; la operación requiere al owner."
+        bindings_by_user: dict[str, list[str]] = {}
+        for binding in bindings:
+            if binding.purpose != "control":
+                continue
+            state = "activo" if binding.is_active else "inactivo"
+            private = "privado" if binding.chat_id == binding.telegram_user_id else "otro chat"
+            bindings_by_user.setdefault(binding.user_id, []).append(
+                f"{binding.telegram_user_id} ({state}, {private})"
+            )
+        lines = ["Usuarios y acceso Telegram (IDs numéricos; no @username):"]
+        for index, membership in enumerate(memberships):
+            user = self.store.get_user(membership.user_id)
+            telegram_ids = ", ".join(bindings_by_user.get(user.id, ())) or "sin vínculo"
+            state = "activo" if user.is_active else "inactivo"
+            entry = (
+                f"• {user.display_name} — {membership.role}, {state}\n"
+                f"  user_id={user.id}; Telegram={telegram_ids}"
+            )
+            if len("\n".join((*lines, entry))) > 3_800:
+                lines.append(
+                    f"… {len(memberships) - index} usuario(s) omitidos; consulta la auditoría "
+                    "o el panel para el listado completo."
+                )
+                break
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def invite_telegram_user(
+        self,
+        target_telegram_user_id: int,
+        role: str,
+        email: str,
+        display_name: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        del request_id  # El ID privado + los datos exactos hacen el alta idempotente.
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            user, membership, _binding = self.store.provision_telegram_team_member(
+                actor_id=actor.id,
+                telegram_user_id=target_telegram_user_id,
+                email=email,
+                display_name=display_name,
+                role=Role(role),
+            )
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return CommandResult(
+                "No se completó el alta: debe ejecutarla el owner con un ID numérico no "
+                "vinculado, un correo nuevo y un rol delegable.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Alta lista: {user.display_name} ({membership.role}), user_id={user.id}, "
+            f"Telegram={target_telegram_user_id}. Debe abrir el bot en privado y usar /start."
+        )
+
+    def bind_telegram_user(
+        self,
+        target_telegram_user_id: int,
+        user_id: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        del request_id  # bind_telegram_chat es un upsert auditado por identidad exacta.
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            actor_membership = next(
+                membership
+                for membership in self.store.list_memberships(actor_id=actor.id)
+                if membership.user_id == actor.id
+            )
+            if Role(actor_membership.role) is not Role.OWNER:
+                raise AuthorizationError("Solo el owner puede vincular otras identidades")
+            self.store.bind_telegram_chat(
+                target_telegram_user_id,
+                telegram_user_id=target_telegram_user_id,
+                actor_id=actor.id,
+                user_id=user_id,
+                purpose="control",
+            )
+        except (AuthorizationError, ConflictError, NotFoundError, StopIteration, ValueError):
+            return CommandResult(
+                "No se creó el vínculo: comprueba el user_id, el ID numérico y que la "
+                "identidad no pertenezca a otra cuenta.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Telegram {target_telegram_user_id} quedó vinculado a user_id={user_id} en chat "
+            "privado. El rol de la membresía limita sus comandos."
+        )
+
+    def get_editorial_line(
+        self,
+        month: str | None,
+        *,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> str:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        selected_month = month or self._editorial_month()
+        line = self.store.get_editorial_line(selected_month, actor_id=actor.id)
+        if line is None:
+            return f"No hay línea editorial fijada para {selected_month}."
+        return f"Línea editorial {line.month} (v{line.version}): {line.line_text}"
+
+    def set_editorial_line(
+        self,
+        month: str,
+        text: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        del request_id  # El upsert idéntico no crea una versión adicional.
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        try:
+            line = self.store.set_editorial_line(month, text, actor_id=actor.id)
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return CommandResult(
+                "No se fijó la línea: solo el owner puede modificar un mes AAAA-MM válido.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Línea editorial {line.month} fijada en versión {line.version}. "
+            "No se generó ni publicó contenido."
+        )
+
+    def research_topic(
+        self,
+        topic: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        month = self._editorial_month()
+        try:
+            line = self.store.get_editorial_line(month, actor_id=actor.id)
+            if line is None:
+                raise ConflictError("No hay línea editorial mensual")
+            registry = self._research_registry or load_gustavo_bueno_registry()
+            # La directriz mensual contextualiza la síntesis, pero no debe contaminar
+            # la selección bibliográfica por título del tema solicitado.
+            selected_references = registry.select(topic)
+            pattern = " ".join(
+                f"{index}) {step}" for index, step in enumerate(RESEARCH_PATTERN_STEPS, start=1)
+            )
+            brief_prefix = (
+                f"{RESEARCH_ONLY_BRIEF_PREFIX} Tema: {topic}. Línea {line.month} "
+                f"v{line.version}: {line.line_text} Patrón obligatorio: {pattern}"
+            )
+            if selected_references:
+                suffix = (
+                    " Catálogo por título, no cita: "
+                    + " | ".join(
+                        _research_reference_text(reference) for reference in selected_references
+                    )
+                    + ". URLs acotadas; verifica pertinencia y hechos."
+                )
+            else:
+                suffix = (
+                    " Sin obra pertinente: no inventes. URLs maestras autorizadas: "
+                    + " ".join(registry.canonical_urls[:2])
+                    + ". El worker recuperará solo esas fuentes; inferencias POR VERIFICAR."
+                )
+            brief = brief_prefix + suffix
+            while len(brief) > 1_000 and len(selected_references) > 1:
+                selected_references = selected_references[:-1]
+                suffix = (
+                    " Catálogo por título, no cita: "
+                    + " | ".join(
+                        _research_reference_text(reference) for reference in selected_references
+                    )
+                    + ". URLs acotadas; verifica pertinencia y hechos."
+                )
+                brief = brief_prefix + suffix
+            if len(brief) > 1_000:
+                raise ValueError("Tema, línea y referencias superan el brief permitido")
+            generation_request = self.store.enqueue_generation_request(
+                brief,
+                actor_id=actor.id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                idempotency_key=request_id,
+                generate_image=False,
+                category="dato_semana",
+                institution="colmat",
+            )
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return CommandResult(
+                "No se encoló la investigación: se requiere owner/editor, línea del mes y "
+                "capacidad disponible.",
+                accepted=False,
+            )
+        return CommandResult(
+            f"Síntesis exploratoria encolada como {generation_request.id} con la línea "
+            f"{line.month} v{line.version} y {len(selected_references)} coincidencia(s) de "
+            "catálogo por título. OpenClaw recuperará solo las URLs oficiales autorizadas y "
+            "asignará la síntesis a MiniMax; no es navegación web abierta ni es publicable. "
+            "Tras verificarla, copia sus hallazgos manualmente a /generar para crear una pieza "
+            "nueva sujeta a revisión humana."
+        )
+
+    def get_research_patterns(self, *, telegram_user_id: int, chat_id: int) -> str:
+        actor = self.store.resolve_telegram_actor(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+        )
+        # Revalida owner/editor en el store; no depende solo del permiso del procesador.
+        self.store.get_editorial_line(self._editorial_month(), actor_id=actor.id)
+        registry = self._research_registry or load_gustavo_bueno_registry()
+        documented_count = sum(not reference.disputed for reference in registry.entries)
+        disputed_count = sum(reference.disputed for reference in registry.entries)
+        lines = [
+            "Patrón de investigación Colmat:",
+            f"Registro canónico cargado: {documented_count} títulos o series documentados + "
+            f"{disputed_count} atribución "
+            "disputada; se envían como máximo 3 coincidencias por título, nunca el catálogo "
+            "completo, y siempre se verifica su pertinencia.",
+        ]
+        lines.extend(
+            f"{index}. {step}" for index, step in enumerate(RESEARCH_PATTERN_STEPS, start=1)
+        )
+        lines.append(
+            "MiniMax solo sintetiza las fuentes del encargo o del registro canónico. La "
+            "verificación externa sigue siendo humana; sin fuente identificable, todo queda "
+            "POR VERIFICAR y nunca pasa a publicación automática."
+        )
+        return "\n".join(lines)
+
+    def _editorial_month(self) -> str:
+        return self._now().astimezone(ZoneInfo("America/Bogota")).strftime("%Y-%m")
 
     def get_calendar(
         self,
@@ -233,8 +508,17 @@ class PlatformTelegramOperations:
             chat_id=chat_id,
         )
         try:
+            month = self._editorial_month()
+            line = self.store.get_editorial_line(month, actor_id=actor.id)
+            if line is None:
+                raise ConflictError("No hay línea editorial mensual")
+            guided_brief = (
+                f"Línea editorial {line.month} v{line.version}: {line.line_text} Encargo: {brief}"
+            )
+            if len(guided_brief) > 1_000:
+                raise ValueError("La línea y el encargo superan el brief permitido")
             generation_request = self.store.enqueue_generation_request(
-                brief,
+                guided_brief,
                 actor_id=actor.id,
                 telegram_user_id=telegram_user_id,
                 chat_id=chat_id,
@@ -248,13 +532,15 @@ class PlatformTelegramOperations:
             ValueError,
         ):
             return CommandResult(
-                "No se encoló la generación. Revisa permisos y el vínculo de Telegram; "
-                "no se llamó a MiniMax ni se realizó ninguna publicación.",
+                "No se encoló la generación. Se requiere owner/editor, una línea editorial "
+                "del mes y un encargo que junto con ella no supere 1000 caracteres; no se "
+                "llamó a MiniMax ni se realizó ninguna publicación.",
                 accepted=False,
             )
         return CommandResult(
             f"Generación encolada como {generation_request.id}. OpenClaw la asignará a "
-            "MiniMax fuera del webhook; el resultado siempre exigirá revisión humana"
+            f"MiniMax con la línea {line.month} v{line.version} fuera del webhook; el resultado "
+            "siempre exigirá revisión humana"
             f"{' e incluirá imagen' if generation_request.generate_image else ''}."
         )
 
@@ -521,6 +807,9 @@ class RuntimeProvider:
         return all(result == "ok" for result in checks.values()), checks
 
     def _build(self) -> WebRuntime:
+        # Se carga durante el arranque, no al recibir /investigar: un artefacto
+        # instalado sin el registro canónico queda no-ready y falla cerrado.
+        research_registry = load_gustavo_bueno_registry()
         store = self._injected.store
         if store is None:
             database_url = self.environ.get("DATABASE_URL", "").strip() or None
@@ -542,6 +831,7 @@ class RuntimeProvider:
                 operations=PlatformTelegramOperations(
                     store,
                     generate_images=_generation_default_image(self.environ),
+                    research_registry=research_registry,
                 ),
                 callback_nonces=store,
             )
@@ -554,6 +844,16 @@ class RuntimeProvider:
                 timeout_seconds=_web_telegram_timeout(self.environ),
             )
         return WebRuntime(store=store, processor=processor, telegram_client=telegram_client)
+
+
+def _research_reference_text(reference: Any) -> str:
+    if reference.disputed:
+        return (
+            f"{reference.title} ({reference.year}) {reference.url}; atribución editorial "
+            "disputada; Bueno negó participación: "
+            f"{reference.status_url}"
+        )
+    return f"{reference.title} ({reference.year}) {reference.url}"
 
 
 def create_app(
@@ -1286,6 +1586,10 @@ def _render_dashboard(
     drafts: list[dict[str, object]] = []
     for draft, revision in draft_rows:
         has_image = revision.image_sha256 is not None
+        research_only = (
+            isinstance(revision.evidence, Mapping)
+            and revision.evidence.get("research_only") is True
+        )
         evidence_text = json.dumps(
             revision.evidence,
             ensure_ascii=False,
@@ -1308,11 +1612,13 @@ def _render_dashboard(
                     revision.image_sha256[:16] if revision.image_sha256 is not None else None
                 ),
                 "requires_telegram_review": has_image,
+                "research_only": research_only,
                 "can_approve": (
                     can_review
                     and draft.status == DraftStatus.IN_REVIEW.value
                     and revision.created_by != principal.user_id
                     and review_material_complete
+                    and not research_only
                 ),
                 "can_reject": (
                     can_review
@@ -1324,6 +1630,7 @@ def _render_dashboard(
                     can_publish
                     and draft.status == DraftStatus.APPROVED.value
                     and review_material_complete
+                    and not research_only
                 ),
             }
         )

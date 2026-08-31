@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,7 @@ from sqlalchemy import func, select, text  # noqa: E402
 
 from colmat_x.platform_store import (  # noqa: E402
     Approval,
+    ApprovalDecision,
     AuditEvent,
     AutomationMode,
     AutomationReviewNotification,
@@ -27,6 +29,7 @@ from colmat_x.platform_store import (  # noqa: E402
     ConflictError,
     Draft,
     DraftStatus,
+    EditorialLine,
     Membership,
     NotFoundError,
     PlatformStore,
@@ -135,6 +138,35 @@ def approved_draft(
     return draft, revision, approval
 
 
+def seed_legacy_approved_draft(
+    store: PlatformStore,
+    draft: Draft,
+    revision: Revision,
+    *,
+    reviewer_id: str,
+) -> Approval:
+    """Simula una aprobación anterior a la barrera research_only."""
+
+    with store.session() as session, session.begin():
+        persisted = session.get(Draft, draft.id)
+        assert persisted is not None
+        approval = Approval(
+            workspace_id=persisted.workspace_id,
+            draft_id=persisted.id,
+            revision_id=revision.id,
+            decision="approved",
+            snapshot_hash=revision.snapshot_hash,
+            actor_id=reviewer_id,
+            created_at=NOW,
+        )
+        session.add(approval)
+        session.flush()
+        persisted.status = DraftStatus.APPROVED.value
+        persisted.approved_revision_id = revision.id
+        persisted.updated_at = NOW
+    return approval
+
+
 def automation_slot(
     slot_id: str = "manana",
     *,
@@ -168,6 +200,7 @@ def test_schema_contains_all_platform_tables() -> None:
         "automation_settings",
         "callback_intents",
         "drafts",
+        "editorial_lines",
         "generation_notifications",
         "generation_requests",
         "media_assets",
@@ -333,6 +366,263 @@ def test_publication_request_enqueue_is_snapshot_bound_idempotent_and_does_not_p
     assert store.get_draft(draft.id, actor_id=owner.id).status_value is DraftStatus.APPROVED
     events = store.list_audit_events(actor_id=owner.id)
     assert sum(event.action == "publication_request.queued" for event in events) == 1
+
+
+def test_research_only_revision_cannot_be_converted_or_published(store) -> None:
+    owner, editor, reviewer, publisher, _auditor = bootstrap_team(store)
+    draft, revision = store.create_draft(
+        actor_id=editor.id,
+        text="Síntesis exploratoria pendiente de verificación.",
+        category="educacion",
+        publish_at=PUBLISH_AT,
+        evidence={"research_only": True, "externally_verified": False},
+        now=NOW,
+    )
+
+    with pytest.raises(ConflictError, match="no puede convertir"):
+        store.revise_draft(
+            draft.id,
+            actor_id=editor.id,
+            text="Intento de quitar la barrera.",
+            category="educacion",
+            publish_at=PUBLISH_AT,
+            evidence={"externally_verified": True},
+            now=NOW,
+        )
+
+    store.submit_for_review(
+        draft.id,
+        actor_id=editor.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        now=NOW,
+    )
+    with pytest.raises(ConflictError, match="no es aprobable"):
+        store.approve_draft(
+            draft.id,
+            actor_id=reviewer.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            now=NOW,
+        )
+    store.bind_telegram_chat(
+        700000040,
+        telegram_user_id=700000040,
+        actor_id=owner.id,
+        user_id=reviewer.id,
+        purpose="review",
+        now=NOW,
+    )
+    with pytest.raises(ConflictError, match="no es aprobable"):
+        store.issue_callback_intent(
+            draft.id,
+            CallbackAction.APPROVE,
+            expected_snapshot_hash=revision.snapshot_hash,
+            telegram_user_id=700000040,
+            chat_id=700000040,
+            expires_at=NOW + timedelta(hours=1),
+            now=NOW,
+        )
+    rejection = store.reject_draft(
+        draft.id,
+        actor_id=reviewer.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        reason="La investigación debe convertirse en una pieza nueva verificada.",
+        now=NOW,
+    )
+    assert rejection.decision_value is ApprovalDecision.REJECTED
+
+    seed_legacy_approved_draft(store, draft, revision, reviewer_id=reviewer.id)
+    with pytest.raises(ConflictError, match="no es publicable"):
+        store.enqueue_publication_request(
+            draft.id,
+            actor_id=publisher.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            idempotency_key="research:enqueue-bypass",
+            now=NOW,
+        )
+    with pytest.raises(ConflictError, match="no es publicable"):
+        store.create_publish_attempt(
+            draft.id,
+            actor_id=publisher.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            idempotency_key="research:attempt-bypass",
+            now=NOW,
+        )
+
+
+def test_claim_fences_legacy_research_only_publication_request(store) -> None:
+    _owner, editor, reviewer, publisher, _auditor = bootstrap_team(store)
+    draft, revision = store.create_draft(
+        actor_id=editor.id,
+        text="Síntesis exploratoria heredada.",
+        category="educacion",
+        publish_at=PUBLISH_AT,
+        evidence={"research_only": True},
+        now=NOW,
+    )
+    store.submit_for_review(
+        draft.id,
+        actor_id=editor.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        now=NOW,
+    )
+    approval = seed_legacy_approved_draft(store, draft, revision, reviewer_id=reviewer.id)
+    with store.session() as session:
+        legacy = PublicationRequest(
+            workspace_id="colmat",
+            draft_id=draft.id,
+            revision_id=revision.id,
+            approval_id=approval.id,
+            requested_by=publisher.id,
+            channel="x",
+            idempotency_key="legacy:research-only",
+            snapshot_hash=revision.snapshot_hash,
+            status=PublicationRequestStatus.QUEUED.value,
+            claim_fence=0,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(legacy)
+        session.commit()
+        legacy_id = legacy.id
+
+    assert store.claim_publication_request(actor_id=publisher.id, now=NOW) is None
+    persisted = store.get_publication_request(legacy_id, actor_id=publisher.id)
+    assert persisted.status_value is PublicationRequestStatus.UNKNOWN
+    assert "no es publicable" in (persisted.error or "")
+    with store.session() as session:
+        assert session.scalar(select(func.count(PublishAttempt.id))) == 0
+
+
+def test_finish_legacy_publish_attempt_cannot_publish_research_only(store) -> None:
+    _owner, editor, reviewer, publisher, _auditor = bootstrap_team(store)
+    draft, revision = store.create_draft(
+        actor_id=editor.id,
+        text="Síntesis exploratoria con intento heredado.",
+        category="educacion",
+        publish_at=PUBLISH_AT,
+        evidence={"research_only": True},
+        now=NOW,
+    )
+    store.submit_for_review(
+        draft.id,
+        actor_id=editor.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        now=NOW,
+    )
+    seed_legacy_approved_draft(store, draft, revision, reviewer_id=reviewer.id)
+    with store.session() as session, session.begin():
+        attempt = PublishAttempt(
+            workspace_id="colmat",
+            draft_id=draft.id,
+            revision_id=revision.id,
+            requested_by=publisher.id,
+            channel="x",
+            idempotency_key="legacy:research-only-attempt",
+            snapshot_hash=revision.snapshot_hash,
+            status=PublishStatus.PENDING.value,
+            started_at=NOW,
+        )
+        session.add(attempt)
+        session.flush()
+        attempt_id = attempt.id
+
+    with pytest.raises(ConflictError, match="no es publicable"):
+        store.finish_publish_attempt(
+            attempt_id,
+            PublishStatus.SUCCEEDED,
+            actor_id=publisher.id,
+            provider_post_id="190000000000000077",
+            now=NOW + timedelta(seconds=1),
+        )
+
+    with store.session() as session:
+        persisted_attempt = session.get(PublishAttempt, attempt_id)
+        persisted_draft = session.get(Draft, draft.id)
+        assert persisted_attempt is not None
+        assert persisted_attempt.status_value is PublishStatus.PENDING
+        assert persisted_attempt.finished_at is None
+        assert persisted_attempt.provider_post_id is None
+        assert persisted_draft is not None
+        assert persisted_draft.status_value is DraftStatus.APPROVED
+
+
+def test_legacy_approve_callback_cannot_consume_or_decide_research_only(store) -> None:
+    owner, editor, reviewer, _publisher, _auditor = bootstrap_team(store)
+    draft, revision = store.create_draft(
+        actor_id=editor.id,
+        text="Síntesis exploratoria con callback heredado.",
+        category="educacion",
+        publish_at=PUBLISH_AT,
+        evidence={"research_only": True, "externally_verified": False},
+        now=NOW,
+    )
+    store.submit_for_review(
+        draft.id,
+        actor_id=editor.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        now=NOW,
+    )
+    telegram_user_id = 700000041
+    chat_id = -1000000000041
+    store.bind_telegram_chat(
+        chat_id,
+        telegram_user_id=telegram_user_id,
+        actor_id=owner.id,
+        user_id=reviewer.id,
+        purpose="review",
+        now=NOW,
+    )
+    nonce = "legacy-research-only-approval-nonce-0001"
+    with store.session() as session, session.begin():
+        intent = CallbackIntent(
+            nonce_hash=hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
+            workspace_id="colmat",
+            action=CallbackAction.APPROVE.value,
+            draft_id=draft.id,
+            revision_id=revision.id,
+            snapshot_hash=revision.snapshot_hash,
+            user_id=reviewer.id,
+            telegram_user_id=str(telegram_user_id),
+            chat_id=str(chat_id),
+            expires_at=NOW + timedelta(hours=1),
+            created_by="telegram",
+            created_at=NOW,
+        )
+        session.add(intent)
+        session.flush()
+        intent_id = intent.id
+    claim = store.claim_update(
+        4304,
+        payload={"update_id": 4304, "callback_query": {"data": "approve:opaque"}},
+        telegram_user_id=telegram_user_id,
+        chat_id=chat_id,
+        now=NOW,
+    )
+
+    applied = store.apply_callback_decision(
+        nonce,
+        decision=CallbackDecision.APPROVE,
+        telegram_user_id=telegram_user_id,
+        chat_id=chat_id,
+        update_id=4304,
+        claim_token=claim.claim_token,
+        claim_fence=claim.claim_fence,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert applied is None
+    with store.session() as session:
+        persisted_intent = session.get(CallbackIntent, intent_id)
+        persisted_update = session.get(TelegramUpdate, 4304)
+        persisted_draft = session.get(Draft, draft.id)
+        assert persisted_intent is not None
+        assert persisted_intent.consumed_at is None
+        assert persisted_intent.consumed_by is None
+        assert persisted_update is not None
+        assert persisted_update.business_result is None
+        assert persisted_draft is not None
+        assert persisted_draft.status_value is DraftStatus.IN_REVIEW
+        assert session.scalar(select(func.count(Approval.id))) == 0
 
 
 def test_publication_queue_peek_is_authorized_and_has_no_claim_side_effect(store) -> None:
@@ -1629,6 +1919,215 @@ def test_telegram_binding_cannot_impersonate_higher_roles_or_transfer_identity(s
             user_id=editor.id,
             now=NOW,
         )
+    with pytest.raises(ConflictError, match="from.id"):
+        store.bind_telegram_chat(
+            -1009003,
+            telegram_user_id=9003,
+            actor_id=owner.id,
+            user_id=editor.id,
+            now=NOW,
+        )
+
+
+def test_owner_provisions_private_telegram_member_atomically_and_idempotently(store) -> None:
+    owner, _editor, _reviewer, _publisher, _auditor = bootstrap_team(store)
+    store.bind_telegram_chat(
+        700000000,
+        telegram_user_id=700000000,
+        actor_id=owner.id,
+        user_id=owner.id,
+        now=NOW,
+    )
+
+    user, membership, binding = store.provision_telegram_team_member(
+        actor_id=owner.id,
+        telegram_user_id=700000001,
+        email="telegram-reviewer@colmat.test",
+        display_name="Revisión Telegram",
+        role=Role.REVIEWER,
+        now=NOW,
+    )
+    replay_user, replay_membership, replay_binding = store.provision_telegram_team_member(
+        actor_id=owner.id,
+        telegram_user_id=700000001,
+        email="telegram-reviewer@colmat.test",
+        display_name="Revisión Telegram",
+        role=Role.REVIEWER,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert membership.role_value is Role.REVIEWER
+    assert binding.telegram_user_id == "700000001"
+    assert binding.chat_id == "700000001"
+    assert binding.purpose == "control"
+    assert (
+        store.resolve_telegram_actor(
+            telegram_user_id=700000001,
+            chat_id=700000001,
+        ).id
+        == user.id
+    )
+    assert (replay_user.id, replay_membership.id, replay_binding.id) == (
+        user.id,
+        membership.id,
+        binding.id,
+    )
+    assert store.is_allowed(
+        telegram_user_id=700000001,
+        chat_id=700000001,
+        permission=BotPermission.APPROVE,
+    )
+    assert not store.is_allowed(
+        telegram_user_id=700000001,
+        chat_id=700000001,
+        permission=BotPermission.GENERATE,
+    )
+    assert not store.is_allowed(
+        telegram_user_id=700000001,
+        chat_id=700000001,
+        permission=BotPermission.MANAGE_TEAM,
+    )
+    events = store.list_audit_events(actor_id=owner.id)
+    assert sum(event.action == "user.created" for event in events) == 5
+    assert sum(event.action == "membership.granted" for event in events) == 5
+    assert sum(event.action == "telegram.binding_created" for event in events) == 2
+
+
+def test_telegram_provisioning_rejects_admin_reserved_roles_and_partial_rows(store) -> None:
+    owner, _editor, _reviewer, _publisher, _auditor = bootstrap_team(store)
+    admin = add_member(store, owner.id, Role.ADMIN, 9)
+    with store.session() as session:
+        users_before = int(session.scalar(select(func.count(User.id))) or 0)
+
+    with pytest.raises(AuthorizationError, match="Solo el owner"):
+        store.provision_telegram_team_member(
+            actor_id=admin.id,
+            telegram_user_id=700000010,
+            email="forbidden@colmat.test",
+            display_name="No permitido",
+            role=Role.EDITOR,
+            now=NOW,
+        )
+    with pytest.raises(AuthorizationError, match="solo permite delegar"):
+        store.provision_telegram_team_member(
+            actor_id=owner.id,
+            telegram_user_id=700000011,
+            email="second-owner@colmat.test",
+            display_name="Owner no delegable",
+            role=Role.OWNER,
+            now=NOW,
+        )
+
+    with store.session() as session:
+        assert int(session.scalar(select(func.count(User.id))) or 0) == users_before
+
+
+def test_monthly_editorial_line_is_owner_versioned_and_editor_readable(store) -> None:
+    owner, editor, reviewer, _publisher, _auditor = bootstrap_team(store)
+
+    first = store.set_editorial_line(
+        "2026-08",
+        "Independencia, conflicto histórico y materialismo filosófico.",
+        actor_id=owner.id,
+        now=NOW,
+    )
+    replay = store.set_editorial_line(
+        "2026-08",
+        "Independencia, conflicto histórico y materialismo filosófico.",
+        actor_id=owner.id,
+        now=NOW + timedelta(seconds=1),
+    )
+    second = store.set_editorial_line(
+        "2026-08",
+        "Analizar guerras históricas desde categorías del materialismo filosófico.",
+        actor_id=owner.id,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    visible = store.get_editorial_line("2026-08", actor_id=editor.id)
+    assert isinstance(visible, EditorialLine)
+    assert first.id == replay.id == second.id == visible.id
+    assert replay.version == 1
+    assert visible.version == 2
+    assert visible.updated_by == owner.id
+    with pytest.raises(AuthorizationError, match="owner o editor"):
+        store.get_editorial_line("2026-08", actor_id=reviewer.id)
+    with pytest.raises(AuthorizationError, match="Solo el owner"):
+        store.set_editorial_line(
+            "2026-08",
+            "Cambio de editor",
+            actor_id=editor.id,
+            now=NOW + timedelta(seconds=3),
+        )
+
+    line_events = [
+        event
+        for event in store.list_audit_events(actor_id=owner.id)
+        if event.entity_type == "editorial_line"
+    ]
+    assert [event.action for event in line_events] == [
+        "editorial_line.created",
+        "editorial_line.updated",
+    ]
+    assert line_events[-1].detail["version"] == 2
+
+
+def test_telegram_owner_editor_permissions_do_not_collapse_editorial_roles(store) -> None:
+    owner, editor, reviewer, _publisher, _auditor = bootstrap_team(store)
+    for telegram_user_id, user in ((700000020, owner), (700000021, editor), (700000022, reviewer)):
+        store.bind_telegram_chat(
+            telegram_user_id,
+            telegram_user_id=telegram_user_id,
+            actor_id=owner.id,
+            user_id=user.id,
+            now=NOW,
+        )
+
+    assert store.is_allowed(
+        telegram_user_id=700000020,
+        chat_id=700000020,
+        permission=BotPermission.MANAGE_TEAM,
+    )
+    assert store.is_allowed(
+        telegram_user_id=700000020,
+        chat_id=700000020,
+        permission=BotPermission.MANAGE_EDITORIAL_LINE,
+    )
+    assert store.is_allowed(
+        telegram_user_id=700000021,
+        chat_id=700000021,
+        permission=BotPermission.VIEW_EDITORIAL_LINE,
+    )
+    assert store.is_allowed(
+        telegram_user_id=700000021,
+        chat_id=700000021,
+        permission=BotPermission.RESEARCH,
+    )
+    assert store.is_allowed(
+        telegram_user_id=700000020,
+        chat_id=700000020,
+        permission=BotPermission.GENERATE,
+    )
+    assert store.is_allowed(
+        telegram_user_id=700000021,
+        chat_id=700000021,
+        permission=BotPermission.GENERATE,
+    )
+    assert not store.is_allowed(
+        telegram_user_id=700000021,
+        chat_id=700000021,
+        permission=BotPermission.MANAGE_EDITORIAL_LINE,
+    )
+    assert not store.is_allowed(
+        telegram_user_id=700000022,
+        chat_id=700000022,
+        permission=BotPermission.RESEARCH,
+    )
+    assert not store.is_allowed(
+        telegram_user_id=700000022,
+        chat_id=700000022,
+        permission=BotPermission.GENERATE,
+    )
 
 
 def test_last_owner_is_protected(store) -> None:
@@ -2687,6 +3186,229 @@ def test_automation_claim_is_idempotent_enforces_daily_limit_and_redacts_errors(
     assert all("super-secret-token" not in json_text(event.detail) for event in events)
 
 
+def test_failed_automation_run_retry_is_explicit_idempotent_and_audited(store) -> None:
+    owner, editor, _reviewer, _publisher, auditor = bootstrap_team(store)
+    scheduler = add_member(store, owner.id, Role.SCHEDULER, 1)
+    slot = automation_slot()
+    store.update_automation_settings(
+        actor_id=owner.id,
+        expected_version=1,
+        enabled=True,
+        slots=[slot],
+        now=NOW,
+    )
+    key = "colmat:auto:v1:2026-08-29:manana"
+    run = store.claim_automation_run(
+        actor_id=scheduler.id,
+        idempotency_key=key,
+        slot_id="manana",
+        scheduled_for=NOW,
+        slot_snapshot=slot,
+        now=NOW,
+    )
+    store.finish_automation_run(
+        run.id,
+        AutomationRunStatus.FAILED,
+        actor_id=scheduler.id,
+        error="MiniMax no produjo un borrador",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(AuthorizationError):
+        store.request_automation_run_retry(
+            run.id,
+            actor_id=editor.id,
+            now=NOW + timedelta(seconds=2),
+        )
+    queued = store.request_automation_run_retry(
+        run.id,
+        actor_id=scheduler.id,
+        now=NOW + timedelta(seconds=3),
+    )
+    repeated = store.request_automation_run_retry(
+        run.id,
+        actor_id=owner.id,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert repeated.id == queued.id == run.id
+    assert queued.status_value is AutomationRunStatus.FAILED
+    assert queued.attempt_count == 1
+    assert queued.retry_requested_by == scheduler.id
+    assert queued.retry_requested_at == NOW + timedelta(seconds=3)
+    pending = store.list_pending_automation_retries(actor_id=scheduler.id)
+    assert [item.id for item in pending] == [run.id]
+
+    reclaimed = store.claim_automation_run(
+        actor_id=scheduler.id,
+        idempotency_key=key,
+        slot_id="manana",
+        scheduled_for=NOW,
+        slot_snapshot=slot,
+        expected_retry_run_id=run.id,
+        now=NOW + timedelta(seconds=5),
+    )
+    duplicate = store.claim_automation_run(
+        actor_id=scheduler.id,
+        idempotency_key=key,
+        slot_id="manana",
+        scheduled_for=NOW,
+        slot_snapshot=slot,
+        now=NOW + timedelta(seconds=6),
+    )
+
+    assert duplicate.id == reclaimed.id == run.id
+    assert reclaimed.status_value is AutomationRunStatus.CLAIMED
+    assert reclaimed.attempt_count == 2
+    assert reclaimed.claimed_at == NOW + timedelta(seconds=5)
+    assert reclaimed.error is None
+    assert reclaimed.finished_at is None
+    assert reclaimed.finished_by is None
+    assert reclaimed.retry_requested_at is None
+    assert reclaimed.retry_requested_by is None
+    assert store.list_pending_automation_retries(actor_id=scheduler.id) == []
+    events = store.list_audit_events(actor_id=auditor.id)
+    assert sum(event.action == "automation.run_retry_requested" for event in events) == 1
+    assert sum(event.action == "automation.run_retry_claimed" for event in events) == 1
+
+
+def test_expected_retry_run_id_cannot_create_or_select_another_run(store) -> None:
+    owner, _membership = store.bootstrap_owner(
+        email="owner@colmat.test",
+        display_name="Owner",
+        now=NOW,
+    )
+    slot = automation_slot()
+    store.update_automation_settings(
+        actor_id=owner.id,
+        expected_version=1,
+        enabled=True,
+        slots=[slot],
+        now=NOW,
+    )
+    key = "colmat:auto:v1:2026-08-29:manana"
+    with pytest.raises(ConflictError, match="retry esperado ya no existe"):
+        store.claim_automation_run(
+            actor_id=owner.id,
+            idempotency_key=key,
+            slot_id="manana",
+            scheduled_for=NOW,
+            slot_snapshot=slot,
+            expected_retry_run_id="missing-run",
+            now=NOW,
+        )
+    assert store.list_automation_runs(actor_id=owner.id) == []
+
+    run = store.claim_automation_run(
+        actor_id=owner.id,
+        idempotency_key=key,
+        slot_id="manana",
+        scheduled_for=NOW,
+        slot_snapshot=slot,
+        now=NOW,
+    )
+    with pytest.raises(ConflictError, match="no coincide con el run"):
+        store.claim_automation_run(
+            actor_id=owner.id,
+            idempotency_key=key,
+            slot_id="manana",
+            scheduled_for=NOW,
+            slot_snapshot=slot,
+            expected_retry_run_id="another-run",
+            now=NOW + timedelta(seconds=1),
+        )
+    assert store.list_automation_runs(actor_id=owner.id)[0].id == run.id
+
+
+def test_failed_automation_run_with_draft_cannot_be_regenerated(store) -> None:
+    owner, editor, _reviewer, _publisher, _auditor = bootstrap_team(store)
+    slot = automation_slot()
+    store.update_automation_settings(
+        actor_id=owner.id,
+        expected_version=1,
+        enabled=True,
+        slots=[slot],
+        now=NOW,
+    )
+    draft, _revision = store.create_draft(
+        actor_id=editor.id,
+        text="Snapshot ya persistido que no debe volver a generarse.",
+        category="educacion",
+        publish_at=NOW,
+        evidence={"source": "manual"},
+        now=NOW,
+    )
+    run = store.claim_automation_run(
+        actor_id=owner.id,
+        idempotency_key="colmat:auto:v1:2026-08-29:manana",
+        slot_id="manana",
+        scheduled_for=NOW,
+        slot_snapshot=slot,
+        draft_id=draft.id,
+        now=NOW,
+    )
+    store.finish_automation_run(
+        run.id,
+        AutomationRunStatus.FAILED,
+        actor_id=owner.id,
+        draft_id=draft.id,
+        error="Fallo posterior al snapshot",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ConflictError, match="ya tiene un draft"):
+        store.request_automation_run_retry(
+            run.id,
+            actor_id=owner.id,
+            now=NOW + timedelta(seconds=2),
+        )
+
+
+def test_failed_automation_run_retry_rejects_changed_slot(store) -> None:
+    owner, _membership = store.bootstrap_owner(
+        email="owner@colmat.test",
+        display_name="Owner",
+        now=NOW,
+    )
+    slot = automation_slot()
+    settings = store.update_automation_settings(
+        actor_id=owner.id,
+        expected_version=1,
+        enabled=True,
+        slots=[slot],
+        now=NOW,
+    )
+    run = store.claim_automation_run(
+        actor_id=owner.id,
+        idempotency_key="colmat:auto:v1:2026-08-29:manana",
+        slot_id="manana",
+        scheduled_for=NOW,
+        slot_snapshot=slot,
+        now=NOW,
+    )
+    store.finish_automation_run(
+        run.id,
+        AutomationRunStatus.FAILED,
+        actor_id=owner.id,
+        error="Fallo confirmado",
+        now=NOW + timedelta(seconds=1),
+    )
+    changed = {**slot, "brief": "Brief nuevo que exige otro snapshot de agenda autorizado."}
+    store.update_automation_settings(
+        actor_id=owner.id,
+        expected_version=settings.version,
+        slots=[changed],
+        now=NOW + timedelta(seconds=2),
+    )
+
+    with pytest.raises(ConflictError, match="slot actual ya no coincide"):
+        store.request_automation_run_retry(
+            run.id,
+            actor_id=owner.id,
+            now=NOW + timedelta(seconds=3),
+        )
+
+
 def test_automation_run_workflow_attaches_same_workspace_draft(store) -> None:
     owner, editor, reviewer, publisher, auditor = bootstrap_team(store)
     store.update_automation_settings(
@@ -3455,7 +4177,12 @@ def test_postgres_ddl_is_repeatable_and_migrates_existing_user_and_role_schema()
     assert "ALTER TABLE memberships DROP CONSTRAINT IF EXISTS ck_memberships_role" in ddl
     assert "'scheduler'" in ddl
     assert "CREATE TABLE IF NOT EXISTS automation_settings" in ddl
+    assert "CREATE TABLE IF NOT EXISTS editorial_lines" in ddl
     assert "CREATE TABLE IF NOT EXISTS automation_runs" in ddl
+    assert "ADD COLUMN IF NOT EXISTS retry_requested_by" in ddl
+    assert "ADD COLUMN IF NOT EXISTS retry_requested_at" in ddl
+    assert "ck_automation_runs_attempt_count" in ddl
+    assert "ck_automation_runs_retry_request" in ddl
     assert "CREATE TABLE IF NOT EXISTS publication_requests" in ddl
     for column in (
         "claim_token_hash",

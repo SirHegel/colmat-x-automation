@@ -1,0 +1,583 @@
+version: 1
+
+metadata:
+  nombre: "Registro bibliográfico de Gustavo Bueno Martínez"
+  idioma: es
+  actualizado: "2026-08-30"
+  criterio:
+    unidad_de_registro: >-
+      Título autónomo que la bibliografía cronológica de la Fundación Gustavo Bueno
+      presenta en cursiva y acompaña de datos editoriales, o que identifica
+      expresamente como tesis, manuscrito, informe, manual o recopilación.
+    series: >-
+      Teoría del cierre categorial cuenta como una sola serie, con sus cinco
+      volúmenes publicados descritos de forma anidada.
+    reediciones: >-
+      Las reediciones, incluso cuando están corregidas o aumentadas, no generan
+      un título nuevo; se consignan en edicion o notas.
+    obras_completas: >-
+      Los tomos de Obras Completas se registran en una sección separada y no se
+      suman al catálogo de títulos para evitar duplicados.
+    articulos_y_otros: >-
+      Se excluyen artículos, capítulos, prólogos, entrevistas, separatas y
+      materiales audiovisuales. La bibliografía cronológica canónica conserva
+      el inventario de esas publicaciones.
+    atribucion_disputada: >-
+      Curso elemental de filosofía se conserva como antecedente bibliográfico,
+      separado de la autoría documentada, porque Gustavo Bueno negó haber
+      participado en su preparación.
+    alcance: >-
+      Registro operativo y reproducible bajo este criterio; no afirma que toda
+      pieza impresa o separata de Gustavo Bueno sea un libro.
+  fuentes_canonicas:
+    - id: fgb_bibliografia_cronologica
+      nombre: "Fundación Gustavo Bueno: Bibliografía cronológica de Gustavo Bueno"
+      url: https://www.fgbueno.es/gbm/gb0bibl.htm
+      uso: "Fuente maestra de títulos, años, editoriales y notas de edición."
+    - id: fgb_obras_completas
+      nombre: "Fundación Gustavo Bueno: Obras Completas de Gustavo Bueno"
+      url: https://www.fgbueno.es/edi/ocgb.htm
+      uso: "Fuente maestra de la edición autorizada de Obras Completas."
+    - id: bne_gustavo_bueno
+      nombre: "Biblioteca Nacional de España: Bueno, Gustavo (1924-2016)"
+      url: https://datos.bne.es/resource/XX875474
+      uso: "Fuente institucional de contraste para obras y ediciones catalogadas."
+  conteos:
+    titulos_o_series_total: 45
+    autoria_o_participacion_documentada: 44
+    atribuciones_disputadas: 1
+    volumenes_teoria_del_cierre_categorial: 5
+    tomos_obras_completas_separados: 9
+    por_tipo:
+      libro: 29
+      opusculo: 5
+      serie: 1
+      manual: 6
+      tesis: 1
+      manuscrito: 1
+      informe: 1
+      recopilacion: 1
+    por_estatuto:
+      autoria_confirmada: 36
+      coautoria_confirmada: 4
+      autoria_confirmada_publicacion_postuma: 2
+      autoria_parcial_documentada: 1
+      autoria_confirmada_recopilacion: 1
+      disputed_attribution: 1
+
+titulos_documentados:
+  - id: fundamento-material-formal-religion
+    anio: 1948
+    tipo: tesis
+    titulo: "Fundamento material y formal de la moderna filosofía de la religión"
+    editorial: "Universidad de Madrid; Pentalfa en Obras Completas 6"
+    edicion: "Tesis doctoral; primera publicación póstuma en 2022"
+    url: https://www.fgbueno.es/edi/ocgb06.htm
+    estatuto: autoria_confirmada_publicacion_postuma
+
+  - id: procesos-picnologicos
+    anio: 1952
+    tipo: manuscrito
+    titulo: "Los procesos picnológicos"
+    editorial: "Pentalfa en Obras Completas 6"
+    edicion: "Manuscrito fechado en Salamanca en 1953; primera publicación póstuma en 2022"
+    url: https://www.fgbueno.es/edi/ocgb06.htm
+    estatuto: autoria_confirmada_publicacion_postuma
+
+  - id: principales-sistemas-filosoficos
+    anio: 1954
+    tipo: manual
+    titulo: "Principales sistemas filosóficos y Soluciones del pensamiento cristiano. Sexto curso"
+    editorial: "Anaya, Salamanca"
+    edicion: "Primera edición; con Leoncio Martínez"
+    url: https://www.fgbueno.es/gbm/gb54p6.htm
+    estatuto: coautoria_confirmada
+
+  - id: nociones-filosofia
+    anio: 1955
+    tipo: manual
+    titulo: "Nociones de Filosofía. Quinto curso"
+    editorial: "Anaya, Salamanca"
+    edicion: "Primera edición; con Leoncio Martínez"
+    url: https://www.fgbueno.es/gbm/gb55nf.htm
+    estatuto: coautoria_confirmada
+
+  - id: filosofia-psicologia-logica-etica
+    anio: 1955
+    tipo: manual
+    titulo: "Filosofía (Psicología, Lógica y Ética). Primer curso de Magisterio"
+    editorial: "Anaya, Salamanca"
+    edicion: "Primera edición; con Leoncio Martínez y Carmen S. Revilla"
+    url: https://www.fgbueno.es/gbm/gb55fm.htm
+    estatuto: coautoria_confirmada
+
+  - id: filosofia-sexto-curso
+    anio: 1958
+    tipo: manual
+    titulo: "Filosofía. Sexto Curso. Con un esquema de historia de la filosofía y un Vocabulario de los términos empleados"
+    editorial: "Anaya, Salamanca"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb58f6.htm
+    estatuto: autoria_confirmada
+
+  - id: papel-filosofia-conjunto-saber
+    anio: 1970
+    tipo: libro
+    titulo: "El papel de la filosofía en el conjunto del saber"
+    editorial: "Ciencia Nueva, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb70pf.htm
+    estatuto: autoria_confirmada
+
+  - id: etnologia-utopia
+    anio: 1971
+    tipo: libro
+    titulo: "Etnología y Utopía. Respuesta a la pregunta: ¿Qué es la Etnología?"
+    editorial: "Azanca, Valencia"
+    edicion: "Primera edición; edición ampliada por Júcar en 1987"
+    url: https://www.fgbueno.es/gbm/gb71eu.htm
+    estatuto: autoria_confirmada
+
+  - id: ensayos-materialistas
+    anio: 1972
+    tipo: libro
+    titulo: "Ensayos materialistas"
+    editorial: "Taurus, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb1972em.htm
+    estatuto: autoria_confirmada
+
+  - id: ensayo-categorias-economia-politica
+    anio: 1972
+    tipo: libro
+    titulo: "Ensayo sobre las categorías de la Economía Política"
+    editorial: "La Gaya Ciencia, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb72cep.htm
+    estatuto: autoria_confirmada
+
+  - id: metafisica-presocratica
+    anio: 1974
+    tipo: libro
+    titulo: "La metafísica presocrática"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición; reeditada como Obras Completas 9 en 2025"
+    url: https://www.fgbueno.es/gbm/gb74mp.htm
+    estatuto: autoria_confirmada
+
+  - id: estatuto-gnoseologico-ciencias-humanas
+    anio: 1976
+    tipo: informe
+    titulo: "Estatuto gnoseológico de las ciencias humanas"
+    editorial: "Fundación Juan March"
+    edicion: "Informe inédito de seis tomos; Gustavo Bueno es autor de los tomos 1 a 4"
+    url: https://www.fgbueno.es/gbm/egch.htm
+    estatuto: autoria_parcial_documentada
+
+  - id: idea-ciencia-cierre-categorial
+    anio: 1976
+    tipo: opusculo
+    titulo: "Idea de ciencia desde la teoría del cierre categorial"
+    editorial: "Universidad Internacional Menéndez Pelayo, Santander"
+    edicion: "Primera edición"
+    url: https://filosofia.org/bol/bib/nb043.htm
+    estatuto: autoria_confirmada
+
+  - id: individuo-historia
+    anio: 1980
+    tipo: opusculo
+    titulo: "El individuo en la Historia. Comentario a un texto de Aristóteles, Poética 1451b"
+    editorial: "Universidad de Oviedo"
+    edicion: "Lección inaugural del curso 1980-1981"
+    url: https://www.fgbueno.es/gbm/gb80indi.htm
+    estatuto: autoria_confirmada
+
+  - id: animal-divino
+    anio: 1985
+    tipo: libro
+    titulo: "El animal divino. Ensayo de una filosofía materialista de la religión"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición; segunda edición corregida y aumentada en 1996"
+    url: https://www.fgbueno.es/gbm/gb1985ad.htm
+    estatuto: autoria_confirmada
+
+  - id: symploke-filosofia
+    anio: 1987
+    tipo: manual
+    titulo: "Symploké. Filosofía (3.º de BUP)"
+    editorial: "Júcar, Madrid"
+    edicion: "Primera edición; con Alberto Hidalgo y Carlos Iglesias"
+    url: https://www.fgbueno.es/gbm/gb0bibl.htm#1987
+    estatuto: coautoria_confirmada
+
+  - id: cuestiones-cuodlibetales
+    anio: 1989
+    tipo: libro
+    titulo: "Cuestiones cuodlibetales sobre Dios y la Religión"
+    editorial: "Mondadori, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb89cc.htm
+    estatuto: autoria_confirmada
+
+  - id: materia
+    anio: 1990
+    tipo: libro
+    titulo: "Materia"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición en español"
+    url: https://filosofia.org/mat/mm1990a.htm
+    estatuto: autoria_confirmada
+
+  - id: nosotros-y-ellos
+    anio: 1990
+    tipo: libro
+    titulo: "Nosotros y ellos. Ensayo de reconstrucción de la distinción emic/etic de Pike"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición"
+    url: https://helicon.es/pen/7848424.htm
+    estatuto: autoria_confirmada
+
+  - id: sobre-asturias
+    anio: 1991
+    tipo: recopilacion
+    titulo: "Sobre Asturias"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Recopilación de quince textos publicados entre 1967 y 1990"
+    url: https://www.helicon.es/pen/7848433.htm
+    estatuto: autoria_confirmada_recopilacion
+
+  - id: primer-ensayo-ciencias-politicas
+    anio: 1991
+    tipo: libro
+    titulo: "Primer ensayo sobre las categorías de las «Ciencias Políticas»"
+    editorial: "Cultural Rioja, Logroño"
+    edicion: "Primera edición; presentación y apéndices de Pedro Santana"
+    url: https://www.fgbueno.es/gbm/gb91ccp.htm
+    estatuto: autoria_confirmada
+
+  - id: teoria-cierre-categorial
+    anio: 1992
+    tipo: serie
+    titulo: "Teoría del cierre categorial"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Cinco volúmenes publicados entre 1992 y 1993"
+    url: https://helicon.es/pen/7848447.htm
+    estatuto: autoria_confirmada
+    volumenes:
+      - numero: 1
+        anio: 1992
+        titulo: "Introducción general. Siete enfoques en el estudio de la ciencia"
+        editorial: "Pentalfa, Oviedo"
+        url: https://helicon.es/pen/7848446.htm
+      - numero: 2
+        anio: 1993
+        titulo: "La Gnoseología como filosofía de la ciencia. Historia de la teoría de la ciencia"
+        editorial: "Pentalfa, Oviedo"
+        url: https://helicon.es/pen/7848457.htm
+      - numero: 3
+        anio: 1993
+        titulo: "El sistema de las doctrinas gnoseológicas. Las cuatro familias básicas"
+        editorial: "Pentalfa, Oviedo"
+        url: https://helicon.es/pen/7848458.htm
+      - numero: 4
+        anio: 1993
+        titulo: "El sistema de las doctrinas gnoseológicas: descripcionismo, teoreticismo"
+        editorial: "Pentalfa, Oviedo"
+        url: https://helicon.es/pen/7848467.htm
+      - numero: 5
+        anio: 1993
+        titulo: "El sistema de las doctrinas gnoseológicas: adecuacionismo, circularismo, Glosario"
+        editorial: "Pentalfa, Oviedo"
+        url: https://helicon.es/pen/7848468.htm
+
+  - id: reino-cultura-gracia
+    anio: 1993
+    tipo: opusculo
+    titulo: "El reino de la Cultura y el reino de la Gracia"
+    editorial: "Excmo. Cabildo Insular de Gran Canaria"
+    edicion: "Edición de una conferencia pronunciada el 20 de mayo de 1993"
+    url: https://www.fgbueno.es/gbm/gb0bibl.htm#1993
+    estatuto: autoria_confirmada
+
+  - id: funcion-actual-ciencia
+    anio: 1995
+    tipo: opusculo
+    titulo: "La función actual de la ciencia"
+    editorial: "Universidad de Las Palmas de Gran Canaria"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb1995fu.htm
+    estatuto: autoria_confirmada
+
+  - id: que-es-filosofia
+    anio: 1995
+    tipo: libro
+    titulo: "¿Qué es la filosofía? El lugar de la filosofía en la educación. El papel de la filosofía en el conjunto del saber constituido por el saber político, el saber científico y el saber religioso de nuestra época"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera y segunda edición aumentada en 1995"
+    url: https://www.fgbueno.es/gbm/gb1995qf.htm
+    estatuto: autoria_confirmada
+
+  - id: que-es-ciencia
+    anio: 1995
+    tipo: libro
+    titulo: "¿Qué es la ciencia? La respuesta de la teoría del cierre categorial. Ciencia y Filosofía"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb1995qc.htm
+    estatuto: autoria_confirmada
+
+  - id: sentido-vida
+    anio: 1996
+    tipo: libro
+    titulo: "El sentido de la vida. Seis lecturas de filosofía moral"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb96sv.htm
+    estatuto: autoria_confirmada
+
+  - id: mito-cultura
+    anio: 1996
+    tipo: libro
+    titulo: "El mito de la cultura. Ensayo de una filosofía materialista de la cultura"
+    editorial: "Editorial Prensa Ibérica, Barcelona"
+    edicion: "Primera edición; décima edición ampliada por Pentalfa en 2016"
+    url: https://www.fgbueno.es/gbm/gb1996mc.htm
+    estatuto: autoria_confirmada
+
+  - id: espana-frente-europa
+    anio: 1999
+    tipo: libro
+    titulo: "España frente a Europa"
+    editorial: "Alba Editorial, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb1999es.htm
+    estatuto: autoria_confirmada
+
+  - id: television-apariencia-verdad
+    anio: 2000
+    tipo: libro
+    titulo: "Televisión: Apariencia y Verdad"
+    editorial: "Gedisa, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2000tv.htm
+    estatuto: autoria_confirmada
+
+  - id: que-es-bioetica
+    anio: 2001
+    tipo: libro
+    titulo: "¿Qué es la Bioética?"
+    editorial: "Fundación Gustavo Bueno y Pentalfa, Oviedo"
+    edicion: "Primera edición"
+    url: https://fgbueno.es/edi/bfe004.htm
+    estatuto: autoria_confirmada
+
+  - id: telebasura-democracia
+    anio: 2002
+    tipo: libro
+    titulo: "Telebasura y democracia"
+    editorial: "Ediciones B, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2002tb.htm
+    estatuto: autoria_confirmada
+
+  - id: mito-izquierda
+    anio: 2003
+    tipo: libro
+    titulo: "El mito de la Izquierda. Las izquierdas y la derecha"
+    editorial: "Ediciones B, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2003mi.htm
+    estatuto: autoria_confirmada
+
+  - id: panfleto-democracia
+    anio: 2004
+    tipo: libro
+    titulo: "Panfleto contra la democracia realmente existente"
+    editorial: "La Esfera de los Libros, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2004pd.htm
+    estatuto: autoria_confirmada
+
+  - id: vuelta-caverna
+    anio: 2004
+    tipo: libro
+    titulo: "La vuelta a la caverna. Terrorismo, Guerra y Globalización"
+    editorial: "Ediciones B, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2004vc.htm
+    estatuto: autoria_confirmada
+
+  - id: mito-felicidad
+    anio: 2005
+    tipo: libro
+    titulo: "El mito de la felicidad. Autoayuda para desengaño de quienes buscan ser felices"
+    editorial: "Ediciones B, Barcelona"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2005mf.htm
+    estatuto: autoria_confirmada
+
+  - id: espana-no-mito
+    anio: 2005
+    tipo: libro
+    titulo: "España no es un mito. Claves para una defensa razonada"
+    editorial: "Temas de Hoy, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2005es.htm
+    estatuto: autoria_confirmada
+
+  - id: zapatero-pensamiento-alicia
+    anio: 2006
+    tipo: libro
+    titulo: "Zapatero y el Pensamiento Alicia. Un presidente en el País de las Maravillas"
+    editorial: "Temas de Hoy, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2006pa.htm
+    estatuto: autoria_confirmada
+
+  - id: fe-ateo
+    anio: 2007
+    tipo: libro
+    titulo: "La fe del ateo"
+    editorial: "Temas de Hoy, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2007fa.htm
+    estatuto: autoria_confirmada
+
+  - id: mito-derecha
+    anio: 2008
+    tipo: libro
+    titulo: "El mito de la Derecha"
+    editorial: "Temas de Hoy, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2008md.htm
+    estatuto: autoria_confirmada
+
+  - id: fundamentalismo-democratico
+    anio: 2010
+    tipo: libro
+    titulo: "El fundamentalismo democrático. La democracia española a examen"
+    editorial: "Temas de Hoy, Madrid"
+    edicion: "Primera edición"
+    url: https://www.fgbueno.es/gbm/gb2010fd.htm
+    estatuto: autoria_confirmada
+
+  - id: santo-domingo-camino-santiago
+    anio: 2012
+    tipo: opusculo
+    titulo: "Santo Domingo de la Calzada y el Camino de Santiago"
+    editorial: "Fundación Gustavo Bueno, Santo Domingo de la Calzada"
+    edicion: "Pregón de las Fiestas del Santo"
+    url: https://www.fgbueno.es/gbm/gb2012sd.htm
+    estatuto: autoria_confirmada
+
+  - id: ensayo-definicion-deporte
+    anio: 2014
+    tipo: libro
+    titulo: "Ensayo de una definición filosófica de la Idea de Deporte"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición"
+    url: https://helicon.es/pen/7848568.htm
+    estatuto: autoria_confirmada
+
+  - id: ego-trascendental
+    anio: 2016
+    tipo: libro
+    titulo: "El Ego trascendental"
+    editorial: "Pentalfa, Oviedo"
+    edicion: "Primera edición"
+    url: https://helicon.es/pen/7848561.htm
+    estatuto: autoria_confirmada
+
+atribuciones_disputadas:
+  - id: curso-elemental-filosofia
+    anio: 1962
+    tipo: manual
+    titulo: "Curso elemental de filosofía (sexto de bachillerato)"
+    editorial: "Anaya, Salamanca"
+    edicion: "Edición atribuida en portada a Rafael Gambra y Gustavo Bueno"
+    url: https://www.fgbueno.es/gbm/gb0bibl.htm#1962
+    estatuto: disputed_attribution
+    fuente_estatuto: https://nodulo.org/ec/2010/n099p02.htm
+    nota: >-
+      Gustavo Bueno declaró que no tuvo arte ni parte en la preparación del libro
+      y que la editorial utilizó su nombre y materiales de su manual de 1958.
+
+obras_completas:
+  metadata:
+    editorial: "Pentalfa, Oviedo"
+    fuente: https://www.fgbueno.es/edi/ocgb.htm
+    cuenta_en_titulos_o_series_total: false
+    total_tomos_publicados: 9
+  tomos:
+    - id: obras-completas-01
+      anio: 2019
+      tipo: obras_completas
+      titulo: "España frente a Europa"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 1"
+      url: https://www.fgbueno.es/edi/ocgb01.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-02
+      anio: 2021
+      tipo: obras_completas
+      titulo: "Panfleto contra la democracia realmente existente"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 2"
+      url: https://www.fgbueno.es/edi/ocgb02.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-03
+      anio: 2021
+      tipo: obras_completas
+      titulo: "El mito de la Izquierda, El mito de la Derecha"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 3"
+      url: https://www.fgbueno.es/edi/ocgb03.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-04
+      anio: 2021
+      tipo: obras_completas
+      titulo: "España no es un mito y otros textos sobre España"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 4"
+      url: https://www.fgbueno.es/edi/ocgb04.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-05
+      anio: 2022
+      tipo: obras_completas
+      titulo: "El fundamentalismo democrático. Democracia y corrupción"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 5"
+      url: https://www.fgbueno.es/edi/ocgb05.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-06
+      anio: 2022
+      tipo: obras_completas
+      titulo: "Escritos de juventud"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 6"
+      url: https://www.fgbueno.es/edi/ocgb06.htm
+      estatuto: recopilacion_postuma_autorizada
+    - id: obras-completas-07
+      anio: 2023
+      tipo: obras_completas
+      titulo: "El animal divino"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 7"
+      url: https://www.fgbueno.es/edi/ocgb07.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-08
+      anio: 2024
+      tipo: obras_completas
+      titulo: "El mito de la cultura"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 8"
+      url: https://www.fgbueno.es/edi/ocgb08.htm
+      estatuto: reedicion_autorizada
+    - id: obras-completas-09
+      anio: 2025
+      tipo: obras_completas
+      titulo: "La metafísica presocrática"
+      editorial: "Pentalfa, Oviedo"
+      edicion: "Obras Completas, tomo 9"
+      url: https://www.fgbueno.es/edi/ocgb09.htm
+      estatuto: reedicion_autorizada

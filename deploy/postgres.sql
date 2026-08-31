@@ -251,6 +251,43 @@ ORDER BY
     id
 ON CONFLICT (workspace_id) DO NOTHING;
 
+CREATE TABLE IF NOT EXISTS editorial_lines (
+    id VARCHAR(36) PRIMARY KEY,
+    workspace_id VARCHAR(80) NOT NULL,
+    month VARCHAR(7) NOT NULL,
+    line_text TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT uq_editorial_line_workspace_month UNIQUE (workspace_id, month),
+    CONSTRAINT ck_editorial_lines_month_length CHECK (length(month) = 7),
+    CONSTRAINT ck_editorial_lines_month_format CHECK (
+        month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'
+    ),
+    CONSTRAINT ck_editorial_lines_text_length CHECK (length(line_text) BETWEEN 1 AND 600),
+    CONSTRAINT ck_editorial_lines_version CHECK (version >= 1)
+);
+
+CREATE INDEX IF NOT EXISTS ix_editorial_lines_workspace_month
+    ON editorial_lines(workspace_id, month);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'ck_editorial_lines_month_format'
+          AND conrelid = 'editorial_lines'::regclass
+    ) THEN
+        ALTER TABLE editorial_lines
+            ADD CONSTRAINT ck_editorial_lines_month_format
+            CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$') NOT VALID;
+        ALTER TABLE editorial_lines VALIDATE CONSTRAINT ck_editorial_lines_month_format;
+    END IF;
+END
+$$;
+
 CREATE TABLE IF NOT EXISTS drafts (
     id VARCHAR(36) PRIMARY KEY,
     workspace_id VARCHAR(80) NOT NULL,
@@ -345,17 +382,21 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     mode VARCHAR(20) NOT NULL,
     settings_version INTEGER NOT NULL,
     slot_hash VARCHAR(64) NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 1,
     status VARCHAR(20) NOT NULL DEFAULT 'claimed',
     draft_id VARCHAR(36) REFERENCES drafts(id) ON DELETE SET NULL,
     error TEXT,
     claimed_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     finished_by VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT,
+    retry_requested_by VARCHAR(36),
     claimed_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     finished_at TIMESTAMPTZ,
+    retry_requested_at TIMESTAMPTZ,
     CONSTRAINT uq_automation_run_workspace_key UNIQUE (workspace_id, idempotency_key),
     CONSTRAINT ck_automation_runs_mode CHECK (mode IN ('human_review', 'direct')),
     CONSTRAINT ck_automation_runs_settings_version CHECK (settings_version >= 1),
+    CONSTRAINT ck_automation_runs_attempt_count CHECK (attempt_count >= 1),
     CONSTRAINT ck_automation_runs_slot_hash CHECK (slot_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT ck_automation_runs_status CHECK (
         status IN (
@@ -369,6 +410,13 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     CONSTRAINT ck_automation_runs_finished CHECK (
         (status IN ('succeeded', 'failed', 'unknown') AND finished_at IS NOT NULL)
         OR (status NOT IN ('succeeded', 'failed', 'unknown'))
+    ),
+    CONSTRAINT ck_automation_runs_retry_request CHECK (
+        (retry_requested_at IS NULL AND retry_requested_by IS NULL)
+        OR (
+            retry_requested_at IS NOT NULL AND retry_requested_by IS NOT NULL
+            AND status = 'failed'
+        )
     )
 );
 
@@ -376,6 +424,12 @@ ALTER TABLE automation_runs
     ADD COLUMN IF NOT EXISTS settings_version INTEGER;
 ALTER TABLE automation_runs
     ADD COLUMN IF NOT EXISTS slot_hash VARCHAR(64);
+ALTER TABLE automation_runs
+    ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE automation_runs
+    ADD COLUMN IF NOT EXISTS retry_requested_by VARCHAR(36);
+ALTER TABLE automation_runs
+    ADD COLUMN IF NOT EXISTS retry_requested_at TIMESTAMPTZ;
 UPDATE automation_runs AS run
 SET settings_version = COALESCE(
     run.settings_version,
@@ -421,6 +475,46 @@ BEGIN
         ALTER TABLE automation_runs
             ADD CONSTRAINT ck_automation_runs_slot_hash
             CHECK (slot_hash ~ '^[0-9a-f]{64}$');
+    END IF;
+END
+$$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_automation_runs_retry_requested_by'
+          AND conrelid = 'automation_runs'::regclass
+    ) THEN
+        ALTER TABLE automation_runs
+            ADD CONSTRAINT fk_automation_runs_retry_requested_by
+            FOREIGN KEY (retry_requested_by) REFERENCES users(id) ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'ck_automation_runs_attempt_count'
+          AND conrelid = 'automation_runs'::regclass
+    ) THEN
+        ALTER TABLE automation_runs
+            ADD CONSTRAINT ck_automation_runs_attempt_count
+            CHECK (attempt_count >= 1);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'ck_automation_runs_retry_request'
+          AND conrelid = 'automation_runs'::regclass
+    ) THEN
+        ALTER TABLE automation_runs
+            ADD CONSTRAINT ck_automation_runs_retry_request
+            CHECK (
+                (retry_requested_at IS NULL AND retry_requested_by IS NULL)
+                OR (
+                    retry_requested_at IS NOT NULL AND retry_requested_by IS NOT NULL
+                    AND status = 'failed'
+                )
+            );
     END IF;
 END
 $$;

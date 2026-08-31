@@ -10,6 +10,7 @@ from sqlalchemy import inspect
 
 from colmat_x.platform_store import Base, ConflictError, PlatformStore
 from colmat_x.rbac import Role
+from colmat_x.research_registry import RESEARCH_ONLY_BRIEF_PREFIX, ResearchRegistryError
 from colmat_x.telegram_bot import (
     BotAutomationMode,
     SendMessage,
@@ -475,6 +476,11 @@ class FakeAutomationTelegramStore(FakeEditorialStore):
         self.generation_requests: list[dict[str, object]] = []
         self.generation_error = False
         self.publication_requests: list[dict[str, object]] = []
+        self.editorial_line = SimpleNamespace(
+            month="2026-08",
+            line_text="Analizar Colombia desde el materialismo filosófico.",
+            version=3,
+        )
 
     def get_automation_settings(self, *, actor_id: str):
         assert actor_id == "reviewer-1"
@@ -505,6 +511,11 @@ class FakeAutomationTelegramStore(FakeEditorialStore):
         self.generation_requests.append({"brief": brief, **kwargs})
         return SimpleNamespace(id="generation-request-1", generate_image=kwargs["generate_image"])
 
+    def get_editorial_line(self, month: str, *, actor_id: str):
+        assert actor_id == "reviewer-1"
+        assert month == "2026-08"
+        return self.editorial_line
+
     def get_current_revision(self, post_id: str, *, actor_id: str):
         assert (post_id, actor_id) == ("draft-approved", "reviewer-1")
         return SimpleNamespace(snapshot_hash="b" * 64)
@@ -526,6 +537,86 @@ def test_platform_telegram_operations_report_status_and_team() -> None:
     assert "Total: 3" in status_text
     assert "Revisión — reviewer (activo)" in team_text
     assert "Edición — editor (inactivo)" in team_text
+
+
+def test_platform_telegram_owner_can_provision_list_and_bind_real_ids() -> None:
+    with PlatformStore("sqlite+pysqlite:///:memory:") as store:
+        owner, _membership = store.bootstrap_owner(
+            email="owner-telegram@web.test",
+            display_name="Owner Telegram",
+        )
+        editor, _editor_membership = store.create_team_member(
+            actor_id=owner.id,
+            email="editor-existing@web.test",
+            display_name="Editor existente",
+            role=Role.EDITOR,
+        )
+        store.bind_telegram_chat(
+            101,
+            telegram_user_id=101,
+            actor_id=owner.id,
+            user_id=owner.id,
+        )
+        operations = PlatformTelegramOperations(store)
+
+        invited = operations.invite_telegram_user(
+            202,
+            "reviewer",
+            "reviewer-new@web.test",
+            "Reviewer nuevo",
+            request_id="telegram:301:invitar",
+            telegram_user_id=101,
+            chat_id=101,
+        )
+        bound = operations.bind_telegram_user(
+            203,
+            editor.id,
+            request_id="telegram:302:vincular",
+            telegram_user_id=101,
+            chat_id=101,
+        )
+        users = operations.list_telegram_users(telegram_user_id=101, chat_id=101)
+
+        assert invited.accepted is True
+        assert bound.accepted is True
+        assert store.resolve_telegram_actor(telegram_user_id=202, chat_id=202).display_name == (
+            "Reviewer nuevo"
+        )
+        assert store.resolve_telegram_actor(telegram_user_id=203, chat_id=203).id == editor.id
+        assert "Telegram=202 (activo, privado)" in users
+        assert "Telegram=203 (activo, privado)" in users
+        assert "@username" in users
+
+
+def test_platform_telegram_user_listing_stays_within_telegram_limit() -> None:
+    memberships = [SimpleNamespace(user_id=f"user-{index}", role="editor") for index in range(150)]
+
+    class LargeTeamStore:
+        def resolve_telegram_actor(self, **_kwargs):
+            return SimpleNamespace(id="owner")
+
+        def list_memberships(self, *, actor_id: str):
+            assert actor_id == "owner"
+            return memberships
+
+        def list_telegram_bindings(self, *, actor_id: str):
+            assert actor_id == "owner"
+            return []
+
+        def get_user(self, user_id: str):
+            return SimpleNamespace(
+                id=user_id,
+                display_name=f"Integrante {user_id} " + "x" * 70,
+                is_active=True,
+            )
+
+    text = PlatformTelegramOperations(LargeTeamStore()).list_telegram_users(
+        telegram_user_id=101,
+        chat_id=101,
+    )
+
+    assert len(text) <= 4_096
+    assert "usuario(s) omitidos" in text
 
 
 def test_platform_telegram_operations_review_without_publishing() -> None:
@@ -732,7 +823,11 @@ def test_platform_telegram_mode_change_uses_real_cas_and_rbac(monkeypatch) -> No
 
 def test_platform_telegram_generation_only_enqueues_for_openclaw() -> None:
     store = FakeAutomationTelegramStore()
-    operations = PlatformTelegramOperations(store, generate_images=True)
+    operations = PlatformTelegramOperations(
+        store,
+        generate_images=True,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
 
     result = operations.generate_draft(
         "Una cifra verificable",
@@ -746,7 +841,10 @@ def test_platform_telegram_generation_only_enqueues_for_openclaw() -> None:
     assert "revisión humana" in result.text
     assert store.generation_requests == [
         {
-            "brief": "Una cifra verificable",
+            "brief": (
+                "Línea editorial 2026-08 v3: Analizar Colombia desde el materialismo "
+                "filosófico. Encargo: Una cifra verificable"
+            ),
             "actor_id": "reviewer-1",
             "telegram_user_id": 7,
             "chat_id": 9,
@@ -754,6 +852,132 @@ def test_platform_telegram_generation_only_enqueues_for_openclaw() -> None:
             "generate_image": True,
         }
     ]
+
+
+def test_platform_telegram_generation_cannot_skip_missing_monthly_line() -> None:
+    store = FakeAutomationTelegramStore()
+    store.editorial_line = None
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
+
+    result = operations.generate_draft(
+        "Intenta generar sin directriz",
+        request_id="telegram:14:generar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is False
+    assert "línea editorial" in result.text
+    assert store.generation_requests == []
+
+
+def test_platform_telegram_research_enqueues_explicit_pattern_without_image_or_x() -> None:
+    store = FakeAutomationTelegramStore()
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
+
+    result = operations.research_topic(
+        "Guerra de los Supremos y formación estatal",
+        request_id="telegram:15:investigar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+    patterns = operations.get_research_patterns(telegram_user_id=7, chat_id=9)
+
+    assert result.accepted is True
+    assert "OpenClaw" in result.text
+    assert "MiniMax" in result.text
+    assert "revisión humana" in result.text
+    assert len(store.generation_requests) == 1
+    request = store.generation_requests[0]
+    assert request["generate_image"] is False
+    assert request["category"] == "dato_semana"
+    assert request["institution"] == "colmat"
+    assert request["idempotency_key"] == "telegram:15:investigar"
+    brief = str(request["brief"])
+    assert len(brief) <= 1_000
+    assert brief.startswith(RESEARCH_ONLY_BRIEF_PREFIX)
+    for required in (
+        "pregunta o tesis",
+        "fuentes aportadas o del registro canónico",
+        "hechos e inferencias",
+        "posible refutación",
+        "síntesis apta",
+        "No fabricar citas",
+        "POR VERIFICAR",
+        "URLs maestras autorizadas",
+        "recuperará solo esas fuentes",
+    ):
+        assert required in brief
+    assert "verificación externa sigue siendo humana" in patterns
+    assert "nunca pasa a publicación automática" in patterns
+    assert not hasattr(store, "publish_post")
+
+
+def test_platform_telegram_research_injects_selected_catalog_entry() -> None:
+    store = FakeAutomationTelegramStore()
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
+
+    result = operations.research_topic(
+        "Ensayos materialistas y materialismo filosófico",
+        request_id="telegram:catalog:investigar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is True
+    brief = str(store.generation_requests[0]["brief"])
+    assert "Ensayos materialistas (1972)" in brief
+    assert "https://www.fgbueno.es/gbm/gb1972em.htm" in brief
+    assert "Catálogo por título, no cita" in brief
+    assert len(brief) <= 1_000
+
+
+def test_platform_telegram_research_labels_explicit_disputed_attribution() -> None:
+    store = FakeAutomationTelegramStore()
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
+
+    result = operations.research_topic(
+        "Curso elemental de filosofía 1962",
+        request_id="telegram:dispute:investigar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is True
+    brief = str(store.generation_requests[0]["brief"])
+    assert "atribución editorial disputada; Bueno negó participación" in brief
+    assert "https://nodulo.org/ec/2010/n099p02.htm" in brief
+
+
+def test_platform_telegram_research_rejects_line_and_topic_over_1000() -> None:
+    store = FakeAutomationTelegramStore()
+    store.editorial_line.line_text = "x" * 600
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
+
+    result = operations.research_topic(
+        "y" * 300,
+        request_id="telegram:16:investigar",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+
+    assert result.accepted is False
+    assert store.generation_requests == []
 
 
 def test_platform_telegram_publication_only_enqueues_durable_request() -> None:
@@ -783,7 +1007,10 @@ def test_platform_telegram_publication_only_enqueues_durable_request() -> None:
 def test_platform_telegram_generation_failure_is_generic_and_never_publishes() -> None:
     store = FakeAutomationTelegramStore()
     store.generation_error = True
-    operations = PlatformTelegramOperations(store)
+    operations = PlatformTelegramOperations(
+        store,
+        now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
+    )
 
     result = operations.generate_draft(
         "Una cifra verificable",
@@ -818,6 +1045,22 @@ def test_runtime_provider_builds_real_local_runtime_and_reuses_it() -> None:
         "database": "ok",
     }
     runtime.store.close()
+
+
+def test_runtime_provider_fails_closed_when_canonical_registry_is_missing(monkeypatch) -> None:
+    def missing_registry():
+        raise ResearchRegistryError("missing")
+
+    monkeypatch.setattr("colmat_x.web.load_gustavo_bueno_registry", missing_registry)
+    provider = RuntimeProvider(
+        environ={},
+        store=object(),
+        processor=object(),
+        telegram_client=object(),
+    )
+
+    with pytest.raises(ResearchRegistryError, match="missing"):
+        provider.get()
 
 
 def test_vercel_runtime_never_creates_schema_and_fails_readiness_when_unmigrated(

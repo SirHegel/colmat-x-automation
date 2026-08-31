@@ -27,8 +27,11 @@ from colmat_x.editorial import (
     validate_visual_description,
 )
 
+MINIMAX_ANTHROPIC_MESSAGES_ENDPOINT = "https://api.minimax.io/anthropic/v1/messages"
 MINIMAX_CHAT_COMPLETIONS_ENDPOINT = "https://api.minimax.io/v1/chat/completions"
 MINIMAX_IMAGE_GENERATION_ENDPOINT = "https://api.minimax.io/v1/image_generation"
+MINIMAX_ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_MINIMAX_API_STYLE = "anthropic"
 DEFAULT_MINIMAX_MODEL = "MiniMax-M2.7"
 DEFAULT_MINIMAX_IMAGE_MODEL = "image-01"
 MAX_IMAGE_PROMPT_CHARACTERS = 1_500
@@ -62,6 +65,7 @@ _MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _CUSTOM_SIZE_PATTERN = re.compile(r"^([0-9]{3,4})x([0-9]{3,4})$")
 _THINK_PREFIX_PATTERN = re.compile(r"^\s*(?:<think>.*?</think>\s*)+", re.DOTALL)
 _JSON_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+_ANTHROPIC_RESPONSE_BLOCK_TYPES = frozenset({"text", "thinking", "tool_use"})
 
 
 class MiniMaxError(RuntimeError):
@@ -112,6 +116,7 @@ class MiniMaxClient:
         *,
         model: str | None = None,
         image_model: str | None = None,
+        api_style: str | None = None,
         connect_timeout_seconds: float = 5.0,
         read_timeout_seconds: float = 90.0,
         image_read_timeout_seconds: float = 180.0,
@@ -124,6 +129,9 @@ class MiniMaxClient:
                 "Falta MINIMAX_API_KEY; la clave solo se admite mediante el entorno"
             )
         self._api_key = api_key
+        self.api_style = _api_style(
+            api_style if api_style is not None else os.getenv("MINIMAX_API_STYLE")
+        )
         self.model = _model_name(model or os.getenv("MINIMAX_MODEL") or DEFAULT_MINIMAX_MODEL)
         self.image_model = _model_name(
             image_model or os.getenv("MINIMAX_IMAGE_MODEL") or DEFAULT_MINIMAX_IMAGE_MODEL
@@ -168,19 +176,26 @@ class MiniMaxClient:
         draft: EditorialDraft | None = None
         draft_error: MiniMaxResponseError | EditorialValidationError | None = None
         for attempt in range(MAX_DRAFT_VALIDATION_ATTEMPTS):
+            endpoint = (
+                MINIMAX_ANTHROPIC_MESSAGES_ENDPOINT
+                if self.api_style == "anthropic"
+                else MINIMAX_CHAT_COMPLETIONS_ENDPOINT
+            )
             response = self._post_json(
-                MINIMAX_CHAT_COMPLETIONS_ENDPOINT,
+                endpoint,
                 _draft_request_body(
                     model=self.model,
                     messages=messages,
                     tool=tool,
                     max_completion_tokens=self.max_completion_tokens,
+                    api_style=self.api_style,
                 ),
                 read_timeout=self.read_timeout_seconds,
+                anthropic_auth=self.api_style == "anthropic",
             )
             arguments: Mapping[str, Any] | None = None
             try:
-                arguments = _extract_draft_arguments(response)
+                arguments = _extract_draft_arguments(response, api_style=self.api_style)
                 candidate = validate_ai_draft(arguments, policy)
                 if category is not None and candidate.categoria.value != str(category):
                     raise MiniMaxResponseError(
@@ -197,6 +212,7 @@ class MiniMaxClient:
                     response,
                     exc,
                     arguments=arguments,
+                    api_style=self.api_style,
                 )
                 continue
             draft = candidate
@@ -268,16 +284,28 @@ class MiniMaxClient:
         )
 
     def _post_json(
-        self, endpoint: str, request_body: Mapping[str, Any], *, read_timeout: float
+        self,
+        endpoint: str,
+        request_body: Mapping[str, Any],
+        *,
+        read_timeout: float,
+        anthropic_auth: bool = False,
     ) -> dict[str, Any]:
         transport_error: str | None = None
         try:
+            headers = {"Content-Type": "application/json"}
+            if anthropic_auth:
+                headers.update(
+                    {
+                        "x-api-key": self._api_key,
+                        "anthropic-version": MINIMAX_ANTHROPIC_VERSION,
+                    }
+                )
+            else:
+                headers["Authorization"] = f"Bearer {self._api_key}"
             response = self.session.post(
                 endpoint,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=request_body,
                 timeout=(self.connect_timeout_seconds, read_timeout),
             )
@@ -324,7 +352,21 @@ def _draft_request_body(
     messages: list[dict[str, Any]],
     tool: Mapping[str, Any],
     max_completion_tokens: int,
+    api_style: str,
 ) -> dict[str, Any]:
+    if api_style == "anthropic":
+        system, anthropic_messages = _anthropic_messages(messages)
+        return {
+            "model": model,
+            "system": system,
+            "messages": anthropic_messages,
+            "tools": [_anthropic_tool(tool)],
+            "tool_choice": {"type": "tool", "name": DRAFT_TOOL_NAME},
+            "thinking": {"type": "disabled"},
+            "stream": False,
+            "temperature": 0.2,
+            "max_tokens": max_completion_tokens,
+        }
     return {
         "model": model,
         "messages": messages,
@@ -340,12 +382,67 @@ def _draft_request_body(
     }
 
 
+def _anthropic_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    system_parts: list[str] = []
+    conversation: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system":
+            if conversation or not isinstance(content, str) or not content:
+                raise MiniMaxConfigurationError("Los mensajes system de MiniMax son inválidos")
+            system_parts.append(content)
+            continue
+        if role not in {"user", "assistant"}:
+            raise MiniMaxConfigurationError("El rol de mensaje para MiniMax Anthropic es inválido")
+        if isinstance(content, str):
+            normalized_content: str | list[dict[str, Any]] = [{"type": "text", "text": content}]
+        elif isinstance(content, list) and content:
+            if not all(isinstance(block, Mapping) for block in content):
+                raise MiniMaxConfigurationError(
+                    "Los bloques de mensaje para MiniMax Anthropic son inválidos"
+                )
+            normalized_content = [dict(block) for block in content]
+        else:
+            raise MiniMaxConfigurationError(
+                "El contenido de mensaje para MiniMax Anthropic es inválido"
+            )
+        conversation.append({"role": role, "content": normalized_content})
+    if not system_parts or not conversation:
+        raise MiniMaxConfigurationError("MiniMax Anthropic exige system y conversación")
+    return "\n\n".join(system_parts), conversation
+
+
+def _anthropic_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
+    function = tool.get("function")
+    if tool.get("type") != "function" or not isinstance(function, Mapping):
+        raise MiniMaxConfigurationError("La herramienta editorial tiene un formato inválido")
+    name = function.get("name")
+    description = function.get("description")
+    parameters = function.get("parameters")
+    if (
+        name != DRAFT_TOOL_NAME
+        or not isinstance(description, str)
+        or not description
+        or not isinstance(parameters, Mapping)
+    ):
+        raise MiniMaxConfigurationError("La herramienta editorial no es la autorizada")
+    return {
+        "name": name,
+        "description": description,
+        "input_schema": dict(parameters),
+    }
+
+
 def _draft_repair_messages(
     original: list[dict[str, Any]],
     response: Mapping[str, Any],
     error: MiniMaxResponseError | EditorialValidationError,
     *,
     arguments: Mapping[str, Any] | None,
+    api_style: str,
 ) -> list[dict[str, Any]]:
     """Conserva la cadena M2.7 al reparar una salida, sin ejecutar ninguna herramienta."""
 
@@ -372,6 +469,39 @@ def _draft_repair_messages(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    if api_style == "anthropic":
+        content = response.get("content")
+        if (
+            isinstance(content, list)
+            and content
+            and all(
+                isinstance(block, Mapping) and block.get("type") in _ANTHROPIC_RESPONSE_BLOCK_TYPES
+                for block in content
+            )
+        ):
+            tool_uses = [block for block in content if block.get("type") == "tool_use"]
+            if len(tool_uses) == 1:
+                tool_use_id = tool_uses[0].get("id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    return [
+                        *original,
+                        {
+                            "role": "assistant",
+                            "content": [dict(block) for block in content],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": feedback,
+                                    "is_error": True,
+                                }
+                            ],
+                        },
+                    ]
+        return _draft_repair_fallback(original, error)
     choices = response.get("choices")
     if isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], Mapping):
         message = choices[0].get("message")
@@ -394,6 +524,13 @@ def _draft_repair_messages(
     # Una respuesta heredada sin id de tool call no puede formar una conversación
     # OpenAI válida. El reintento conserva el encargo original y solo agrega el
     # diagnóstico local; nunca inventa ni ejecuta un identificador de herramienta.
+    return _draft_repair_fallback(original, error)
+
+
+def _draft_repair_fallback(
+    original: list[dict[str, Any]],
+    error: MiniMaxResponseError | EditorialValidationError,
+) -> list[dict[str, Any]]:
     return [
         *original,
         {
@@ -421,7 +558,44 @@ def validate_alt_text(value: str | None) -> str | None:
     return normalized
 
 
-def _extract_draft_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+def _extract_draft_arguments(payload: Mapping[str, Any], *, api_style: str) -> Mapping[str, Any]:
+    if api_style == "anthropic":
+        return _extract_anthropic_draft_arguments(payload)
+    return _extract_openai_draft_arguments(payload)
+
+
+def _extract_anthropic_draft_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    if payload.get("input_sensitive") is True or payload.get("output_sensitive") is True:
+        raise MiniMaxResponseError("MiniMax marcó el contenido como sensible y no entregó borrador")
+    if payload.get("type") != "message" or payload.get("role") != "assistant":
+        raise MiniMaxResponseError("MiniMax no devolvió un mensaje Anthropic válido")
+    if payload.get("stop_reason") == "max_tokens":
+        raise MiniMaxResponseError("MiniMax truncó el borrador por límite de tokens")
+    content = payload.get("content")
+    if not isinstance(content, list) or not content:
+        raise MiniMaxResponseError("MiniMax no devolvió bloques de contenido Anthropic")
+    if not all(isinstance(block, Mapping) for block in content):
+        raise MiniMaxResponseError("MiniMax devolvió un bloque Anthropic inválido")
+    if any(block.get("type") not in _ANTHROPIC_RESPONSE_BLOCK_TYPES for block in content):
+        raise MiniMaxResponseError("MiniMax devolvió un tipo de bloque Anthropic no autorizado")
+    tool_uses = [block for block in content if block.get("type") == "tool_use"]
+    if len(tool_uses) != 1:
+        raise MiniMaxResponseError("MiniMax debe hacer exactamente una llamada de herramienta")
+    if payload.get("stop_reason") != "tool_use":
+        raise MiniMaxResponseError("MiniMax no terminó con la llamada de herramienta requerida")
+    tool_use = tool_uses[0]
+    if tool_use.get("name") != DRAFT_TOOL_NAME:
+        raise MiniMaxResponseError("MiniMax intentó invocar una herramienta no autorizada")
+    tool_use_id = tool_use.get("id")
+    if not isinstance(tool_use_id, str) or not tool_use_id:
+        raise MiniMaxResponseError("MiniMax devolvió una llamada de herramienta sin id válido")
+    arguments = tool_use.get("input")
+    if not isinstance(arguments, Mapping):
+        raise MiniMaxResponseError("Los argumentos Anthropic de herramienta no son un objeto JSON")
+    return dict(arguments)
+
+
+def _extract_openai_draft_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     if payload.get("input_sensitive") is True or payload.get("output_sensitive") is True:
         raise MiniMaxResponseError("MiniMax marcó el contenido como sensible y no entregó borrador")
     choices = payload.get("choices")
@@ -512,7 +686,11 @@ def _http_error_detail(response: requests.Response, *, secret: str) -> str:
             if isinstance(base_response, Mapping) and base_response.get("status_msg"):
                 detail = str(base_response["status_msg"])
             else:
-                detail = str(payload.get("message") or payload.get("error") or "sin detalle")
+                error = payload.get("error")
+                if isinstance(error, Mapping) and error.get("message"):
+                    detail = str(error["message"])
+                else:
+                    detail = str(payload.get("message") or error or "sin detalle")
         else:
             detail = str(payload)
     return detail.replace(secret, "[REDACTADO]").strip()[:500] or "sin detalle"
@@ -680,6 +858,17 @@ def _model_name(value: object) -> str:
     if not isinstance(value, str) or not _MODEL_NAME_PATTERN.fullmatch(value):
         raise MiniMaxConfigurationError("El nombre de modelo de MiniMax no es válido")
     return value
+
+
+def _api_style(value: object) -> str:
+    if value is None:
+        return DEFAULT_MINIMAX_API_STYLE
+    if not isinstance(value, str):
+        raise MiniMaxConfigurationError("MINIMAX_API_STYLE debe ser anthropic u openai")
+    normalized = value.strip().casefold()
+    if normalized not in {"anthropic", "openai"}:
+        raise MiniMaxConfigurationError("MINIMAX_API_STYLE debe ser anthropic u openai")
+    return normalized
 
 
 def _positive_timeout(value: object, name: str) -> float:

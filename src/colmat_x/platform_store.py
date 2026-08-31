@@ -54,6 +54,7 @@ from colmat_x.rbac import (
     require_role_assignment,
     roles_with,
 )
+from colmat_x.research_registry import RESEARCH_ONLY_BRIEF_PREFIX
 
 DEFAULT_WORKSPACE_ID = "colmat"
 DEFAULT_DATABASE_PATH = Path(".state/colmat-platform.db")
@@ -77,6 +78,12 @@ CANONICAL_AUTOMATION_WEEKDAYS = (
 DIRECT_PUBLISH_ENV = "COLMAT_DIRECT_PUBLISH_ENABLED"
 MAX_AUTOMATION_SLOTS = 100
 MAX_AUTOMATION_ERROR_LENGTH = 1000
+RESEARCH_ONLY_PUBLICATION_ERROR = (
+    "El material de investigación no es publicable; crea una pieza nueva con /generar"
+)
+RESEARCH_ONLY_APPROVAL_ERROR = (
+    "El material de investigación no es aprobable; crea una pieza nueva con /generar"
+)
 DEFAULT_PUBLICATION_LEASE_SECONDS = 300
 MAX_PUBLICATION_LEASE_SECONDS = 3600
 DEFAULT_GENERATION_LEASE_SECONDS = 900
@@ -979,6 +986,37 @@ class GenerationNotificationClaim:
     lease_expires_at: datetime
 
 
+class EditorialLine(Base):
+    """Línea editorial mensual que contextualiza encargos sin aprobar resultados."""
+
+    __tablename__ = "editorial_lines"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "month", name="uq_editorial_line_workspace_month"),
+        CheckConstraint("length(month) = 7", name="ck_editorial_lines_month_length"),
+        CheckConstraint(
+            "month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'",
+            name="ck_editorial_lines_month_format",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "length(line_text) BETWEEN 1 AND 600",
+            name="ck_editorial_lines_text_length",
+        ),
+        CheckConstraint("version >= 1", name="ck_editorial_lines_version"),
+        Index("ix_editorial_lines_workspace_month", "workspace_id", "month"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    workspace_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    month: Mapped[str] = mapped_column(String(7), nullable=False)
+    line_text: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+
+
 class AutomationSettings(Base):
     __tablename__ = "automation_settings"
     __table_args__ = (
@@ -1053,6 +1091,7 @@ class AutomationRun(Base):
             name="ck_automation_runs_status",
         ),
         CheckConstraint("settings_version >= 1", name="ck_automation_runs_settings_version"),
+        CheckConstraint("attempt_count >= 1", name="ck_automation_runs_attempt_count"),
         CheckConstraint(
             "length(slot_hash) = 64",
             name="ck_automation_runs_slot_hash_length",
@@ -1065,6 +1104,12 @@ class AutomationRun(Base):
             "(status IN ('succeeded', 'failed', 'unknown') AND finished_at IS NOT NULL) "
             "OR status NOT IN ('succeeded', 'failed', 'unknown')",
             name="ck_automation_runs_finished",
+        ),
+        CheckConstraint(
+            "(retry_requested_at IS NULL AND retry_requested_by IS NULL) OR "
+            "(retry_requested_at IS NOT NULL AND retry_requested_by IS NOT NULL "
+            "AND status = 'failed')",
+            name="ck_automation_runs_retry_request",
         ),
         Index(
             "ix_automation_runs_workspace_schedule",
@@ -1083,6 +1128,7 @@ class AutomationRun(Base):
     mode: Mapped[str] = mapped_column(String(20), nullable=False)
     settings_version: Mapped[int] = mapped_column(Integer, nullable=False)
     slot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=AutomationRunStatus.CLAIMED.value
     )
@@ -1096,9 +1142,13 @@ class AutomationRun(Base):
     finished_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="RESTRICT")
     )
+    retry_requested_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT")
+    )
     claimed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    retry_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     @property
     def mode_value(self) -> AutomationMode:
@@ -1561,6 +1611,164 @@ class PlatformStore:
             )
             return user, membership
 
+    def provision_telegram_team_member(
+        self,
+        *,
+        actor_id: str,
+        telegram_user_id: int | str,
+        email: str,
+        display_name: str,
+        role: Role | str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> tuple[User, Membership, TelegramBinding]:
+        """Crea miembro y binding privado de Telegram en una sola transacción.
+
+        La operación es owner-only y deliberadamente no permite crear owners ni admins.
+        Una repetición idéntica devuelve el alta existente; una identidad Telegram ya
+        asociada a otros datos se rechaza sin transferirla.
+        """
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        telegram_identity = _normalize_telegram_user_id(telegram_user_id)
+        normalized_email = _normalize_email(email)
+        normalized_name = _normalize_short_text(display_name, "display_name", 120)
+        target_role = _normalize_role(role)
+        delegatable_roles = {
+            Role.EDITOR,
+            Role.REVIEWER,
+            Role.PUBLISHER,
+            Role.SCHEDULER,
+            Role.AUDITOR,
+        }
+        if target_role not in delegatable_roles:
+            raise AuthorizationError(
+                "Telegram solo permite delegar editor, reviewer, publisher, scheduler o auditor"
+            )
+        target_id = _new_id()
+        timestamp = _normalize_now(now)
+        with (
+            _workspace_rbac_lock(workspace),
+            _user_rbac_lock(target_id),
+            self._sessions.begin() as session,
+        ):
+            self._serialize_workspace_rbac(session, workspace)
+            actor_role = self._authorize(session, actor, workspace, Permission.MANAGE_USERS)
+            if actor_role is not Role.OWNER:
+                raise AuthorizationError("Solo el owner puede dar altas desde Telegram")
+            require_permission(actor_role, Permission.MANAGE_MEMBERSHIPS)
+            require_permission(actor_role, Permission.MANAGE_TELEGRAM)
+            require_role_assignment(actor_role, target_role)
+
+            existing_binding = session.scalar(
+                select(TelegramBinding)
+                .where(
+                    TelegramBinding.workspace_id == workspace,
+                    TelegramBinding.telegram_user_id == telegram_identity,
+                )
+                .order_by(TelegramBinding.created_at, TelegramBinding.id)
+                .limit(1)
+                .with_for_update()
+            )
+            if existing_binding is not None:
+                existing_user = self._get_user(session, existing_binding.user_id)
+                existing_membership = self._required_membership(
+                    session,
+                    existing_binding.user_id,
+                    workspace,
+                )
+                identical = (
+                    existing_binding.chat_id == telegram_identity
+                    and existing_binding.purpose == "control"
+                    and existing_binding.is_active
+                    and existing_user.is_active
+                    and existing_user.email == normalized_email
+                    and existing_user.display_name == normalized_name
+                    and existing_membership.role == target_role.value
+                )
+                if identical:
+                    return existing_user, existing_membership, existing_binding
+                raise ConflictError(
+                    "El ID de Telegram ya está asociado y no se transfiere ni cambia de rol"
+                )
+
+            user = self._new_user(
+                session,
+                email=normalized_email,
+                display_name=normalized_name,
+                username=None,
+                password_hash=None,
+                user_id=target_id,
+                now=timestamp,
+            )
+            membership = Membership(
+                workspace_id=workspace,
+                user_id=user.id,
+                role=target_role.value,
+                created_by=actor,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            binding = TelegramBinding(
+                workspace_id=workspace,
+                telegram_user_id=telegram_identity,
+                chat_id=telegram_identity,
+                user_id=user.id,
+                purpose="control",
+                is_active=True,
+                created_by=actor,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            session.add_all((membership, binding))
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                raise ConflictError("No se pudo completar el alta de Telegram") from exc
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="user.created",
+                entity_type="user",
+                entity_id=user.id,
+                detail={"email": user.email, "source": "telegram_owner_command"},
+                now=timestamp,
+            )
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="membership.granted",
+                entity_type="membership",
+                entity_id=membership.id,
+                detail={
+                    "user_id": user.id,
+                    "role": target_role.value,
+                    "source": "telegram_owner_command",
+                },
+                now=timestamp,
+            )
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="telegram.binding_created",
+                entity_type="telegram_binding",
+                entity_id=binding.id,
+                detail={
+                    "chat_id": telegram_identity,
+                    "telegram_user_id": telegram_identity,
+                    "user_id": user.id,
+                    "purpose": "control",
+                    "active": True,
+                    "source": "telegram_owner_command",
+                },
+                now=timestamp,
+            )
+            return user, membership, binding
+
     def set_user_active(
         self,
         user_id: str,
@@ -1873,6 +2081,101 @@ class PlatformStore:
                 )
             )
 
+    def get_editorial_line(
+        self,
+        month: str,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> EditorialLine | None:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        normalized_month = _normalize_editorial_month(month)
+        with self._sessions() as session:
+            role = self._authorize(session, actor, workspace, Permission.VIEW_WORKSPACE)
+            if role not in {Role.OWNER, Role.EDITOR}:
+                raise AuthorizationError(
+                    "Solo owner o editor pueden consultar la línea editorial mensual"
+                )
+            return session.scalar(
+                select(EditorialLine).where(
+                    EditorialLine.workspace_id == workspace,
+                    EditorialLine.month == normalized_month,
+                )
+            )
+
+    def set_editorial_line(
+        self,
+        month: str,
+        line_text: str,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> EditorialLine:
+        """Crea o actualiza idempotentemente la directriz mensual; solo el owner."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        normalized_month = _normalize_editorial_month(month)
+        normalized_text = _normalize_short_text(line_text, "line_text", 600)
+        timestamp = _normalize_now(now)
+        with _workspace_rbac_lock(workspace), self._sessions.begin() as session:
+            self._serialize_workspace_rbac(session, workspace)
+            role = self._authorize(session, actor, workspace, Permission.VIEW_WORKSPACE)
+            if role is not Role.OWNER:
+                raise AuthorizationError("Solo el owner puede fijar la línea editorial mensual")
+            current = session.scalar(
+                select(EditorialLine)
+                .where(
+                    EditorialLine.workspace_id == workspace,
+                    EditorialLine.month == normalized_month,
+                )
+                .with_for_update()
+            )
+            previous_hash: str | None = None
+            action = "editorial_line.created"
+            if current is None:
+                current = EditorialLine(
+                    workspace_id=workspace,
+                    month=normalized_month,
+                    line_text=normalized_text,
+                    version=1,
+                    updated_by=actor,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+                session.add(current)
+            elif current.line_text == normalized_text:
+                return current
+            else:
+                previous_hash = hashlib.sha256(current.line_text.encode("utf-8")).hexdigest()
+                current.line_text = normalized_text
+                current.version += 1
+                current.updated_by = actor
+                current.updated_at = timestamp
+                action = "editorial_line.updated"
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                raise ConflictError("No se pudo fijar la línea editorial mensual") from exc
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action=action,
+                entity_type="editorial_line",
+                entity_id=current.id,
+                detail={
+                    "month": normalized_month,
+                    "previous_sha256": previous_hash,
+                    "sha256": hashlib.sha256(normalized_text.encode("utf-8")).hexdigest(),
+                    "version": current.version,
+                },
+                now=timestamp,
+            )
+            return current
+
     def create_draft(
         self,
         *,
@@ -1957,6 +2260,14 @@ class PlatformStore:
         with self._sessions.begin() as session:
             draft = self._get_draft_for_update(session, draft_id)
             self._authorize(session, actor, draft.workspace_id, Permission.EDIT_DRAFTS)
+            current_revision = self._current_revision(session, draft)
+            if _revision_is_research_only(
+                session, current_revision
+            ) and not _evidence_is_research_only(material["evidence"]):
+                raise ConflictError(
+                    "Una revisión no puede convertir material de investigación en pieza "
+                    "publicable; usa /generar para crear un draft nuevo"
+                )
             if DraftStatus(draft.status) in {DraftStatus.IN_REVIEW, DraftStatus.PUBLISHED}:
                 raise ConflictError(f"No se puede editar un draft en estado '{draft.status}'")
             pending = session.scalar(
@@ -2292,7 +2603,8 @@ class PlatformStore:
         target_id = _normalize_entity_id(user_id)
         if purpose not in {"control", "review", "alerts"}:
             raise ValueError("purpose debe ser control, review o alerts")
-        with self._sessions.begin() as session:
+        with _workspace_rbac_lock(workspace), self._sessions.begin() as session:
+            self._serialize_workspace_rbac(session, workspace)
             actor_role = self._authorize(session, actor, workspace, Permission.MANAGE_TELEGRAM)
             self._get_user(session, target_id)
             target_membership = self._required_membership(session, target_id, workspace)
@@ -2300,6 +2612,20 @@ class PlatformStore:
             if actor != target_id and actor_role is not Role.OWNER:
                 raise AuthorizationError(
                     "Solo el owner puede vincular Telegram a la cuenta de otra persona"
+                )
+            conflicting_identity = session.scalar(
+                select(TelegramBinding.id)
+                .where(
+                    TelegramBinding.workspace_id == workspace,
+                    TelegramBinding.telegram_user_id == normalized_telegram_user,
+                    TelegramBinding.user_id != target_id,
+                )
+                .limit(1)
+                .with_for_update()
+            )
+            if conflicting_identity is not None:
+                raise ConflictError(
+                    "El from.id de Telegram ya pertenece a otra cuenta y no se transfiere"
                 )
             binding = session.scalar(
                 select(TelegramBinding).where(
@@ -2346,6 +2672,30 @@ class PlatformStore:
                 now=timestamp,
             )
             return binding
+
+    def list_telegram_bindings(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> list[TelegramBinding]:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            role = self._authorize(session, actor, workspace, Permission.MANAGE_TELEGRAM)
+            if role is not Role.OWNER:
+                raise AuthorizationError("Solo el owner puede listar los IDs de Telegram")
+            return list(
+                session.scalars(
+                    select(TelegramBinding)
+                    .where(TelegramBinding.workspace_id == workspace)
+                    .order_by(
+                        TelegramBinding.user_id,
+                        TelegramBinding.created_at,
+                        TelegramBinding.id,
+                    )
+                )
+            )
 
     def has_private_control_binding(
         self,
@@ -2438,6 +2788,8 @@ class PlatformStore:
                 raise StaleSnapshotError(
                     "El snapshot solicitado ya no coincide con la revisión actual"
                 )
+            if normalized_action is CallbackAction.APPROVE:
+                _require_revision_approvable(session, revision)
             self._validate_callback_state(
                 draft=draft,
                 revision=revision,
@@ -2569,6 +2921,8 @@ class PlatformStore:
             revision = self._current_revision(session, draft)
             if revision.id != intent.revision_id or revision.snapshot_hash != intent.snapshot_hash:
                 raise StaleSnapshotError("El callback pertenece a una revisión anterior")
+            if normalized_action is CallbackAction.APPROVE:
+                _require_revision_approvable(session, revision)
             self._validate_callback_state(
                 draft=draft,
                 revision=revision,
@@ -3046,19 +3400,31 @@ class PlatformStore:
         """Implementa TelegramAuthorizer usando siempre `from.id`, no `chat.id`."""
 
         permission_value = getattr(permission, "value", permission)
+        owner_only_permissions = {
+            "telegram.team.manage.owner",
+            "editorial.line.manage.owner",
+        }
+        owner_editor_permissions = {
+            "editorial.line.view",
+            "research.request",
+            "content.generate",
+        }
         permission_map = {
             "telegram.access": Permission.VIEW_WORKSPACE,
             "telegram.status.view": Permission.VIEW_DRAFTS,
             "telegram.team.view": Permission.VIEW_WORKSPACE,
             "calendar.view": Permission.VIEW_AUTOMATION,
             "automation.mode.manage": Permission.MANAGE_AUTOMATION_MODE,
-            "content.generate": Permission.CREATE_DRAFTS,
             "content.publish.request": Permission.PUBLISH_DRAFTS,
             "content.approve": Permission.REVIEW_DRAFTS,
             "content.reject": Permission.REVIEW_DRAFTS,
         }
         required_permission = permission_map.get(permission_value)
-        if required_permission is None:
+        if (
+            required_permission is None
+            and permission_value not in owner_only_permissions
+            and permission_value not in owner_editor_permissions
+        ):
             return False
         try:
             workspace = _normalize_workspace(workspace_id)
@@ -3071,7 +3437,16 @@ class PlatformStore:
                     telegram_user_id=telegram_identity,
                     chat_id=normalized_chat,
                 )
-                require_permission(Role(membership.role), required_permission)
+                role = Role(membership.role)
+                if permission_value in owner_only_permissions:
+                    if role is not Role.OWNER:
+                        return False
+                elif permission_value in owner_editor_permissions:
+                    if role not in {Role.OWNER, Role.EDITOR}:
+                        return False
+                else:
+                    assert required_permission is not None
+                    require_permission(role, required_permission)
         except (AuthorizationError, ValueError):
             return False
         return True
@@ -3499,6 +3874,22 @@ class PlatformStore:
                 self._authorize(session, author, request.workspace_id, Permission.MANAGE_MEDIA)
             if author == request.requested_by:
                 raise AuthorizationError("La identidad solicitante no puede ser el autor IA")
+            if _generation_request_is_research_only(request):
+                normalized_evidence = material["evidence"]
+                if not isinstance(normalized_evidence, Mapping):
+                    raise ConflictError(
+                        "Una investigación exige evidencia estructurada y no publicable"
+                    )
+                research_evidence = dict(normalized_evidence)
+                research_evidence["research_only"] = True
+                research_evidence["externally_verified"] = False
+                material = _normalize_revision_material(
+                    text=material["text"],
+                    category=material["category"],
+                    publish_at=material["publish_at"],
+                    evidence=research_evidence,
+                    image_sha256=material["image_sha256"],
+                )
             _require_generation_claim_credentials(
                 request,
                 actor_id=worker,
@@ -3518,6 +3909,12 @@ class PlatformStore:
                 )
                 if revision is None or notification is None:
                     raise ConflictError("La generación exitosa no tiene outbox íntegro")
+                if _generation_request_is_research_only(request) and not _evidence_is_research_only(
+                    revision.evidence
+                ):
+                    raise ConflictError(
+                        "La generación heredada no conserva la barrera research_only"
+                    )
                 return request, draft, revision, notification
             if current is not GenerationRequestStatus.CLAIMED:
                 raise ConflictError("La solicitud de generación no está reclamada")
@@ -4460,6 +4857,31 @@ class PlatformStore:
             request = session.get(PublicationRequest, claimed_id)
             if request is None:  # pragma: no cover - protegido por RETURNING
                 raise NotFoundError("La solicitud desapareció durante el claim")
+            queued_revision = session.get(Revision, request.revision_id)
+            if queued_revision is None:  # pragma: no cover - protegido por FK
+                raise NotFoundError("La revisión de la solicitud ya no existe")
+            if _revision_is_research_only(session, queued_revision):
+                # Compatibilidad segura para filas que hubieran sido encoladas antes
+                # de introducir la barrera: se cercan y no vuelven a la cola.
+                request.status = PublicationRequestStatus.UNKNOWN.value
+                request.error = RESEARCH_ONLY_PUBLICATION_ERROR
+                request.finished_at = timestamp
+                request.updated_at = timestamp
+                self._audit(
+                    session,
+                    workspace_id=workspace,
+                    actor_id=actor,
+                    action="publication_request.blocked_research_only",
+                    entity_type="publication_request",
+                    entity_id=request.id,
+                    detail={
+                        "draft_id": request.draft_id,
+                        "revision_id": request.revision_id,
+                        "claim_fence": request.claim_fence,
+                    },
+                    now=timestamp,
+                )
+                return None
             draft = self._get_draft(session, request.draft_id)
             revision, approval = self._approved_snapshot_for_publication(
                 session,
@@ -4655,28 +5077,17 @@ class PlatformStore:
             if existing is not None:
                 if existing.draft_id != draft.id or existing.snapshot_hash != expected:
                     raise ConflictError("La clave de idempotencia pertenece a otro snapshot")
+                existing_revision = session.get(Revision, existing.revision_id)
+                if existing_revision is None:  # pragma: no cover - protegido por FK
+                    raise NotFoundError("La revisión del intento ya no existe")
+                if _revision_is_research_only(session, existing_revision):
+                    raise ConflictError(RESEARCH_ONLY_PUBLICATION_ERROR)
                 return existing
-            if DraftStatus(draft.status) is not DraftStatus.APPROVED:
-                raise ConflictError("Solo se puede publicar un draft aprobado")
-            revision = self._current_revision(session, draft)
-            if draft.approved_revision_id != revision.id:
-                raise StaleSnapshotError("La aprobación no pertenece a la revisión actual")
-            approval = session.scalar(
-                select(Approval)
-                .where(
-                    Approval.draft_id == draft.id,
-                    Approval.revision_id == revision.id,
-                    Approval.decision == ApprovalDecision.APPROVED.value,
-                )
-                .order_by(Approval.created_at.desc(), Approval.id.desc())
-                .limit(1)
+            revision, _approval = self._approved_snapshot_for_publication(
+                session,
+                draft=draft,
+                expected_snapshot_hash=expected,
             )
-            if (
-                approval is None
-                or approval.snapshot_hash != revision.snapshot_hash
-                or revision.snapshot_hash != expected
-            ):
-                raise StaleSnapshotError("El snapshot aprobado ya no coincide con el contenido")
             attempt = PublishAttempt(
                 workspace_id=draft.workspace_id,
                 draft_id=draft.id,
@@ -4734,6 +5145,12 @@ class PlatformStore:
             if attempt is None:
                 raise NotFoundError(f"No existe el intento de publicación '{attempt_id}'")
             self._authorize(session, actor, attempt.workspace_id, Permission.PUBLISH_DRAFTS)
+            if target_status is PublishStatus.SUCCEEDED:
+                revision = session.get(Revision, attempt.revision_id)
+                if revision is None:  # pragma: no cover - protegido por FK
+                    raise NotFoundError("La revisión del intento ya no existe")
+                if _revision_is_research_only(session, revision):
+                    raise ConflictError(RESEARCH_ONLY_PUBLICATION_ERROR)
             if PublishStatus(attempt.status) is not PublishStatus.PENDING:
                 if PublishStatus(attempt.status) is target_status:
                     return attempt
@@ -5074,6 +5491,7 @@ class PlatformStore:
         slot_snapshot: Mapping[str, Any],
         mode: AutomationMode | str | None = None,
         draft_id: str | None = None,
+        expected_retry_run_id: str | None = None,
         workspace_id: str = DEFAULT_WORKSPACE_ID,
         now: datetime | None = None,
     ) -> AutomationRun:
@@ -5088,6 +5506,11 @@ class PlatformStore:
         requested_slot = _normalize_single_automation_slot(slot_snapshot)
         requested_slot_hash = _automation_slot_hash(requested_slot)
         normalized_draft_id = _normalize_entity_id(draft_id) if draft_id else None
+        normalized_retry_run_id = (
+            _normalize_entity_id(expected_retry_run_id)
+            if expected_retry_run_id is not None
+            else None
+        )
         timestamp = _normalize_now(now)
         with self._sessions.begin() as session:
             self._authorize(session, actor, workspace, Permission.MANAGE_SCHEDULE)
@@ -5099,13 +5522,19 @@ class PlatformStore:
             if settings is None:
                 raise NotFoundError("No existe configuración de automatización")
             existing = session.scalar(
-                select(AutomationRun).where(
+                select(AutomationRun)
+                .where(
                     AutomationRun.workspace_id == workspace,
                     AutomationRun.idempotency_key == key,
                 )
+                .with_for_update()
             )
             effective_mode = AutomationMode(settings.mode)
+            if existing is None and normalized_retry_run_id is not None:
+                raise ConflictError("El retry esperado ya no existe")
             if existing is not None:
+                if normalized_retry_run_id is not None and existing.id != normalized_retry_run_id:
+                    raise ConflictError("El retry no coincide con el run persistido")
                 _require_matching_automation_claim(
                     existing,
                     slot_id=normalized_slot,
@@ -5114,7 +5543,14 @@ class PlatformStore:
                     draft_id=normalized_draft_id,
                     slot_hash=requested_slot_hash,
                 )
-                return existing
+                if existing.retry_requested_at is None:
+                    return existing
+                if (
+                    existing.status_value is not AutomationRunStatus.FAILED
+                    or existing.draft_id is not None
+                    or existing.retry_requested_by is None
+                ):
+                    raise ConflictError("La solicitud de reintento persistida es inconsistente")
             if not settings.enabled:
                 raise ConflictError("La automatización está desactivada")
             if requested_mode is not None and requested_mode is not effective_mode:
@@ -5148,6 +5584,41 @@ class PlatformStore:
                 if draft.workspace_id != workspace:
                     raise ConflictError("El draft pertenece a otro espacio de trabajo")
 
+            if existing is not None:
+                previous_attempt = existing.attempt_count
+                retry_requested_by = existing.retry_requested_by
+                retry_requested_at = existing.retry_requested_at
+                existing.status = AutomationRunStatus.CLAIMED.value
+                existing.settings_version = settings.version
+                existing.attempt_count = previous_attempt + 1
+                existing.error = None
+                existing.claimed_by = actor
+                existing.claimed_at = timestamp
+                existing.updated_at = timestamp
+                existing.finished_by = None
+                existing.finished_at = None
+                existing.retry_requested_by = None
+                existing.retry_requested_at = None
+                self._audit(
+                    session,
+                    workspace_id=workspace,
+                    actor_id=actor,
+                    action="automation.run_retry_claimed",
+                    entity_type="automation_run",
+                    entity_id=existing.id,
+                    detail={
+                        "attempt_count": existing.attempt_count,
+                        "idempotency_key": key,
+                        "previous_attempt_count": previous_attempt,
+                        "retry_requested_at": _format_time(retry_requested_at),
+                        "retry_requested_by": retry_requested_by,
+                        "settings_version": settings.version,
+                        "slot_id": normalized_slot,
+                    },
+                    now=timestamp,
+                )
+                return existing
+
             day_start, day_end = _local_day_bounds(schedule, settings.timezone)
             claimed_today = session.scalar(
                 select(func.count(AutomationRun.id)).where(
@@ -5167,6 +5638,7 @@ class PlatformStore:
                 mode=effective_mode.value,
                 settings_version=settings.version,
                 slot_hash=requested_slot_hash,
+                attempt_count=1,
                 status=AutomationRunStatus.CLAIMED.value,
                 draft_id=normalized_draft_id,
                 claimed_by=actor,
@@ -5203,12 +5675,176 @@ class PlatformStore:
                 entity_type="automation_run",
                 entity_id=run.id,
                 detail={
+                    "attempt_count": 1,
                     "idempotency_key": key,
                     "slot_id": normalized_slot,
                     "slot_hash": requested_slot_hash,
                     "settings_version": settings.version,
                     "scheduled_for": _format_time(schedule),
                     "mode": effective_mode.value,
+                },
+                now=timestamp,
+            )
+            return run
+
+    def request_automation_run_retry(
+        self,
+        run_id: str,
+        *,
+        actor_id: str,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        """Reencola un fallo confirmado sin reemplazar el run ni su idempotency key.
+
+        Solo se puede repetir la preparación cuando el intento falló antes de persistir
+        un draft. Los resultados ambiguos y los runs con snapshot editorial quedan cerrados
+        para evitar duplicar contenido o efectos externos.
+        """
+
+        normalized_run_id = _normalize_entity_id(run_id)
+        actor = _normalize_actor(actor_id)
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            run = session.scalar(select(AutomationRun).where(AutomationRun.id == normalized_run_id))
+            if run is None:
+                raise NotFoundError(f"No existe el run de automatización '{normalized_run_id}'")
+            workspace = run.workspace_id
+            self._authorize(session, actor, workspace, Permission.MANAGE_SCHEDULE)
+            settings = session.scalar(
+                select(AutomationSettings)
+                .where(AutomationSettings.workspace_id == workspace)
+                .with_for_update()
+            )
+            if settings is None:
+                raise NotFoundError("No existe configuración de automatización")
+            run = session.scalar(
+                select(AutomationRun).where(AutomationRun.id == normalized_run_id).with_for_update()
+            )
+            if run is None:  # pragma: no cover - la fila está protegida por FK y transacción
+                raise NotFoundError(f"No existe el run de automatización '{normalized_run_id}'")
+            status = AutomationRunStatus(run.status)
+            if status is AutomationRunStatus.UNKNOWN:
+                raise ConflictError(
+                    "Un run unknown exige conciliación; no se puede reintentar automáticamente"
+                )
+            if status is not AutomationRunStatus.FAILED:
+                raise ConflictError("Solo se puede reintentar un run con estado failed")
+            if run.draft_id is not None:
+                raise ConflictError(
+                    "El run fallido ya tiene un draft; requiere conciliación, no regeneración"
+                )
+            if run.mode != settings.mode:
+                raise ConflictError("El modo actual ya no coincide con el run fallido")
+            authorized_slot = _require_scheduled_automation_claim(
+                settings,
+                idempotency_key=run.idempotency_key,
+                slot_id=run.slot_id,
+                scheduled_for=run.scheduled_for,
+                mode=AutomationMode(run.mode),
+            )
+            if _automation_slot_hash(authorized_slot) != run.slot_hash:
+                raise ConflictError("El slot actual ya no coincide con el run fallido")
+            if run.retry_requested_at is not None:
+                if run.retry_requested_by is None:
+                    raise ConflictError("La solicitud de reintento persistida es inconsistente")
+                return run
+
+            run.retry_requested_by = actor
+            run.retry_requested_at = timestamp
+            run.updated_at = timestamp
+            self._audit(
+                session,
+                workspace_id=run.workspace_id,
+                actor_id=actor,
+                action="automation.run_retry_requested",
+                entity_type="automation_run",
+                entity_id=run.id,
+                detail={
+                    "attempt_count": run.attempt_count,
+                    "idempotency_key": run.idempotency_key,
+                    "slot_id": run.slot_id,
+                    "status": status.value,
+                },
+                now=timestamp,
+            )
+            return run
+
+    def list_pending_automation_retries(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        limit: int = 20,
+    ) -> list[AutomationRun]:
+        """Lista solicitudes explícitas pendientes, incluso de fechas locales anteriores."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        normalized_limit = _normalize_bounded_int(limit, "limit", minimum=1, maximum=100)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_SCHEDULE)
+            return list(
+                session.scalars(
+                    select(AutomationRun)
+                    .where(
+                        AutomationRun.workspace_id == workspace,
+                        AutomationRun.status == AutomationRunStatus.FAILED.value,
+                        AutomationRun.retry_requested_at.is_not(None),
+                        AutomationRun.retry_requested_by.is_not(None),
+                    )
+                    .order_by(AutomationRun.retry_requested_at, AutomationRun.id)
+                    .limit(normalized_limit)
+                )
+            )
+
+    def cancel_automation_run_retry(
+        self,
+        run_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        """Retira un retry que ya no puede corresponder a la agenda vigente."""
+
+        normalized_run_id = _normalize_entity_id(run_id)
+        actor = _normalize_actor(actor_id)
+        normalized_reason = _sanitize_automation_error(reason)
+        if normalized_reason is None:
+            raise ValueError("reason debe ser texto no vacío")
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            run = session.scalar(
+                select(AutomationRun).where(AutomationRun.id == normalized_run_id).with_for_update()
+            )
+            if run is None:
+                raise NotFoundError(f"No existe el run de automatización '{normalized_run_id}'")
+            self._authorize(session, actor, run.workspace_id, Permission.MANAGE_SCHEDULE)
+            if run.retry_requested_at is None and run.retry_requested_by is None:
+                return run
+            if run.status_value is not AutomationRunStatus.FAILED:
+                raise ConflictError("Solo un run failed puede conservar un retry pendiente")
+            previous_requested_at = run.retry_requested_at
+            previous_requested_by = run.retry_requested_by
+            run.retry_requested_at = None
+            run.retry_requested_by = None
+            run.updated_at = timestamp
+            self._audit(
+                session,
+                workspace_id=run.workspace_id,
+                actor_id=actor,
+                action="automation.run_retry_cancelled",
+                entity_type="automation_run",
+                entity_id=run.id,
+                detail={
+                    "attempt_count": run.attempt_count,
+                    "reason": normalized_reason,
+                    "retry_requested_at": (
+                        _format_time(previous_requested_at)
+                        if previous_requested_at is not None
+                        else None
+                    ),
+                    "retry_requested_by": previous_requested_by,
                 },
                 now=timestamp,
             )
@@ -6581,6 +7217,8 @@ class PlatformStore:
                 raise StaleSnapshotError(
                     "El contenido cambió desde la vista previa; no se registró la decisión"
                 )
+            if decision is ApprovalDecision.APPROVED:
+                _require_revision_approvable(session, revision)
             target_status = (
                 DraftStatus.APPROVED
                 if decision is ApprovalDecision.APPROVED
@@ -6749,6 +7387,8 @@ class PlatformStore:
         if DraftStatus(draft.status) is not DraftStatus.APPROVED:
             raise ConflictError("Solo se puede publicar un draft aprobado")
         revision = self._current_revision(session, draft)
+        if _revision_is_research_only(session, revision):
+            raise ConflictError(RESEARCH_ONLY_PUBLICATION_ERROR)
         if draft.approved_revision_id != revision.id:
             raise StaleSnapshotError("La aprobación no pertenece a la revisión actual")
         approval = session.scalar(
@@ -7446,6 +8086,17 @@ def _migrate_legacy_sqlite_schema(engine: Any) -> None:
                     "ALTER TABLE automation_runs ADD COLUMN slot_hash VARCHAR(64) "
                     f"NOT NULL DEFAULT '{'0' * 64}'"
                 )
+            if "attempt_count" not in run_columns:
+                cursor.execute(
+                    "ALTER TABLE automation_runs ADD COLUMN "
+                    "attempt_count INTEGER NOT NULL DEFAULT 1"
+                )
+            if "retry_requested_by" not in run_columns:
+                cursor.execute(
+                    "ALTER TABLE automation_runs ADD COLUMN retry_requested_by VARCHAR(36)"
+                )
+            if "retry_requested_at" not in run_columns:
+                cursor.execute("ALTER TABLE automation_runs ADD COLUMN retry_requested_at DATETIME")
         if "telegram_updates" in tables:
             update_columns = {
                 row[1] for row in cursor.execute("PRAGMA table_info(telegram_updates)")
@@ -7578,6 +8229,35 @@ def _normalize_revision_material(
     }
 
 
+def _evidence_is_research_only(evidence: Any) -> bool:
+    return isinstance(evidence, Mapping) and evidence.get("research_only") is True
+
+
+def _generation_request_is_research_only(request: GenerationRequest) -> bool:
+    return request.brief.startswith(RESEARCH_ONLY_BRIEF_PREFIX)
+
+
+def _revision_is_research_only(session: Session, revision: Revision) -> bool:
+    if _evidence_is_research_only(revision.evidence):
+        return True
+    return (
+        session.scalar(
+            select(GenerationRequest.id)
+            .where(
+                GenerationRequest.revision_id == revision.id,
+                GenerationRequest.brief.startswith(RESEARCH_ONLY_BRIEF_PREFIX),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _require_revision_approvable(session: Session, revision: Revision) -> None:
+    if _revision_is_research_only(session, revision):
+        raise ConflictError(RESEARCH_ONLY_APPROVAL_ERROR)
+
+
 def _normalize_text(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("text debe ser texto")
@@ -7652,6 +8332,15 @@ def _normalize_email(value: str) -> str:
     normalized = value.strip().lower()
     if len(normalized) > 320 or EMAIL_PATTERN.fullmatch(normalized) is None:
         raise ValueError("email no tiene un formato válido")
+    return normalized
+
+
+def _normalize_editorial_month(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("month debe ser texto")
+    normalized = value.strip()
+    if re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", normalized) is None:
+        raise ValueError("month debe usar AAAA-MM")
     return normalized
 
 

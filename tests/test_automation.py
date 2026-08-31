@@ -174,6 +174,7 @@ class FakeGenerator:
 class FakeRepository:
     def __init__(self) -> None:
         self.claims = []
+        self.retry_claims = []
         self.claimed_keys: set[str] = set()
         self.claims_by_date: defaultdict[date, int] = defaultdict(int)
         self.forced_decision: ClaimDecision | None = None
@@ -198,6 +199,10 @@ class FakeRepository:
         self.claimed_keys.add(claim.idempotency_key)
         self.claims_by_date[claim.local_date] += 1
         return ClaimDecision.CLAIMED
+
+    def claim_retry_slot(self, claim, *, daily_limit):
+        self.retry_claims.append((claim, daily_limit))
+        return self.claim_slot(claim, daily_limit=daily_limit)
 
     def save_prepared(self, prepared):
         if self.fail_save:
@@ -498,6 +503,61 @@ def test_duplicate_and_daily_limit_stop_before_generation(policy) -> None:
     assert repeated.status is AutomationStatus.SKIPPED_DUPLICATE
     assert limited.status is AutomationStatus.SKIPPED_DAILY_LIMIT
     assert len(generator.draft_requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status", "detail_fragment"),
+    [
+        (ClaimDecision.DUPLICATE_FAILED, AutomationStatus.FAILED, "reintento explícito"),
+        (ClaimDecision.DUPLICATE_UNKNOWN, AutomationStatus.UNKNOWN, "conciliación"),
+    ],
+)
+def test_failed_or_unknown_duplicate_preserves_unhealthy_scheduler_result(
+    policy,
+    decision,
+    expected_status,
+    detail_fragment,
+) -> None:
+    generator = FakeGenerator(DraftCandidate(draft=editorial_draft(policy)))
+    repository = FakeRepository()
+    repository.forced_decision = decision
+    scheduler, _repository, _notifier = engine(
+        policy=policy,
+        config=automation_config(slot()),
+        generator=generator,
+        repository=repository,
+    )
+
+    result = scheduler.run_due(now=NOW, environ={})[0]
+
+    assert result.status is expected_status
+    assert detail_fragment in result.detail
+    assert generator.draft_requests == []
+
+
+def test_explicit_retry_executes_only_the_historical_slot(policy) -> None:
+    generator = FakeGenerator(DraftCandidate(draft=editorial_draft(policy)))
+    selected_slot = slot()
+    scheduler, repository, _notifier = engine(
+        policy=policy,
+        config=automation_config(selected_slot),
+        generator=generator,
+    )
+    historical_date = date(2026, 8, 28)
+    key = slot_idempotency_key(historical_date, selected_slot.id)
+
+    result = scheduler.run_retry(
+        slot_id=selected_slot.id,
+        local_date=historical_date,
+        idempotency_key=key,
+        environ={},
+    )
+
+    assert result.idempotency_key == key
+    assert result.status is AutomationStatus.REVIEW_REQUIRED
+    assert len(repository.retry_claims) == 1
+    assert repository.retry_claims[0][0].local_date == historical_date
+    assert len(repository.claims) == 1
 
 
 @pytest.mark.parametrize(

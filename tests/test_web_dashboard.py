@@ -338,6 +338,41 @@ def test_web_post_cannot_approve_truncated_evidence(dashboard_stack) -> None:
     assert store.get_draft(draft.id, actor_id=owner.id).status == "in_review"
 
 
+def test_web_post_cannot_approve_research_only(dashboard_stack) -> None:
+    client, store, owner, telegram = dashboard_stack
+    editor, _membership = store.create_team_member(
+        actor_id=owner.id,
+        email="research-editor@colmat.test",
+        username="research.editor",
+        display_name="Editor de investigación",
+        role=Role.EDITOR,
+    )
+    draft, revision = store.create_draft(
+        actor_id=editor.id,
+        text="Síntesis exploratoria que todavía no es una pieza publicable.",
+        category="dato_semana",
+        publish_at="2026-09-01T15:00:00+00:00",
+        evidence={"research_only": True, "externally_verified": False},
+    )
+    store.submit_for_review(
+        draft.id,
+        actor_id=editor.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+    )
+    _login(client, telegram)
+    csrf_token = client.cookies.get(CSRF_COOKIE)
+    assert csrf_token
+
+    response = client.post(
+        f"/app/drafts/{draft.id}/approve",
+        headers={"Origin": ORIGIN},
+        data={"csrf_token": csrf_token, "snapshot_hash": revision.snapshot_hash},
+    )
+
+    assert response.headers["location"] == "/app?error=review_failed"
+    assert store.get_draft(draft.id, actor_id=owner.id).status == "in_review"
+
+
 def test_scheduler_can_edit_schedule_but_cannot_change_mode(dashboard_stack) -> None:
     client, store, owner, telegram = dashboard_stack
     scheduler, _membership = store.create_team_member(
