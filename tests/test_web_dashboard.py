@@ -154,6 +154,11 @@ def test_login_post_requires_same_origin_and_csrf(dashboard_stack) -> None:
         "/auth/code",
         data={"csrf_token": csrf_token, "identifier": "sirhegel"},
     )
+    null_origin = client.post(
+        "/auth/code",
+        headers={"Origin": "null"},
+        data={"csrf_token": csrf_token, "identifier": "sirhegel"},
+    )
     wrong_csrf = client.post(
         "/auth/code",
         headers={"Origin": ORIGIN},
@@ -161,8 +166,27 @@ def test_login_post_requires_same_origin_and_csrf(dashboard_stack) -> None:
     )
 
     assert missing_origin.status_code == 403
+    assert null_origin.status_code == 403
     assert wrong_csrf.status_code == 403
     assert telegram.sent == []
+
+
+def test_refreshing_login_keeps_an_existing_form_valid(dashboard_stack) -> None:
+    client, _store, _owner, telegram = dashboard_stack
+    first_login = client.get("/login")
+    first_csrf = _hidden(first_login, "csrf_token")
+
+    refreshed_login = client.get("/login")
+    refreshed_csrf = _hidden(refreshed_login, "csrf_token")
+    challenge = client.post(
+        "/auth/code",
+        headers={"Origin": ORIGIN},
+        data={"csrf_token": first_csrf, "identifier": "sirhegel"},
+    )
+
+    assert refreshed_csrf == first_csrf
+    assert challenge.status_code == 200
+    assert len(telegram.sent) == 1
 
 
 def test_owner_can_create_team_member_and_enqueue_minimax_work(dashboard_stack) -> None:
