@@ -11,6 +11,8 @@ sqlalchemy = pytest.importorskip("sqlalchemy")
 from sqlalchemy import select  # noqa: E402
 
 from colmat_x.automation import (  # noqa: E402
+    AUTOMATION_TIMEZONE,
+    AutomationConfig,
     AutomationError,
     AutomationEvent,
     AutomationEventKind,
@@ -18,6 +20,7 @@ from colmat_x.automation import (  # noqa: E402
     AutomationMode,
     AutomationSlot,
     ClaimDecision,
+    DailyAutomation,
     DraftCandidate,
     GeneratedMedia,
     GenerationRequest,
@@ -152,13 +155,24 @@ def make_media(
     )
 
 
-def make_prepared(policy, *, slot: AutomationSlot | None = None, media=True):
+def make_prepared(
+    policy,
+    *,
+    slot: AutomationSlot | None = None,
+    media=True,
+    editorial_line: bool = False,
+):
     claim = make_claim(slot)
     draft = make_draft(policy)
     candidate = DraftCandidate(
         draft=draft,
         evidence_verified=claim.slot.evidence_verified,
         evidence_reference=claim.slot.evidence_reference,
+        editorial_line_month="2026-08" if editorial_line else None,
+        editorial_line_version=3 if editorial_line else None,
+        editorial_line_sha256=(
+            hashlib.sha256(b"linea mensual").hexdigest() if editorial_line else None
+        ),
     )
     return PreparedAutomation(
         claim=claim,
@@ -284,7 +298,7 @@ def bootstrap_services(store: PlatformStore, *, direct: bool, monkeypatch):
     return owner, scheduler, author, reviewer, publisher
 
 
-def make_repository(store, services, tmp_path):
+def make_repository(store, services, tmp_path, *, retry_run_ids=None):
     _owner, scheduler, author, _reviewer, _publisher = services
     return PlatformAutomationRepository(
         store,
@@ -294,6 +308,7 @@ def make_repository(store, services, tmp_path):
         review_chat_id=REVIEW_CHAT_ID,
         media_root=tmp_path / "persistent-media",
         clock=lambda: NOW,
+        retry_run_ids=retry_run_ids,
     )
 
 
@@ -334,6 +349,67 @@ def test_minimax_generator_uses_slot_evidence_only_and_fixed_policy(policy) -> N
     assert "cifra='25,2 %'" in args[0]
     assert "fuente='DANE 2024'" in args[0]
     assert kwargs == {"category": slot.category, "institution": slot.institution}
+
+
+def test_minimax_generator_prepends_versioned_monthly_editorial_line(policy) -> None:
+    draft = make_draft(policy)
+    client = FakeMiniMax(draft)
+    requested_months: list[str] = []
+
+    def resolve_line(month: str) -> tuple[str, int]:
+        requested_months.append(month)
+        return "Analizar conflictos históricos desde el materialismo filosófico.", 3
+
+    generator = MiniMaxAutomationGenerator(
+        client,
+        policy=policy,
+        editorial_line_resolver=resolve_line,
+    )
+    claim = make_claim()
+    candidate = generator.generate_draft(
+        GenerationRequest(
+            claim=claim,
+            brief=claim.slot.brief,
+            category=claim.slot.category,
+            institution=claim.slot.institution,
+        )
+    )
+
+    assert requested_months == ["2026-08"]
+    prompt = client.draft_calls[0][0][0]
+    assert prompt.startswith("Línea editorial mensual humana obligatoria")
+    assert "mes=2026-08; versión=3" in prompt
+    assert prompt.index("materialismo filosófico") < prompt.index(claim.slot.brief)
+    assert candidate.editorial_line_month == "2026-08"
+    assert candidate.editorial_line_version == 3
+    assert (
+        candidate.editorial_line_sha256
+        == hashlib.sha256(
+            "Analizar conflictos históricos desde el materialismo filosófico.".encode()
+        ).hexdigest()
+    )
+
+
+def test_minimax_generator_fails_before_network_when_monthly_line_is_missing(policy) -> None:
+    client = FakeMiniMax(make_draft(policy))
+    generator = MiniMaxAutomationGenerator(
+        client,
+        policy=policy,
+        editorial_line_resolver=lambda _month: None,
+    )
+    claim = make_claim()
+
+    with pytest.raises(AutomationGenerationError, match="No existe línea editorial"):
+        generator.generate_draft(
+            GenerationRequest(
+                claim=claim,
+                brief=claim.slot.brief,
+                category=claim.slot.category,
+                institution=claim.slot.institution,
+            )
+        )
+
+    assert client.draft_calls == []
 
 
 def test_minimax_generator_downgrades_verified_slot_when_output_changes_evidence(policy) -> None:
@@ -408,6 +484,56 @@ def test_repository_claim_is_duplicate_safe_with_frozen_clock_and_maps_daily_lim
         repository.get_record("missing-key")
 
 
+def test_repository_duplicate_reports_persisted_unhealthy_status(
+    store,
+    policy,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    services = bootstrap_services(store, direct=False, monkeypatch=monkeypatch)
+    repository = make_repository(store, services, tmp_path)
+    claim = make_claim()
+    assert repository.claim_slot(claim, daily_limit=1) is ClaimDecision.CLAIMED
+    repository.mark_failed(claim.idempotency_key, reason="fallo controlado", ambiguous=False)
+
+    assert repository.claim_slot(claim, daily_limit=1) is ClaimDecision.DUPLICATE_FAILED
+
+
+def test_repository_claims_explicit_historical_retry_by_run_id(
+    store, policy, tmp_path, monkeypatch
+) -> None:
+    services = bootstrap_services(store, direct=False, monkeypatch=monkeypatch)
+    owner, scheduler, *_rest = services
+    first_repository = make_repository(store, services, tmp_path)
+    claim = make_claim()
+    assert first_repository.claim_slot(claim, daily_limit=1) is ClaimDecision.CLAIMED
+    first_repository.mark_failed(
+        claim.idempotency_key,
+        reason="Fallo confirmado antes del borrador",
+        ambiguous=False,
+    )
+    run = store.list_automation_runs(actor_id=owner.id)[0]
+    store.request_automation_run_retry(
+        run.id,
+        actor_id=scheduler.id,
+        now=NOW,
+    )
+
+    retry_repository = make_repository(
+        store,
+        services,
+        tmp_path,
+        retry_run_ids={claim.idempotency_key: run.id},
+    )
+
+    assert retry_repository.claim_retry_slot(claim, daily_limit=1) is ClaimDecision.CLAIMED
+    reclaimed = store.list_automation_runs(actor_id=owner.id)[0]
+    assert reclaimed.id == run.id
+    assert reclaimed.attempt_count == 2
+    assert reclaimed.status_value is AutomationRunStatus.CLAIMED
+    assert reclaimed.retry_requested_at is None
+
+
 def test_repository_persists_content_addressed_media_and_holds_for_review(
     store, policy, tmp_path, monkeypatch
 ) -> None:
@@ -446,6 +572,66 @@ def test_repository_persists_content_addressed_media_and_holds_for_review(
     run = store.list_automation_runs(actor_id=owner.id)[0]
     assert run.status_value is AutomationRunStatus.AWAITING_REVIEW
     assert run.draft_id == record.draft_id
+
+
+def test_repository_persists_editorial_line_version_in_draft_evidence(
+    store, policy, tmp_path, monkeypatch
+) -> None:
+    services = bootstrap_services(store, direct=False, monkeypatch=monkeypatch)
+    owner, *_rest = services
+    repository = make_repository(store, services, tmp_path)
+    prepared = make_prepared(policy, media=False, editorial_line=True)
+    assert repository.claim_slot(prepared.claim, daily_limit=1) is ClaimDecision.CLAIMED
+
+    repository.save_prepared(prepared)
+    record = repository.get_record(prepared.claim.idempotency_key)
+    revision = store.get_current_revision(record.draft_id, actor_id=owner.id)
+
+    assert revision.evidence["editorial_line"] == {
+        "month": "2026-08",
+        "version": 3,
+        "sha256": hashlib.sha256(b"linea mensual").hexdigest(),
+    }
+
+
+def test_daily_automation_preserves_editorial_line_in_persisted_evidence(
+    store, policy, tmp_path, monkeypatch
+) -> None:
+    services = bootstrap_services(store, direct=False, monkeypatch=monkeypatch)
+    owner, *_rest = services
+    repository = make_repository(store, services, tmp_path)
+    scheduled_slot = make_slot()
+    line = "Analizar conflictos históricos desde el materialismo filosófico."
+    generator = MiniMaxAutomationGenerator(
+        FakeMiniMax(make_draft(policy)),
+        policy=policy,
+        editorial_line_resolver=lambda month: (line, 3) if month == "2026-08" else None,
+    )
+    automation = DailyAutomation(
+        config=AutomationConfig(
+            version=1,
+            timezone=AUTOMATION_TIMEZONE,
+            daily_limit=1,
+            direct_enabled=False,
+            direct_min_engagement_score=85,
+            slots=(scheduled_slot,),
+        ),
+        policy=policy,
+        generator=generator,
+        repository=repository,
+        notifier=SimpleNamespace(notify=lambda _event: None),
+    )
+
+    results = automation.run_due(now=NOW, environ={})
+
+    assert len(results) == 1
+    record = repository.get_record(results[0].idempotency_key)
+    revision = store.get_current_revision(record.draft_id, actor_id=owner.id)
+    assert revision.evidence["editorial_line"] == {
+        "month": "2026-08",
+        "version": 3,
+        "sha256": hashlib.sha256(line.encode()).hexdigest(),
+    }
 
 
 def test_repository_maps_block_failure_and_unknown_without_leaking_secret(
@@ -659,6 +845,7 @@ def test_direct_publisher_marks_ambiguous_and_never_retries(
     run = store.list_automation_runs(actor_id=owner.id)[0]
     assert run.status_value is AutomationRunStatus.UNKNOWN
     assert "must-not-leak" not in run.error
+    assert repository.claim_slot(prepared.claim, daily_limit=1) is ClaimDecision.DUPLICATE_UNKNOWN
 
 
 @pytest.mark.parametrize(

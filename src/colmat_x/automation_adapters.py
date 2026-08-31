@@ -124,16 +124,61 @@ class _UniqueUtcClock:
 class MiniMaxAutomationGenerator:
     """Adapta MiniMax al puerto de generación sin concederle autoridad editorial."""
 
-    def __init__(self, client: MiniMaxClient, *, policy: EditorialPolicy) -> None:
+    def __init__(
+        self,
+        client: MiniMaxClient,
+        *,
+        policy: EditorialPolicy,
+        editorial_line_resolver: Callable[[str], tuple[str, int] | None] | None = None,
+    ) -> None:
         if not isinstance(policy, EditorialPolicy):
             raise TypeError("policy debe ser una EditorialPolicy validada")
+        if editorial_line_resolver is not None and not callable(editorial_line_resolver):
+            raise TypeError("editorial_line_resolver debe ser invocable")
         self.client = client
         self.policy = policy
+        self.editorial_line_resolver = editorial_line_resolver
 
     def generate_draft(self, request: GenerationRequest) -> DraftCandidate:
         if not isinstance(request, GenerationRequest):
             raise TypeError("request debe ser GenerationRequest")
         model_brief = request.brief
+        editorial_month: str | None = None
+        editorial_version: int | None = None
+        editorial_sha256: str | None = None
+        if self.editorial_line_resolver is not None:
+            editorial_month = f"{request.claim.local_date:%Y-%m}"
+            resolved_line = self.editorial_line_resolver(editorial_month)
+            if resolved_line is None:
+                raise AutomationGenerationError(
+                    f"No existe línea editorial para el mes {editorial_month}"
+                )
+            if not isinstance(resolved_line, tuple) or len(resolved_line) != 2:
+                raise AutomationGenerationError("La línea editorial resuelta no es válida")
+            line_text, editorial_version = resolved_line
+            if not isinstance(line_text, str) or any(
+                ord(character) < 32 and character not in "\n\t" for character in line_text
+            ):
+                raise AutomationGenerationError("El texto de la línea editorial no es válido")
+            line_text = " ".join(line_text.split())
+            if not 1 <= len(line_text) <= 600:
+                raise AutomationGenerationError(
+                    "La línea editorial debe tener entre 1 y 600 caracteres"
+                )
+            if (
+                isinstance(editorial_version, bool)
+                or not isinstance(editorial_version, int)
+                or editorial_version < 1
+            ):
+                raise AutomationGenerationError("La versión de la línea editorial no es válida")
+            editorial_sha256 = hashlib.sha256(line_text.encode("utf-8")).hexdigest()
+            model_brief = (
+                "Línea editorial mensual humana obligatoria "
+                f"(mes={editorial_month}; versión={editorial_version}; "
+                "contextualiza el encargo y no autoriza publicación):\n"
+                f"{line_text}\n\n"
+                f"Encargo autónomo del slot:\n{request.brief}"
+            )
         if request.claim.slot.evidence_verified:
             model_brief = (
                 f"{model_brief}\n\n"
@@ -159,6 +204,9 @@ class MiniMaxAutomationGenerator:
             draft=draft,
             evidence_verified=verified,
             evidence_reference=reference,
+            editorial_line_month=editorial_month,
+            editorial_line_version=editorial_version,
+            editorial_line_sha256=editorial_sha256,
         )
 
     def generate_image(self, request: ImageGenerationRequest) -> GeneratedMedia:
@@ -199,6 +247,7 @@ class PlatformAutomationRepository:
         media_root: Path = DEFAULT_MEDIA_ROOT,
         workspace_id: str = "colmat",
         clock: Callable[[], datetime] | None = None,
+        retry_run_ids: Mapping[str, str] | None = None,
     ) -> None:
         self.store = store
         self.scheduler_actor_id = _required_identifier(scheduler_actor_id, "scheduler_actor_id")
@@ -212,6 +261,12 @@ class PlatformAutomationRepository:
         self.workspace_id = _required_identifier(workspace_id, "workspace_id")
         self.media_root = require_trusted_media_root(media_root)
         self._clock = _UniqueUtcClock(clock or (lambda: datetime.now(UTC)))
+        self.retry_run_ids = {
+            _required_identifier(key, "retry idempotency_key"): _required_identifier(
+                run_id, "retry run_id"
+            )
+            for key, run_id in (retry_run_ids or {}).items()
+        }
         self._records: dict[str, StoredAutomation] = {}
         self._records_lock = threading.RLock()
 
@@ -232,6 +287,29 @@ class PlatformAutomationRepository:
                 raise ValueError("El destino de revisión ya fue configurado con otra identidad")
 
     def claim_slot(self, claim: SlotClaim, *, daily_limit: int) -> ClaimDecision:
+        return self._claim_slot(
+            claim,
+            daily_limit=daily_limit,
+            expected_retry_run_id=self.retry_run_ids.get(claim.idempotency_key),
+        )
+
+    def claim_retry_slot(self, claim: SlotClaim, *, daily_limit: int) -> ClaimDecision:
+        expected_run_id = self.retry_run_ids.get(claim.idempotency_key)
+        if expected_run_id is None:
+            raise AutomationError("El retry no fue autorizado por un run persistido")
+        return self._claim_slot(
+            claim,
+            daily_limit=daily_limit,
+            expected_retry_run_id=expected_run_id,
+        )
+
+    def _claim_slot(
+        self,
+        claim: SlotClaim,
+        *,
+        daily_limit: int,
+        expected_retry_run_id: str | None,
+    ) -> ClaimDecision:
         if not isinstance(claim, SlotClaim):
             raise TypeError("claim debe ser SlotClaim")
         if isinstance(daily_limit, bool) or not isinstance(daily_limit, int) or daily_limit < 1:
@@ -247,6 +325,7 @@ class PlatformAutomationRepository:
                 mode=claim.slot.mode.value,
                 workspace_id=self.workspace_id,
                 now=claim_now,
+                expected_retry_run_id=expected_retry_run_id,
             )
         except ConflictError as exc:
             if "max_posts_per_day" in str(exc):
@@ -254,6 +333,10 @@ class PlatformAutomationRepository:
             raise
 
         if not _same_instant(run.claimed_at, claim_now):
+            if run.status_value is AutomationRunStatus.FAILED:
+                return ClaimDecision.DUPLICATE_FAILED
+            if run.status_value is AutomationRunStatus.UNKNOWN:
+                return ClaimDecision.DUPLICATE_UNKNOWN
             return ClaimDecision.DUPLICATE
         record = StoredAutomation(run_id=run.id, claim=claim)
         with self._records_lock:
@@ -284,6 +367,12 @@ class PlatformAutomationRepository:
                 "expected_source": prepared.claim.slot.evidence_expected_source,
             },
         }
+        if prepared.candidate.editorial_line_month is not None:
+            evidence["editorial_line"] = {
+                "month": prepared.candidate.editorial_line_month,
+                "version": prepared.candidate.editorial_line_version,
+                "sha256": prepared.candidate.editorial_line_sha256,
+            }
         media_path: Path | None = None
         image: dict[str, object] | None = None
         if prepared.media is not None:

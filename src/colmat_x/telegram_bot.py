@@ -17,7 +17,18 @@ _CALLBACK_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,48}$")
 _COMMAND_PATTERN = re.compile(r"^/([a-zA-Z0-9_]+)(?:@[A-Za-z0-9_]{5,32})?$")
 _POST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 _SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_PLATFORM_USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,35}$")
+_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 MAX_TELEGRAM_INTEGER = 9_223_372_036_854_775_807
+TELEGRAM_DELEGATABLE_ROLES = frozenset({"editor", "reviewer", "publisher", "scheduler", "auditor"})
+RESEARCH_PATTERN_STEPS = (
+    "Formular la pregunta o tesis de trabajo.",
+    "Usar hechos y cifras solo de fuentes aportadas o del registro canónico.",
+    "Separar explícitamente hechos e inferencias.",
+    "Incluir un contraste o una posible refutación.",
+    "Cerrar con una síntesis apta para una futura pieza en X.",
+    "No fabricar citas, referencias, cifras ni fuentes.",
+)
 
 
 class WebhookAuthenticationError(PermissionError):
@@ -64,6 +75,10 @@ class BotPermission(StrEnum):
     ACCESS = "telegram.access"
     VIEW_STATUS = "telegram.status.view"
     VIEW_TEAM = "telegram.team.view"
+    MANAGE_TEAM = "telegram.team.manage.owner"
+    VIEW_EDITORIAL_LINE = "editorial.line.view"
+    MANAGE_EDITORIAL_LINE = "editorial.line.manage.owner"
+    RESEARCH = "research.request"
     VIEW_CALENDAR = "calendar.view"
     MANAGE_MODE = "automation.mode.manage"
     GENERATE = "content.generate"
@@ -175,6 +190,63 @@ class TelegramBotOperations(Protocol):
     def get_status(self, *, telegram_user_id: int, chat_id: int) -> str: ...
 
     def get_team(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def list_telegram_users(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def invite_telegram_user(
+        self,
+        target_telegram_user_id: int,
+        role: str,
+        email: str,
+        display_name: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Crea una membresía con rol acotado y un vínculo privado por ID numérico."""
+
+    def bind_telegram_user(
+        self,
+        target_telegram_user_id: int,
+        user_id: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Vincula una membresía existente a un ID numérico en su chat privado."""
+
+    def get_editorial_line(
+        self,
+        month: str | None,
+        *,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> str: ...
+
+    def set_editorial_line(
+        self,
+        month: str,
+        text: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Fija una línea mensual; no genera, aprueba ni publica contenido."""
+
+    def research_topic(
+        self,
+        topic: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Encola una investigación para el worker; nunca llama IA o X en el webhook."""
+
+    def get_research_patterns(self, *, telegram_user_id: int, chat_id: int) -> str: ...
 
     def get_calendar(
         self,
@@ -335,6 +407,20 @@ class _ParsedCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class _TelegramInvitation:
+    telegram_user_id: int
+    role: str
+    email: str
+    display_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TelegramBindingRequest:
+    telegram_user_id: int
+    user_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class _CallbackEvent:
     actor: _Actor
     callback_query_id: str
@@ -463,13 +549,21 @@ class TelegramWebhookProcessor:
                 "Comandos disponibles:\n"
                 "/estado — estado editorial y operativo\n"
                 "/equipo — integrantes y roles visibles\n"
+                "/usuarios — IDs y vínculos de Telegram (solo owner, chat privado)\n"
+                "/invitar <telegram_id> <rol> <correo> <nombre> — alta segura (solo owner)\n"
+                "/vincular <telegram_id> <user_id> — vincular una cuenta existente "
+                "(solo owner)\n"
+                "/linea [AAAA-MM <texto>] — consultar o fijar la línea editorial mensual\n"
+                "/patrones — mostrar el método de investigación y sus límites\n"
+                "/investigar <tema> — encolar investigación según la línea mensual\n"
                 "/calendario [días] — agenda de los próximos 1-31 días\n"
                 "/modo [human_review|direct] — consultar o solicitar un modo operativo\n"
                 "/generar <brief> — crear un borrador sujeto a revisión\n"
                 "/publicar <id> — solicitar la cola de un borrador ya aprobado\n"
                 "/ayuda — esta guía\n"
-                "El bot no crea usuarios. El modo direct exige autorización y doble compuerta; "
-                "el webhook no llama a X."
+                "Las altas usan from.id numérico, un chat privado y roles separados; nunca se "
+                "confía en @username. El modo direct exige autorización y doble compuerta; el "
+                "webhook no llama a X."
             )
         elif command == "estado":
             if argument:
@@ -486,6 +580,105 @@ class TelegramWebhookProcessor:
             if not self._allowed(event.actor, BotPermission.VIEW_TEAM):
                 return (self._forbidden_message(event, "consultar el equipo"),)
             text = self._operations.get_team(
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+        elif command == "usuarios":
+            if argument:
+                return (self._usage_message(event, "/usuarios"),)
+            if not self._allowed(event.actor, BotPermission.MANAGE_TEAM):
+                return (self._forbidden_message(event, "administrar usuarios de Telegram"),)
+            if not _is_private_actor_chat(event.actor):
+                return (self._private_management_message(event),)
+            text = self._operations.list_telegram_users(
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+        elif command == "invitar":
+            if not self._allowed(event.actor, BotPermission.MANAGE_TEAM):
+                return (self._forbidden_message(event, "administrar usuarios de Telegram"),)
+            if not _is_private_actor_chat(event.actor):
+                return (self._private_management_message(event),)
+            invitation = _telegram_invitation(argument)
+            if invitation is None:
+                return (
+                    self._usage_message(
+                        event,
+                        "/invitar <telegram_id> "
+                        "<editor|reviewer|publisher|scheduler|auditor> <correo> <nombre>",
+                    ),
+                )
+            result = self._operations.invite_telegram_user(
+                invitation.telegram_user_id,
+                invitation.role,
+                invitation.email,
+                invitation.display_name,
+                request_id=_request_id(update_id, command),
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+            text = result.text
+        elif command == "vincular":
+            if not self._allowed(event.actor, BotPermission.MANAGE_TEAM):
+                return (self._forbidden_message(event, "administrar usuarios de Telegram"),)
+            if not _is_private_actor_chat(event.actor):
+                return (self._private_management_message(event),)
+            binding = _telegram_binding_request(argument)
+            if binding is None:
+                return (self._usage_message(event, "/vincular <telegram_id> <user_id>"),)
+            result = self._operations.bind_telegram_user(
+                binding.telegram_user_id,
+                binding.user_id,
+                request_id=_request_id(update_id, command),
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+            text = result.text
+        elif command == "linea":
+            editorial_line = _editorial_line_argument(argument)
+            if not argument:
+                if not self._allowed(event.actor, BotPermission.VIEW_EDITORIAL_LINE):
+                    return (self._forbidden_message(event, "consultar la línea editorial"),)
+                text = self._operations.get_editorial_line(
+                    None,
+                    telegram_user_id=event.actor.telegram_user_id,
+                    chat_id=event.actor.chat_id,
+                )
+            elif editorial_line is None:
+                return (self._usage_message(event, "/linea [AAAA-MM <texto>]"),)
+            else:
+                if not self._allowed(event.actor, BotPermission.MANAGE_EDITORIAL_LINE):
+                    return (self._forbidden_message(event, "fijar la línea editorial"),)
+                if not _is_private_actor_chat(event.actor):
+                    return (self._private_management_message(event),)
+                month, line_text = editorial_line
+                result = self._operations.set_editorial_line(
+                    month,
+                    line_text,
+                    request_id=_request_id(update_id, command),
+                    telegram_user_id=event.actor.telegram_user_id,
+                    chat_id=event.actor.chat_id,
+                )
+                text = result.text
+        elif command == "investigar":
+            if not self._allowed(event.actor, BotPermission.RESEARCH):
+                return (self._forbidden_message(event, "asignar investigaciones"),)
+            topic = _research_topic(argument)
+            if topic is None:
+                return (self._usage_message(event, "/investigar <tema>"),)
+            result = self._operations.research_topic(
+                topic,
+                request_id=_request_id(update_id, command),
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+            )
+            text = result.text
+        elif command == "patrones":
+            if argument:
+                return (self._usage_message(event, "/patrones"),)
+            if not self._allowed(event.actor, BotPermission.RESEARCH):
+                return (self._forbidden_message(event, "consultar los patrones"),)
+            text = self._operations.get_research_patterns(
                 telegram_user_id=event.actor.telegram_user_id,
                 chat_id=event.actor.chat_id,
             )
@@ -734,6 +927,15 @@ class TelegramWebhookProcessor:
             telegram_user_id=event.actor.telegram_user_id,
             chat_id=event.actor.chat_id,
             text=f"Uso: {usage}",
+            reply_to_message_id=event.message_id,
+        )
+
+    @staticmethod
+    def _private_management_message(event: _MessageEvent) -> SendMessage:
+        return SendMessage(
+            telegram_user_id=event.actor.telegram_user_id,
+            chat_id=event.actor.chat_id,
+            text="Por seguridad, administra usuarios únicamente en el chat privado con el bot.",
             reply_to_message_id=event.message_id,
         )
 
@@ -1223,6 +1425,71 @@ def _generation_brief(argument: str) -> str | None:
     if any(ord(character) < 32 for character in normalized):
         return None
     return normalized
+
+
+def _telegram_invitation(argument: str) -> _TelegramInvitation | None:
+    parts = argument.split(maxsplit=3)
+    if len(parts) != 4:
+        return None
+    telegram_user_id = _telegram_user_id_argument(parts[0])
+    role = parts[1].casefold()
+    email = parts[2].casefold()
+    display_name = " ".join(parts[3].split())
+    if (
+        telegram_user_id is None
+        or role not in TELEGRAM_DELEGATABLE_ROLES
+        or len(email) > 320
+        or _EMAIL_PATTERN.fullmatch(email) is None
+        or not display_name
+        or len(display_name) > 120
+        or any(ord(character) < 32 for character in display_name)
+    ):
+        return None
+    return _TelegramInvitation(telegram_user_id, role, email, display_name)
+
+
+def _telegram_binding_request(argument: str) -> _TelegramBindingRequest | None:
+    parts = argument.split()
+    if len(parts) != 2:
+        return None
+    telegram_user_id = _telegram_user_id_argument(parts[0])
+    user_id = parts[1]
+    if (
+        telegram_user_id is None
+        or len(user_id) > 36
+        or _PLATFORM_USER_ID_PATTERN.fullmatch(user_id) is None
+    ):
+        return None
+    return _TelegramBindingRequest(telegram_user_id, user_id)
+
+
+def _telegram_user_id_argument(value: str) -> int | None:
+    if re.fullmatch(r"[1-9][0-9]{0,18}", value) is None:
+        return None
+    parsed = int(value)
+    return parsed if parsed <= MAX_TELEGRAM_INTEGER else None
+
+
+def _editorial_line_argument(argument: str) -> tuple[str, str] | None:
+    parts = argument.split(maxsplit=1)
+    if len(parts) != 2 or re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", parts[0]) is None:
+        return None
+    line_text = " ".join(parts[1].split())
+    if not line_text or len(line_text) > 600 or any(ord(character) < 32 for character in line_text):
+        return None
+    return parts[0], line_text
+
+
+def _research_topic(argument: str) -> str | None:
+    topic = " ".join(argument.split())
+    if not topic or len(topic) > 300 or any(ord(character) < 32 for character in topic):
+        return None
+    return topic
+
+
+def _is_private_actor_chat(actor: _Actor) -> bool:
+    # Telegram usa el mismo ID numérico para from.id y el chat privado con el bot.
+    return actor.chat_id == actor.telegram_user_id
 
 
 def _publication_post_id(argument: str) -> str | None:

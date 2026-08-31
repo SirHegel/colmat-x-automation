@@ -338,7 +338,12 @@
                   {% endif %}
                 </details>
 
-                {% if draft.requires_telegram_review %}
+                {% if draft.research_only %}
+                  <div class="notice notice--info draft-review-note" role="note">
+                    Síntesis exploratoria no publicable. Verifica sus hallazgos y crea una pieza
+                    separada con <code>/generar</code>; este panel no permite aprobarla ni publicarla.
+                  </div>
+                {% elif draft.requires_telegram_review %}
                   <div class="notice notice--info draft-review-note" role="note">
                     Esta revisión incluye una imagen. Apruébala, recházala o publícala desde
                     Telegram, donde se muestra el material visual exacto.

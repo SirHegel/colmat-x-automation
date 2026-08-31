@@ -5,11 +5,12 @@ import os
 import stat
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -61,6 +62,7 @@ from colmat_x.platform_store import (
     PlatformStore,
     PlatformStoreError,
     User,
+    resolve_database_url,
 )
 from colmat_x.publication_worker import QueuedPublicationWorker, QueuePublicationStatus
 from colmat_x.rbac import AuthorizationError, Role, require_role_assignment
@@ -83,9 +85,18 @@ app = typer.Typer(
 )
 
 AUTOMATION_RUN_RECONCILIATION_GRACE = timedelta(minutes=30)
+MINIMAX_ENV_FILE_VARIABLE = "COLMAT_MINIMAX_ENV_FILE"
+MINIMAX_SECRET_VARIABLE = "MINIMAX_API_KEY"
+MINIMAX_ENV_FILE_MAX_BYTES = 4096
 TELEGRAM_CONTROL_COMMANDS = (
     BotCommand("estado", "Consultar estado editorial y automatización"),
     BotCommand("equipo", "Ver usuarios y roles del equipo"),
+    BotCommand("usuarios", "Listar IDs y vínculos; solo owner"),
+    BotCommand("invitar", "Crear miembro por ID numérico; solo owner"),
+    BotCommand("vincular", "Vincular un miembro por IDs; solo owner"),
+    BotCommand("linea", "Consultar o fijar la línea editorial mensual"),
+    BotCommand("patrones", "Consultar el patrón de síntesis exploratoria"),
+    BotCommand("investigar", "Encolar una síntesis no publicable"),
     BotCommand("calendario", "Consultar la agenda de publicaciones"),
     BotCommand("modo", "Ver o cambiar revisión humana/directo"),
     BotCommand("generar", "Crear un borrador con MiniMax"),
@@ -834,16 +845,56 @@ def automation_status(
                 "mode": run.mode,
                 "settings_version": run.settings_version,
                 "slot_hash": run.slot_hash,
+                "attempt_count": run.attempt_count,
                 "status": run.status,
                 "draft_id": run.draft_id,
                 "error": run.error,
                 "claimed_at": run.claimed_at.isoformat(),
                 "finished_at": _iso_or_none(run.finished_at),
+                "retry_requested_at": _iso_or_none(run.retry_requested_at),
+                "retry_requested_by": run.retry_requested_by,
             }
             for run in runs
         ],
     }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@app.command("automation-retry")
+def automation_retry(
+    run_id: Annotated[
+        str,
+        typer.Argument(help="ID del run failed que se reencolará sin cambiar su idempotency key."),
+    ],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner, admin o scheduler que solicita el reintento."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Solicita un nuevo intento seguro; no ejecuta MiniMax ni publica."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            run = store.request_automation_run_retry(run_id, actor_id=actor_id)
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        json.dumps(
+            {
+                "attempt_count": run.attempt_count,
+                "id": run.id,
+                "idempotency_key": run.idempotency_key,
+                "retry_requested_at": _iso_or_none(run.retry_requested_at),
+                "retry_requested_by": run.retry_requested_by,
+                "status": run.status,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("automation-sync")
@@ -1030,7 +1081,7 @@ def automation_run(
         scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
         media_root = configured_worker_media_root(os.getenv("COLMAT_AUTOMATION_MEDIA_ROOT"))
         telegram: TelegramApiClient | None = None
-        with PlatformStore(database_url) as store:
+        with _worker_platform_store(database_url) as store:
             reconciliation_now = datetime.now(UTC)
             store.reconcile_stale_automation_runs(
                 actor_id=scheduler_actor_id,
@@ -1113,6 +1164,9 @@ def automation_run(
                 _require_direct_worker_preflight(live=live)
 
             author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
+            pending_retries = store.list_pending_automation_retries(
+                actor_id=scheduler_actor_id,
+            )
             telegram_chat_id = _required_worker_environment("COLMAT_TELEGRAM_ALERT_CHAT_ID")
             reviewer_telegram_user_id = _required_worker_environment(
                 "COLMAT_TELEGRAM_REVIEWER_USER_ID"
@@ -1124,6 +1178,7 @@ def automation_run(
                 scheduler_actor_id=scheduler_actor_id,
                 author_actor_id=author_actor_id,
                 media_root=media_root,
+                retry_run_ids={item.idempotency_key: item.id for item in pending_retries},
             )
             notifier = TelegramAutomationNotifier(
                 telegram,
@@ -1133,7 +1188,18 @@ def automation_run(
                 reviewer_telegram_user_id=reviewer_telegram_user_id,
                 actor_id=scheduler_actor_id,
             )
-            generator = MiniMaxAutomationGenerator(MiniMaxClient(), policy=policy)
+
+            def resolve_editorial_line(month: str) -> tuple[str, int] | None:
+                editorial_line = store.get_editorial_line(month, actor_id=author_actor_id)
+                if editorial_line is None:
+                    return None
+                return editorial_line.line_text, editorial_line.version
+
+            generator = MiniMaxAutomationGenerator(
+                MiniMaxClient(),
+                policy=policy,
+                editorial_line_resolver=resolve_editorial_line,
+            )
 
             publisher = None
             if direct_mode:
@@ -1153,14 +1219,66 @@ def automation_run(
                     environ=os.environ,
                 )
 
-            results = DailyAutomation(
+            automation = DailyAutomation(
                 config=schedule,
                 policy=policy,
                 generator=generator,
                 repository=repository,
                 notifier=notifier,
                 publisher=publisher,
-            ).run_due(environ=os.environ, progress=_emit_automation_progress)
+            )
+            due_results = automation.run_due(
+                environ=os.environ,
+                progress=_emit_automation_progress,
+            )
+            results_list = list(due_results)
+            processed_keys = {item.idempotency_key for item in due_results}
+            retry_scan_failures: list[dict[str, str]] = []
+            for pending_retry in pending_retries:
+                if pending_retry.idempotency_key in processed_keys:
+                    store.cancel_automation_run_retry(
+                        pending_retry.id,
+                        actor_id=scheduler_actor_id,
+                        reason="El run_due no pudo consumir el retry en esta ejecución.",
+                    )
+                    continue
+                retry_local_date = pending_retry.scheduled_for.astimezone(schedule.zoneinfo).date()
+                try:
+                    retry_result = automation.run_retry(
+                        slot_id=pending_retry.slot_id,
+                        local_date=retry_local_date,
+                        idempotency_key=pending_retry.idempotency_key,
+                        environ=os.environ,
+                        progress=_emit_automation_progress,
+                    )
+                except (AutomationConfigurationError, ValueError) as exc:
+                    store.cancel_automation_run_retry(
+                        pending_retry.id,
+                        actor_id=scheduler_actor_id,
+                        reason=(
+                            "El retry dejó de coincidir con la agenda vigente: "
+                            f"{type(exc).__name__}"
+                        ),
+                    )
+                    retry_scan_failures.append(
+                        {
+                            "idempotency_key": pending_retry.idempotency_key,
+                            "run_id": pending_retry.id,
+                            "status": "cancelled_invalid_schedule",
+                        }
+                    )
+                    continue
+                results_list.append(retry_result)
+                processed_keys.add(retry_result.idempotency_key)
+                # Si el claim falló antes de consumir la solicitud, no se deja un
+                # flag que vuelva a cruzar otra medianoche. Cuando sí se consumió,
+                # esta operación es un no-op idempotente.
+                store.cancel_automation_run_retry(
+                    pending_retry.id,
+                    actor_id=scheduler_actor_id,
+                    reason="El scanner no pudo consumir el retry en esta ejecución.",
+                )
+            results = tuple(results_list)
     except (
         AutomationConfigurationError,
         AuthorizationError,
@@ -1191,6 +1309,7 @@ def automation_run(
             for item in review_notifications
         ],
         "settings_version": settings.version,
+        "retry_scan_failures": retry_scan_failures,
         "results": [
             {
                 "detail": result.detail,
@@ -1212,6 +1331,7 @@ def automation_run(
             item.status is not ReviewNotificationDeliveryStatus.SENT
             for item in review_notifications
         )
+        or bool(retry_scan_failures)
         or any(result.status in failed for result in results)
         or any(
             result.status in notification_required and not result.notification_delivered
@@ -1290,7 +1410,7 @@ def publication_run(
         scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
         publisher_actor_id = _required_worker_environment("COLMAT_AUTOMATION_PUBLISHER_ID")
         x_client = XApiClient(XCredentials.from_environment())
-        with PlatformStore(database_url) as store:
+        with _worker_platform_store(database_url) as store:
             results = QueuedPublicationWorker(
                 store=store,
                 x_client=x_client,
@@ -1360,7 +1480,7 @@ def generation_run(
         worker_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
         author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
         policy = load_editorial_policy(policy_path)
-        with PlatformStore(database_url) as store:
+        with _worker_platform_store(database_url) as store:
             results = QueuedGenerationWorker(
                 store=store,
                 minimax_client=MiniMaxClient(),
@@ -1429,6 +1549,13 @@ def _iso_or_none(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _worker_platform_store(database_url: str | None) -> PlatformStore:
+    """Abre workers sin privilegios DDL sobre PostgreSQL; SQLite local se auto-inicializa."""
+
+    resolved = resolve_database_url(database_url)
+    return PlatformStore(resolved, create_schema=resolved.startswith("sqlite"))
+
+
 def _emit_automation_progress(event: str, slot_id: str, status: str | None) -> None:
     payload: dict[str, object] = {
         "event": f"automation.slot_{event}",
@@ -1453,12 +1580,76 @@ def _load_trusted_worker_environment(path: Path | None) -> None:
         raise ConfigError("El archivo de entorno del worker pertenece a otro usuario")
     if metadata.st_mode & 0o077:
         raise ConfigError("El archivo de entorno del worker debe tener permisos 0600")
-    if not load_dotenv(
-        candidate.resolve(strict=True),
-        override=True,
-        interpolate=False,
-    ):
+    primary_values = dotenv_values(candidate.resolve(strict=True), interpolate=False)
+    assignments = {name: value for name, value in primary_values.items() if value is not None}
+    if not assignments:
         raise ConfigError("El archivo de entorno del worker está vacío o no pudo cargarse")
+    for name, value in assignments.items():
+        os.environ[name] = value
+
+    # La ruta se toma del mapping recién leído, nunca de os.environ: así un proceso
+    # padre no puede hacer que el worker siga una ruta que su env primario no declaró.
+    minimax_env_file = primary_values.get(MINIMAX_ENV_FILE_VARIABLE)
+    if minimax_env_file is None:
+        return
+    normalized_path = minimax_env_file.strip()
+    if not normalized_path:
+        raise ConfigError(f"{MINIMAX_ENV_FILE_VARIABLE} no puede estar vacío")
+    _load_trusted_minimax_environment(Path(normalized_path))
+
+
+def _load_trusted_minimax_environment(path: Path) -> None:
+    candidate = path.expanduser()
+    try:
+        metadata = candidate.lstat()
+    except OSError as exc:
+        raise ConfigError("No se pudo abrir el archivo de credencial MiniMax") from exc
+    _validate_minimax_environment_metadata(metadata)
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as exc:
+        raise ConfigError("No se pudo abrir el archivo de credencial MiniMax") from exc
+    try:
+        opened_metadata = os.fstat(descriptor)
+        _validate_minimax_environment_metadata(opened_metadata)
+        if (metadata.st_dev, metadata.st_ino) != (
+            opened_metadata.st_dev,
+            opened_metadata.st_ino,
+        ):
+            raise ConfigError("El archivo de credencial MiniMax cambió durante la lectura")
+        payload = os.read(descriptor, MINIMAX_ENV_FILE_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+
+    if len(payload) != opened_metadata.st_size:
+        raise ConfigError("El archivo de credencial MiniMax cambió durante la lectura")
+    try:
+        content = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError("El archivo de credencial MiniMax no es UTF-8 válido") from exc
+    significant_lines = [
+        line for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    ]
+    values = dotenv_values(stream=StringIO(content), interpolate=False)
+    if len(significant_lines) != 1 or set(values) != {MINIMAX_SECRET_VARIABLE}:
+        raise ConfigError("El archivo de credencial MiniMax debe contener solo MINIMAX_API_KEY")
+    secret = values[MINIMAX_SECRET_VARIABLE]
+    if secret is None or not secret.strip():
+        raise ConfigError("MINIMAX_API_KEY no puede estar vacía")
+    os.environ[MINIMAX_SECRET_VARIABLE] = secret
+
+
+def _validate_minimax_environment_metadata(metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ConfigError("El archivo de credencial MiniMax debe ser regular, no un enlace")
+    if not hasattr(os, "getuid") or metadata.st_uid != os.getuid():
+        raise ConfigError("El archivo de credencial MiniMax pertenece a otro usuario")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ConfigError("El archivo de credencial MiniMax debe tener permisos 0600 exactos")
+    if metadata.st_size < 1 or metadata.st_size > MINIMAX_ENV_FILE_MAX_BYTES:
+        raise ConfigError("El archivo de credencial MiniMax tiene un tamaño no permitido")
 
 
 def _required_worker_environment(name: str) -> str:

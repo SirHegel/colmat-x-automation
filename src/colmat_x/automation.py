@@ -39,6 +39,7 @@ DEFAULT_AUTOMATION_CONFIG_PATH = Path("config/automation.yaml")
 
 _SLOT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{1,49}$")
 _TIME_PATTERN = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+_EDITORIAL_MONTH_PATTERN = re.compile(r"^[0-9]{4}-(?:0[1-9]|1[0-2])$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 _ALLOWED_IMAGE_MIME_TYPES = SUPPORTED_IMAGE_MIME_TYPES
@@ -83,6 +84,8 @@ ALL_AUTOMATION_WEEKDAYS = tuple(AutomationWeekday)
 class ClaimDecision(StrEnum):
     CLAIMED = "claimed"
     DUPLICATE = "duplicate"
+    DUPLICATE_FAILED = "duplicate_failed"
+    DUPLICATE_UNKNOWN = "duplicate_unknown"
     DAILY_LIMIT = "daily_limit"
 
 
@@ -292,6 +295,9 @@ class DraftCandidate:
     draft: EditorialDraft
     evidence_verified: bool = False
     evidence_reference: str | None = None
+    editorial_line_month: str | None = None
+    editorial_line_version: int | None = None
+    editorial_line_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.draft, EditorialDraft):
@@ -312,6 +318,34 @@ class DraftCandidate:
             raise AutomationGenerationError(
                 "La verificación de evidencia requiere una referencia auditable"
             )
+        editorial_values = (
+            self.editorial_line_month,
+            self.editorial_line_version,
+            self.editorial_line_sha256,
+        )
+        if any(value is not None for value in editorial_values):
+            if not all(value is not None for value in editorial_values):
+                raise AutomationGenerationError(
+                    "La línea editorial exige mes, versión y SHA-256 juntos"
+                )
+            if (
+                not isinstance(self.editorial_line_month, str)
+                or _EDITORIAL_MONTH_PATTERN.fullmatch(self.editorial_line_month) is None
+            ):
+                raise AutomationGenerationError("El mes de la línea editorial no es canónico")
+            if (
+                isinstance(self.editorial_line_version, bool)
+                or not isinstance(self.editorial_line_version, int)
+                or self.editorial_line_version < 1
+            ):
+                raise AutomationGenerationError(
+                    "La versión de la línea editorial debe ser un entero positivo"
+                )
+            if (
+                not isinstance(self.editorial_line_sha256, str)
+                or _SHA256_PATTERN.fullmatch(self.editorial_line_sha256) is None
+            ):
+                raise AutomationGenerationError("La línea editorial requiere un SHA-256 canónico")
 
 
 @dataclass(frozen=True)
@@ -401,6 +435,8 @@ class AutomationRepository(Protocol):
 
     def claim_slot(self, claim: SlotClaim, *, daily_limit: int) -> ClaimDecision: ...
 
+    def claim_retry_slot(self, claim: SlotClaim, *, daily_limit: int) -> ClaimDecision: ...
+
     def save_prepared(self, prepared: PreparedAutomation) -> None: ...
 
     def mark_review_required(self, idempotency_key: str, *, reason: str) -> None: ...
@@ -480,12 +516,53 @@ class DailyAutomation:
                     progress("finished", slot.id, result.status.value)
         return tuple(results)
 
+    def run_retry(
+        self,
+        *,
+        slot_id: str,
+        local_date: date,
+        idempotency_key: str,
+        environ: Mapping[str, str] | None = None,
+        progress: Callable[[str, str, str | None], None] | None = None,
+    ) -> AutomationResult:
+        """Ejecuta únicamente un retry persistido; el repositorio debe cercarlo por run id."""
+
+        if isinstance(local_date, datetime) or not isinstance(local_date, date):
+            raise TypeError("local_date debe ser date")
+        slot = next((item for item in self.config.slots if item.id == slot_id), None)
+        if slot is None:
+            raise AutomationConfigurationError("El retry no pertenece a un slot vigente")
+        if not slot.runs_on(local_date):
+            raise AutomationConfigurationError(
+                "El retry no coincide con un día autorizado para el slot"
+            )
+        expected_key = slot_idempotency_key(local_date, slot.id)
+        if idempotency_key != expected_key:
+            raise AutomationConfigurationError(
+                "El retry no coincide con la fecha local y el slot persistidos"
+            )
+        environment = os.environ if environ is None else environ
+        if progress is not None:
+            with suppress(Exception):
+                progress("retry_started", slot.id, None)
+        result = self._run_slot(
+            slot,
+            local_date=local_date,
+            environment=environment,
+            retry=True,
+        )
+        if progress is not None:
+            with suppress(Exception):
+                progress("retry_finished", slot.id, result.status.value)
+        return result
+
     def _run_slot(
         self,
         slot: AutomationSlot,
         *,
         local_date: date,
         environment: Mapping[str, str],
+        retry: bool = False,
     ) -> AutomationResult:
         scheduled_for = datetime.combine(local_date, slot.at, tzinfo=self.config.zoneinfo)
         key = slot_idempotency_key(local_date, slot.id)
@@ -497,7 +574,8 @@ class DailyAutomation:
         )
 
         try:
-            decision = self.repository.claim_slot(claim, daily_limit=self.config.daily_limit)
+            claim_slot = self.repository.claim_retry_slot if retry else self.repository.claim_slot
+            decision = claim_slot(claim, daily_limit=self.config.daily_limit)
         except Exception as exc:  # una frontera de adaptador nunca debe romper el scheduler
             detail = _safe_failure("El claim del repositorio", exc)
             delivered = self._notify_failure(claim, detail, ambiguous=False)
@@ -513,6 +591,24 @@ class DailyAutomation:
                 claim,
                 AutomationStatus.SKIPPED_DUPLICATE,
                 "El slot ya fue reclamado para esta fecha local.",
+            )
+        if decision is ClaimDecision.DUPLICATE_FAILED:
+            return self._result(
+                claim,
+                AutomationStatus.FAILED,
+                (
+                    "El run persistido de este slot terminó en failed; "
+                    "requiere un reintento explícito y auditado."
+                ),
+            )
+        if decision is ClaimDecision.DUPLICATE_UNKNOWN:
+            return self._result(
+                claim,
+                AutomationStatus.UNKNOWN,
+                (
+                    "El run persistido de este slot tiene resultado unknown; "
+                    "requiere conciliación y no se reintentará automáticamente."
+                ),
             )
         if decision is ClaimDecision.DAILY_LIMIT:
             return self._result(
@@ -641,6 +737,9 @@ class DailyAutomation:
                 and evidence_matches
             ),
             evidence_reference=claim.slot.evidence_reference,
+            editorial_line_month=candidate.editorial_line_month,
+            editorial_line_version=candidate.editorial_line_version,
+            editorial_line_sha256=candidate.editorial_line_sha256,
         )
         assessment = assess_engagement(validated)
         media = None

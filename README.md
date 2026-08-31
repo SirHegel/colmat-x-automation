@@ -79,9 +79,13 @@ colmat-x ai-draft "Cifra y fuente ya verificadas para el dato semanal" \
   --institution escuela_colombiana_de_filosofia
 ```
 
-La clave se recibe solo por `MINIMAX_API_KEY`. Usa `MiniMax-M2.7` para texto e `image-01` para
-imagen salvo que la documentación oficial y las pruebas justifiquen otro modelo. Nunca subas una
-clave a Git; si apareció en un chat, log o captura, rótala antes de usar producción.
+La clave se recibe solo por `MINIMAX_API_KEY`. El texto usa por defecto
+`MINIMAX_API_STYLE=anthropic` contra el endpoint fijo oficial
+`https://api.minimax.io/anthropic/v1/messages`; `openai` queda disponible solo como compatibilidad
+explícita. La selección es una lista cerrada y no permite inyectar endpoints. La generación de
+imagen conserva su API propia. Usa `MiniMax-M2.7` para texto e `image-01` para imagen salvo que la
+documentación oficial y las pruebas justifiquen otro modelo. Nunca subas una clave a Git; si
+apareció en un chat, log o captura, rótala antes de usar producción.
 
 ## Equipo, jerarquía y Telegram
 
@@ -129,9 +133,16 @@ Telegram autentica por `from.id`, nunca por `username`, y exige además el chat 
 | `/start` | Confirma la conexión. |
 | `/estado` | Consulta el estado editorial y operativo. |
 | `/equipo` | Muestra integrantes y roles visibles. |
+| `/usuarios` | Lista `user_id`, rol y vínculos numéricos; solo owner y chat privado. |
+| `/invitar <telegram_id> <rol> <correo> <nombre>` | Crea atómicamente un miembro y su vínculo privado; solo owner. |
+| `/vincular <telegram_id> <user_id>` | Vincula un miembro existente por IDs reales; solo owner y chat privado. |
+| `/linea` | Consulta la línea editorial del mes; owner o editor. |
+| `/linea <AAAA-MM> <texto>` | Crea o versiona la línea mensual; solo owner y chat privado. |
+| `/patrones` | Explica el patrón cerrado y los límites de la investigación asistida. |
+| `/investigar <tema>` | Encola una síntesis sin imagen según la línea mensual; consulta solo URLs oficiales autorizadas y nunca publica. |
 | `/calendario [días]` | Consulta entre 1 y 31 días de agenda persistida. |
 | `/modo [human_review\|direct]` | Consulta o solicita un modo, según RBAC y seguros. |
-| `/generar <brief>` | Encola una generación durable; el webhook no llama a MiniMax. |
+| `/generar <brief>` | Encola según la línea mensual; el webhook no llama a MiniMax. |
 | `/publicar <id>` | Encola durablemente un borrador ya aprobado; el webhook no lo envía a X. |
 | `/ayuda` | Muestra la guía integrada. |
 
@@ -139,6 +150,35 @@ Los callbacks de aprobación o rechazo usan nonces expirables y de un solo uso. 
 fecha, evidencia o imagen invalida la aprobación anterior. Ni los comandos ni los callbacks del
 webhook llaman directamente a X: solo consultan o mutan el estado transaccional. Cualquier acceso
 a X queda fuera del proceso web y bajo los seguros del worker persistente.
+
+Las altas administrativas no confían en `@username`: el owner entrega el `from.id` decimal y el
+bot crea o vincula únicamente un chat privado cuyo `chat_id` coincide con ese ID. Los roles que se
+pueden dar de alta por Telegram son `editor`, `reviewer`, `publisher`, `scheduler` y `auditor`; cada
+uno conserva sus permisos separados. Repetir exactamente un alta es idempotente y toda creación,
+membresía, vínculo y cambio de línea deja auditoría.
+
+`/investigar` aplica siempre este patrón: pregunta o tesis; hechos y cifras solo de fuentes
+aportadas o del registro canónico; separación entre hecho e inferencia; contraste o posible
+refutación; síntesis futura para X; y prohibición de fabricar citas. Antes de delegar la síntesis,
+el worker recupera como máximo tres URLs HTTPS de una lista institucional cerrada, rechaza
+redirecciones a otro host y limita tanto el cuerpo como el texto entregado al modelo. MiniMax solo
+produce una **síntesis exploratoria**: no hace navegación web abierta. El registro canónico contiene 44 títulos
+o series documentados y una atribución editorial disputada; el selector envía como máximo tres
+coincidencias fuertes por título, cuya pertinencia debe comprobarse. La atribución de 1962 solo se
+incluye ante una consulta explícita y se presenta junto con la fuente donde Bueno negó su
+participación. Si no hay coincidencia, se incluyen únicamente las URLs maestras y el brief exige
+marcar las inferencias `POR VERIFICAR`. La evidencia durable conserva las URLs finales y el
+SHA-256 de cada respuesta, nunca el cuerpo descargado; la verificación editorial humana sigue
+siendo obligatoria.
+
+El worker deriva del prefijo interno —no de la salida de MiniMax— la evidencia
+`research_only=true`. Esa síntesis se entrega sin botones de aprobación o publicación y queda
+bloqueada al encolar, reclamar o crear directamente un intento de publicación, incluso para filas
+antiguas. Tampoco puede quitarse la marca mediante una revisión: tras verificar los hallazgos, un
+owner o editor debe copiarlos deliberadamente a `/generar`, que crea un draft separado, exige y
+antepone la línea vigente con su versión y vuelve a pasar por revisión humana. Si línea más encargo
+exceden 1000 caracteres, la solicitud se rechaza en vez de omitir la directriz. `/publicar` no
+reescribe nada: solo encola un snapshot publicable que ya fue aprobado por un rol publisher.
 
 `generation-run` consume la cola de `/generar`: OpenClaw asigna el command job, MiniMax propone
 texto y, opcionalmente, imagen, y Colmat crea siempre un draft `in_review`. Una outbox durable
@@ -184,6 +224,25 @@ colmat-x automation-status --actor-id OWNER_ID
 `automation-calendar` previsualiza el YAML local; `/calendario` y `automation-status` consultan la
 configuración que ya fue persistida.
 
+Si un run termina en `failed` antes de persistir un borrador, el scheduler seguirá devolviendo un
+resultado no saludable para ese slot en vez de ocultarlo como un duplicado exitoso. Un owner,
+admin o scheduler puede solicitar exactamente un nuevo intento sobre el mismo run:
+
+```bash
+colmat-x automation-retry RUN_ID --actor-id SCHEDULER_ID
+```
+
+La orden solo deja la solicitud durable y auditada. El siguiente `automation-run` escanea retries
+pendientes de cualquier fecha local, reclama exactamente el `run_id` original, incrementa
+`attempt_count` y conserva la misma clave de idempotencia y el mismo cupo diario. Nunca crea un run
+retroactivo nuevo. Si la agenda dejó de corresponder, retira y audita el flag en esa ejecución para
+que no quede varado al cruzar otra medianoche. No admite runs `unknown` ni runs que ya tengan un
+draft: esos casos requieren conciliación para no duplicar snapshots o efectos externos.
+
+Antes de llamar a MiniMax, cada slot autónomo resuelve la línea editorial del mes de su fecha
+programada y la antepone al brief con su versión. Mes, versión y SHA-256 quedan en la evidencia del
+draft. Si la línea falta o es inválida, el run termina en `failed` antes de generar o publicar.
+
 Cada slot puede declarar `weekdays` con una lista no vacía de valores canónicos: `lunes`,
 `martes`, `miércoles`, `jueves`, `viernes`, `sábado` y `domingo`. Omitirla conserva la ejecución
 diaria. La agenda canónica limita `dato-manana` a los lunes, como exige `dato_semana`; tanto el
@@ -222,12 +281,16 @@ Contiene los IDs fijos `COLMAT_AUTOMATION_SCHEDULER_ID`, `COLMAT_AUTOMATION_AUTH
 `COLMAT_AUTOMATION_REVIEWER_ID` y `COLMAT_AUTOMATION_PUBLISHER_ID`, además de las integraciones
 necesarias. Los valores presentes en ese archivo prevalecen sobre un entorno heredado. No pases
 secretos en argumentos ni los guardes en OpenClaw.
+Los tres comandos worker crean el esquema únicamente cuando usan SQLite local. Con PostgreSQL
+operan sin DDL; aplica `deploy/postgres.sql` con una identidad de migración antes de arrancarlos.
 
 Usa tres archivos **distintos, modo `0600` y fuera del checkout**: `automation-worker.env` puede
 acceder a MiniMax y X; `generation-worker.env` accede a MiniMax pero rechaza cualquier variable
-`X_*`; `publication-worker.env` accede a X y nunca recibe MiniMax. La clave MiniMax puede
-inyectarse a los dos primeros mediante un `EnvironmentFile` de systemd con el mismo modo, sin
-duplicarla en los archivos del job. `COLMAT_AUTOMATION_MEDIA_ROOT` y
+`X_*`; `publication-worker.env` accede a X y nunca recibe MiniMax. Guarda la clave una sola vez en
+un archivo `0600` que contenga únicamente `MINIMAX_API_KEY=...`; los dos primeros envs declaran
+`COLMAT_MINIMAX_ENV_FILE=/ruta/absoluta/minimax.env` y el cargador la incorpora sin interpolar ni
+copiarla a la definición del job. Una ruta heredada que no figure en el env primario se ignora.
+`COLMAT_AUTOMATION_MEDIA_ROOT` y
 `COLMAT_GENERATION_MEDIA_ROOT` deben apuntar ambos a `/var/lib/colmat-x/media`, para que el
 publicador lea media de las dos colas. Una imagen mayor de 5 MiB se descarta antes de crear el
 draft.
@@ -419,10 +482,11 @@ Internet. Cada job debe ejecutar rutas absolutas y una identidad de sistema fija
 `automation-run` puede recibir MiniMax y X porque cubre el pipeline diario completo.
 `generation-run` recibe MiniMax para `/generar` y rechaza cualquier credencial `X_*`;
 `publication-run` es el consumer de `/publicar`, recibe X y rechaza una clave MiniMax no vacía.
-Mantén los tres archivos
-`0600` fuera del checkout y los tres jobs inicialmente deshabilitados. Si systemd inyecta
-`MINIMAX_API_KEY` mediante otro `EnvironmentFile` `0600`, limita esa inyección a los command jobs de
-automation y generation; no copies la clave al repositorio ni al env de publication.
+Mantén los tres archivos `0600` fuera del checkout y los tres jobs inicialmente deshabilitados.
+`MINIMAX_API_KEY` vive en un dotenv exclusivo `0600`, regular y del mismo usuario. Declara su ruta
+como `COLMAT_MINIMAX_ENV_FILE` dentro de los envs primarios de automation y generation; el archivo
+referido admite solo esa clave y un máximo de 4 KiB. No copies la clave al repositorio, a OpenClaw
+ni al env de publication.
 
 Los tres procesos comparten `/var/lib/colmat-x/media`: configura con ese mismo valor
 `COLMAT_AUTOMATION_MEDIA_ROOT` en automation/publication y `COLMAT_GENERATION_MEDIA_ROOT` en

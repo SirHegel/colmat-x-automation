@@ -102,6 +102,93 @@ class FakeOperations:
         self.calls.append(("team", telegram_user_id, chat_id))
         return "Administración: 1; Editores: 2"
 
+    def list_telegram_users(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("telegram_users", telegram_user_id, chat_id))
+        return "Owner — Telegram=101"
+
+    def invite_telegram_user(
+        self,
+        target_telegram_user_id: int,
+        role: str,
+        email: str,
+        display_name: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(
+            (
+                "invite_user",
+                target_telegram_user_id,
+                role,
+                email,
+                display_name,
+                request_id,
+                telegram_user_id,
+                chat_id,
+            )
+        )
+        return CommandResult("Alta lista", accepted=self.command_accepted)
+
+    def bind_telegram_user(
+        self,
+        target_telegram_user_id: int,
+        user_id: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(
+            (
+                "bind_user",
+                target_telegram_user_id,
+                user_id,
+                request_id,
+                telegram_user_id,
+                chat_id,
+            )
+        )
+        return CommandResult("Vínculo listo", accepted=self.command_accepted)
+
+    def get_editorial_line(
+        self,
+        month: str | None,
+        *,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> str:
+        self.calls.append(("get_line", month, telegram_user_id, chat_id))
+        return "Línea editorial vigente"
+
+    def set_editorial_line(
+        self,
+        month: str,
+        text: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("set_line", month, text, request_id, telegram_user_id, chat_id))
+        return CommandResult("Línea fijada", accepted=self.command_accepted)
+
+    def research_topic(
+        self,
+        topic: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("research", topic, request_id, telegram_user_id, chat_id))
+        return CommandResult("Investigación encolada", accepted=self.command_accepted)
+
+    def get_research_patterns(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("patterns", telegram_user_id, chat_id))
+        return "Patrones y verificación humana"
+
     def get_calendar(self, *, days: int, telegram_user_id: int, chat_id: int) -> str:
         self.calls.append(("calendar", days, telegram_user_id, chat_id))
         return f"Calendario para {days} días"
@@ -433,8 +520,8 @@ def test_same_username_does_not_grant_a_different_user_access() -> None:
     ("command", "expected"),
     [
         ("/start", "está conectado"),
-        ("/ayuda", "no crea usuarios"),
-        ("/help", "no crea usuarios"),
+        ("/ayuda", "nunca se confía en @username"),
+        ("/help", "nunca se confía en @username"),
         ("/desconocido", "comando desconocido"),
     ],
 )
@@ -458,6 +545,179 @@ def test_team_requires_its_own_rbac_permission() -> None:
     action = result.actions[0]
     assert isinstance(action, SendMessage)
     assert "no tienes permiso" in action.text.casefold()
+    assert operations.calls == []
+
+
+def test_owner_can_list_and_invite_numeric_telegram_ids_only_in_private_chat() -> None:
+    processor, _, authorizer, _, operations = make_processor(user_id=101, chat_id=101)
+
+    listed = processor.process_update(
+        message_update(201, "/usuarios", user_id=101, chat_id=101),
+        secret_token=SECRET,
+    )
+    invited = processor.process_update(
+        message_update(
+            202,
+            "/invitar 700000001 reviewer persona@example.co María Revisión",
+            user_id=101,
+            chat_id=101,
+            username="untrusted_owner_name",
+        ),
+        secret_token=SECRET,
+    )
+
+    assert listed.actions[0].text == "Owner — Telegram=101"
+    assert invited.actions[0].text == "Alta lista"
+    assert operations.calls == [
+        ("telegram_users", 101, 101),
+        (
+            "invite_user",
+            700000001,
+            "reviewer",
+            "persona@example.co",
+            "María Revisión",
+            "telegram:202:invitar",
+            101,
+            101,
+        ),
+    ]
+    assert (101, 101, BotPermission.MANAGE_TEAM) in authorizer.calls
+
+
+def test_team_management_rejects_groups_and_non_delegable_roles() -> None:
+    group_processor, _, _, _, group_operations = make_processor()
+    group_result = group_processor.process_update(
+        message_update(203, "/invitar 700000001 reviewer persona@example.co Persona"),
+        secret_token=SECRET,
+    )
+
+    private_processor, _, _, _, private_operations = make_processor(user_id=101, chat_id=101)
+    unsafe_role = private_processor.process_update(
+        message_update(
+            204,
+            "/invitar 700000001 owner persona@example.co Persona",
+            user_id=101,
+            chat_id=101,
+        ),
+        secret_token=SECRET,
+    )
+
+    assert "chat privado" in group_result.actions[0].text
+    assert unsafe_role.actions[0].text.startswith("Uso: /invitar")
+    assert group_operations.calls == []
+    assert private_operations.calls == []
+
+
+def test_owner_can_bind_existing_user_by_platform_and_numeric_ids() -> None:
+    processor, _, _, _, operations = make_processor(user_id=101, chat_id=101)
+    user_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    result = processor.process_update(
+        message_update(
+            205,
+            f"/vincular 700000002 {user_id}",
+            user_id=101,
+            chat_id=101,
+        ),
+        secret_token=SECRET,
+    )
+
+    assert result.actions[0].text == "Vínculo listo"
+    assert operations.calls == [
+        ("bind_user", 700000002, user_id, "telegram:205:vincular", 101, 101)
+    ]
+
+
+def test_editorial_line_and_research_commands_keep_distinct_permissions() -> None:
+    processor, _, authorizer, _, operations = make_processor(user_id=101, chat_id=101)
+
+    current = processor.process_update(
+        message_update(206, "/linea", user_id=101, chat_id=101),
+        secret_token=SECRET,
+    )
+    changed = processor.process_update(
+        message_update(
+            207,
+            "/linea 2026-08 Independencia y materialismo filosófico",
+            user_id=101,
+            chat_id=101,
+        ),
+        secret_token=SECRET,
+    )
+    research = processor.process_update(
+        message_update(
+            208,
+            "/investigar   Guerra de los Supremos y formación estatal ",
+            user_id=101,
+            chat_id=101,
+        ),
+        secret_token=SECRET,
+    )
+    patterns = processor.process_update(
+        message_update(209, "/patrones", user_id=101, chat_id=101),
+        secret_token=SECRET,
+    )
+
+    assert current.actions[0].text == "Línea editorial vigente"
+    assert changed.actions[0].text == "Línea fijada"
+    assert research.actions[0].text == "Investigación encolada"
+    assert patterns.actions[0].text == "Patrones y verificación humana"
+    assert operations.calls == [
+        ("get_line", None, 101, 101),
+        (
+            "set_line",
+            "2026-08",
+            "Independencia y materialismo filosófico",
+            "telegram:207:linea",
+            101,
+            101,
+        ),
+        (
+            "research",
+            "Guerra de los Supremos y formación estatal",
+            "telegram:208:investigar",
+            101,
+            101,
+        ),
+        ("patterns", 101, 101),
+    ]
+    assert (101, 101, BotPermission.VIEW_EDITORIAL_LINE) in authorizer.calls
+    assert (101, 101, BotPermission.MANAGE_EDITORIAL_LINE) in authorizer.calls
+    assert (101, 101, BotPermission.RESEARCH) in authorizer.calls
+
+
+def test_editor_cannot_set_monthly_line_without_owner_permission() -> None:
+    processor, _, _, _, operations = make_processor(
+        permissions={
+            BotPermission.ACCESS,
+            BotPermission.VIEW_EDITORIAL_LINE,
+            BotPermission.RESEARCH,
+        },
+        user_id=101,
+        chat_id=101,
+    )
+
+    result = processor.process_update(
+        message_update(
+            210,
+            "/linea 2026-13 Fecha inválida",
+            user_id=101,
+            chat_id=101,
+        ),
+        secret_token=SECRET,
+    )
+    forbidden = processor.process_update(
+        message_update(
+            211,
+            "/linea 2026-08 Cambio no autorizado",
+            user_id=101,
+            chat_id=101,
+        ),
+        secret_token=SECRET,
+    )
+
+    assert result.actions[0].text.startswith("Uso: /linea")
+    assert "no tienes permiso" in forbidden.actions[0].text.casefold()
     assert operations.calls == []
 
 
