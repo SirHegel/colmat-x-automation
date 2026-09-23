@@ -1903,6 +1903,8 @@ class PlatformStore:
         actor = _normalize_actor(actor_id)
         telegram_identity = _normalize_telegram_user_id(telegram_user_id)
         normalized_email = _normalize_email(email)
+        if _is_service_principal_email(normalized_email):
+            raise AuthorizationError(SERVICE_PRINCIPAL_TELEGRAM_ERROR)
         normalized_name = _normalize_short_text(display_name, "display_name", 120)
         target_role = _normalize_role(role)
         delegatable_roles = {
@@ -2896,7 +2898,9 @@ class PlatformStore:
         with _workspace_rbac_lock(workspace), self._sessions.begin() as session:
             self._serialize_workspace_rbac(session, workspace)
             actor_role = self._authorize(session, actor, workspace, Permission.MANAGE_TELEGRAM)
-            self._get_user(session, target_id)
+            target_user = self._get_user(session, target_id)
+            if _is_service_principal_email(target_user.email):
+                raise AuthorizationError(SERVICE_PRINCIPAL_TELEGRAM_ERROR)
             target_membership = self._required_membership(session, target_id, workspace)
             self._require_can_manage_existing_role(actor_role, Role(target_membership.role))
             if actor != target_id and actor_role is not Role.OWNER:
@@ -5183,13 +5187,41 @@ class PlatformStore:
                 )
                 return None
             draft = self._get_draft(session, request.draft_id)
-            revision, approval = self._approved_snapshot_for_publication(
-                session,
-                draft=draft,
-                expected_snapshot_hash=request.snapshot_hash,
-            )
-            if revision.id != request.revision_id or approval.id != request.approval_id:
-                raise StaleSnapshotError("La solicitud ya no coincide con la aprobación persistida")
+            # Un snapshot que ya no es publicable cierra ESTA solicitud, no el lote.
+            # Lanzar aquí revertía el claim dentro de la misma transacción, la fila
+            # volvía a `queued` y el worker abortaba en cada ejecución, dejando sin
+            # publicar todas las solicitudes que venían detrás.
+            try:
+                revision, approval = self._approved_snapshot_for_publication(
+                    session,
+                    draft=draft,
+                    expected_snapshot_hash=request.snapshot_hash,
+                )
+                if revision.id != request.revision_id or approval.id != request.approval_id:
+                    raise StaleSnapshotError(
+                        "La solicitud ya no coincide con la aprobación persistida"
+                    )
+            except (ConflictError, StaleSnapshotError) as exc:
+                request.status = PublicationRequestStatus.UNKNOWN.value
+                request.error = str(exc)
+                request.finished_at = timestamp
+                request.updated_at = timestamp
+                self._audit(
+                    session,
+                    workspace_id=workspace,
+                    actor_id=actor,
+                    action="publication_request.blocked_unpublishable_snapshot",
+                    entity_type="publication_request",
+                    entity_id=request.id,
+                    detail={
+                        "draft_id": request.draft_id,
+                        "revision_id": request.revision_id,
+                        "claim_fence": request.claim_fence,
+                        "reason": str(exc),
+                    },
+                    now=timestamp,
+                )
+                return None
             session.refresh(request)
             claim_fence = request.claim_fence
             attempt_key = _publication_attempt_idempotency_key(request.id, claim_fence)
@@ -5273,6 +5305,9 @@ class PlatformStore:
                     session,
                     draft=draft,
                     expected_snapshot_hash=request.snapshot_hash,
+                    ignore_attempt_key=_publication_attempt_idempotency_key(
+                        request.id, normalized_fence
+                    ),
                 )
                 if revision.id != request.revision_id or approval.id != request.approval_id:
                     raise StaleSnapshotError(
@@ -8828,12 +8863,36 @@ class PlatformStore:
         *,
         draft: Draft,
         expected_snapshot_hash: str,
+        ignore_attempt_key: str | None = None,
     ) -> tuple[Revision, Approval]:
         if DraftStatus(draft.status) is not DraftStatus.APPROVED:
             raise ConflictError("Solo se puede publicar un draft aprobado")
         revision = self._current_revision(session, draft)
         if _revision_is_research_only(session, revision):
             raise ConflictError(RESEARCH_ONLY_PUBLICATION_ERROR)
+        # Un intento en vuelo, ambiguo o ya exitoso sobre esta misma revisión cierra
+        # la publicación igual que cierra la edición en ``revise_draft``. Sin este
+        # cerrojo, un ``unknown`` del camino direct no impide que la cola humana
+        # vuelva a enviar el mismo snapshot y lo duplique en X.
+        blocking = select(PublishAttempt.id).where(
+            PublishAttempt.revision_id == revision.id,
+            PublishAttempt.status.in_(
+                (
+                    PublishStatus.PENDING.value,
+                    PublishStatus.UNKNOWN.value,
+                    PublishStatus.SUCCEEDED.value,
+                )
+            ),
+        )
+        if ignore_attempt_key is not None:
+            # El intento del propio claim en curso no se bloquea a sí mismo.
+            blocking = blocking.where(PublishAttempt.idempotency_key != ignore_attempt_key)
+        blocking_attempt = session.scalar(blocking)
+        if blocking_attempt is not None:
+            raise ConflictError(
+                "Ya hay un intento de publicación pendiente, ambiguo o exitoso "
+                "para este snapshot; exige conciliación antes de reintentar"
+            )
         if draft.approved_revision_id != revision.id:
             raise StaleSnapshotError("La aprobación no pertenece a la revisión actual")
         approval = session.scalar(
@@ -9253,6 +9312,10 @@ class PlatformStore:
         membership = self._membership(session, binding.user_id, workspace_id)
         if user is None or not user.is_active or membership is None:
             raise AuthorizationError("La cuenta vinculada a Telegram no es un miembro activo")
+        # Defensa en profundidad: un binding heredado sobre un principal técnico
+        # tampoco puede resolver a un actor, aunque se creara antes del cerrojo.
+        if _is_service_principal_email(user.email):
+            raise AuthorizationError(SERVICE_PRINCIPAL_TELEGRAM_ERROR)
         return user, membership
 
     @staticmethod
@@ -9802,6 +9865,18 @@ def _normalize_sha256(value: str | None, *, required: bool) -> str | None:
     if not isinstance(value, str) or not SHA256_PATTERN.fullmatch(value.lower()):
         raise ValueError("El hash debe contener exactamente 64 dígitos hexadecimales")
     return value.lower()
+
+
+SERVICE_PRINCIPAL_EMAIL_SUFFIX = ".internal"
+SERVICE_PRINCIPAL_TELEGRAM_ERROR = (
+    "Los principals técnicos del dominio reservado no tienen acceso por Telegram"
+)
+
+
+def _is_service_principal_email(value: str | None) -> bool:
+    """Un principal técnico (`@colmat.internal`) nunca opera como persona."""
+
+    return isinstance(value, str) and value.strip().lower().endswith(SERVICE_PRINCIPAL_EMAIL_SUFFIX)
 
 
 def _normalize_email(value: str) -> str:

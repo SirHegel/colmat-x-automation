@@ -54,7 +54,11 @@ from colmat_x.telegram_bot import (
     WebhookAuthenticationError,
     execute_bot_actions,
 )
-from colmat_x.telegram_operations import PlatformTelegramOperations
+from colmat_x.telegram_operations import (
+    PlatformTelegramOperations,
+    editorial_month,
+    guided_brief,
+)
 from colmat_x.web_auth import (
     CsrfError,
     InvalidChallengeError,
@@ -592,9 +596,17 @@ def create_app(
             if not _valid_request_nonce(request_nonce):
                 raise ValueError("request_id inválido")
             runtime = await run_in_threadpool(provider.get)
+            # El panel es otra puerta a la misma cola: antepone la línea editorial
+            # del mes igual que `/generar`, en vez de encolar el brief crudo.
+            month = editorial_month(datetime.now(UTC))
+            line = await run_in_threadpool(
+                runtime.store.get_editorial_line,
+                month,
+                actor_id=principal.user_id,
+            )
             await run_in_threadpool(
                 runtime.store.enqueue_generation_request,
-                form.get("brief", ""),
+                guided_brief(line, form.get("brief", "")),
                 actor_id=principal.user_id,
                 telegram_user_id=principal.telegram_user_id,
                 chat_id=principal.chat_id,

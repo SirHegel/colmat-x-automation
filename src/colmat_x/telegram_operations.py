@@ -29,6 +29,7 @@ from colmat_x.platform_store import (
     AutomationRunStatus,
     ConflictError,
     DraftStatus,
+    EditorialLine,
     GenerationRequestStatus,
     NotFoundError,
     PlatformStore,
@@ -1478,7 +1479,31 @@ class PlatformTelegramOperations:
         return load_automation_config(self._automation_config_path, policy=policy)
 
     def _editorial_month(self) -> str:
-        return self._now().astimezone(_LOCAL_ZONE).strftime("%Y-%m")
+        return editorial_month(self._now())
+
+
+EDITORIAL_BRIEF_MAX_CHARACTERS = 1_000
+
+
+def editorial_month(now: datetime) -> str:
+    """Mes editorial en la fecha local de Bogotá, no en UTC."""
+
+    return now.astimezone(_LOCAL_ZONE).strftime("%Y-%m")
+
+
+def guided_brief(line: EditorialLine | None, brief: str) -> str:
+    """Antepone la línea editorial vigente con su versión, como exige el manual.
+
+    La comparte toda puerta de entrada a la cola de generación —Telegram y panel
+    web—, para que ninguna encole un encargo sin la directriz del mes.
+    """
+
+    if line is None:
+        raise ConflictError("No hay línea editorial mensual")
+    guided = f"Línea editorial {line.month} v{line.version}: {line.line_text} Encargo: {brief}"
+    if len(guided) > EDITORIAL_BRIEF_MAX_CHARACTERS:
+        raise ValueError("La línea y el encargo superan el brief permitido")
+    return guided
 
 
 def _automation_slots_for_mode(
