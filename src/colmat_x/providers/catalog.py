@@ -40,8 +40,10 @@ class ProviderCatalogEntry:
         return bool(self.image_models)
 
 
-# Los modelos listados provienen de la documentación oficial vigente al escribir
-# este catálogo. Ampliarlo es un cambio de código revisado, no una variable.
+# Los modelos listados se contrastaron contra la documentación oficial el
+# 2026-09-23 (developers.openai.com/api/docs/models y ai.google.dev). Ampliar o
+# actualizar el catálogo es un cambio de código revisado, no una variable: un
+# identificador escrito de memoria caduca y rompe la generación en producción.
 PROVIDER_CATALOG: Mapping[str, ProviderCatalogEntry] = MappingProxyType(
     {
         PROVIDER_MINIMAX: ProviderCatalogEntry(
@@ -70,16 +72,18 @@ PROVIDER_CATALOG: Mapping[str, ProviderCatalogEntry] = MappingProxyType(
             label="OpenAI",
             api_key_variable="OPENAI_API_KEY",
             env_file_variable="COLMAT_OPENAI_ENV_FILE",
-            text_models=("gpt-5", "gpt-5-mini", "gpt-4.1"),
-            image_models=("gpt-image-1",),
+            text_models=("gpt-6-astra", "gpt-6-sol", "gpt-6-luna"),
+            image_models=("gpt-image-2.5-sunburst", "gpt-image-2.5-flare"),
         ),
         PROVIDER_GEMINI: ProviderCatalogEntry(
             name=PROVIDER_GEMINI,
             label="Google Gemini",
             api_key_variable="GEMINI_API_KEY",
             env_file_variable="COLMAT_GEMINI_ENV_FILE",
-            text_models=("gemini-2.5-pro", "gemini-2.5-flash"),
-            image_models=("gemini-2.5-flash-image",),
+            # Los `gemini-2.5-*` quedaron como legacy de acceso limitado; el
+            # catálogo usa los estables vigentes para no depender de ese acceso.
+            text_models=("gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+            image_models=("gemini-3.1-flash-image", "gemini-3-pro-image"),
         ),
     }
 )

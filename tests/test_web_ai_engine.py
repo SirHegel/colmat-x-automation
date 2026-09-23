@@ -163,7 +163,7 @@ def test_panel_selects_engine_with_cas_and_relabels_generation(sealed_stack) -> 
             "text_provider": "anthropic",
             "text_model": "claude-sonnet-5",
             "image_provider": "openai",
-            "image_model": "gpt-image-1",
+            "image_model": "gpt-image-2.5-sunburst",
         },
     )
     stale = client.post(
@@ -173,9 +173,9 @@ def test_panel_selects_engine_with_cas_and_relabels_generation(sealed_stack) -> 
             "csrf_token": csrf,
             "expected_version": "1",
             "text_provider": "gemini",
-            "text_model": "gemini-2.5-pro",
+            "text_model": "gemini-3.8-flash",
             "image_provider": "gemini",
-            "image_model": "gemini-2.5-flash-image",
+            "image_model": "gemini-3.1-flash-image",
         },
     )
     impossible = client.post(
@@ -196,7 +196,7 @@ def test_panel_selects_engine_with_cas_and_relabels_generation(sealed_stack) -> 
     assert impossible.headers["location"] == "/app?error=ai_engine_failed"
     settings = store.get_ai_engine_settings(actor_id=owner.id)
     assert (settings.text_provider, settings.text_model) == ("anthropic", "claude-sonnet-5")
-    assert (settings.image_provider, settings.image_model) == ("openai", "gpt-image-1")
+    assert (settings.image_provider, settings.image_model) == ("openai", "gpt-image-2.5-sunburst")
     assert settings.version == 2
     panel = client.get("/app")
     assert "Encargar a Anthropic (Claude)" in panel.text
@@ -269,9 +269,9 @@ def test_editor_sees_read_only_engine_and_cannot_manage_it(sealed_stack) -> None
             "csrf_token": csrf,
             "expected_version": "1",
             "text_provider": "openai",
-            "text_model": "gpt-5",
+            "text_model": "gpt-6-astra",
             "image_provider": "openai",
-            "image_model": "gpt-image-1",
+            "image_model": "gpt-image-2.5-sunburst",
         },
     )
     credential = client.post(
@@ -311,9 +311,9 @@ def test_admin_can_select_engine_but_not_store_credentials(sealed_stack) -> None
             "csrf_token": csrf,
             "expected_version": "1",
             "text_provider": "gemini",
-            "text_model": "gemini-2.5-flash",
+            "text_model": "gemini-3.5-flash",
             "image_provider": "gemini",
-            "image_model": "gemini-2.5-flash-image",
+            "image_model": "gemini-3.1-flash-image",
         },
     )
     credential = client.post(

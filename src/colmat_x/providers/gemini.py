@@ -33,8 +33,8 @@ from colmat_x.providers.catalog import PROVIDER_GEMINI
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODELS_ENDPOINT = f"{GEMINI_API_BASE}/models?pageSize=1"
 GEMINI_API_KEY_VARIABLE = "GEMINI_API_KEY"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-pro"
-DEFAULT_GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 8_192
 MAX_GEMINI_MAX_OUTPUT_TOKENS = 65_536
 

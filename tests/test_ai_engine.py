@@ -173,7 +173,7 @@ def test_engine_defaults_to_minimax_with_cas_rbac_and_audit(store, team) -> None
         now=NOW,
     )
     assert (updated.text_provider, updated.text_model) == ("anthropic", "claude-opus-5")
-    assert (updated.image_provider, updated.image_model) == ("openai", "gpt-image-1")
+    assert (updated.image_provider, updated.image_model) == ("openai", "gpt-image-2.5-sunburst")
     assert updated.version == 2
 
     with pytest.raises(ConflictError, match="versión actual 2"):
@@ -181,7 +181,9 @@ def test_engine_defaults_to_minimax_with_cas_rbac_and_audit(store, team) -> None
             actor_id=owner.id, expected_version=1, text_model="claude-sonnet-5"
         )
     with pytest.raises(ValueError, match="modelo de texto"):
-        store.update_ai_engine_settings(actor_id=owner.id, expected_version=2, text_model="gpt-5")
+        store.update_ai_engine_settings(
+            actor_id=owner.id, expected_version=2, text_model="gpt-6-astra"
+        )
     with pytest.raises(ValueError, match="uno de"):
         store.update_ai_engine_settings(
             actor_id=owner.id, expected_version=2, image_provider="anthropic"
@@ -199,7 +201,7 @@ def test_engine_defaults_to_minimax_with_cas_rbac_and_audit(store, team) -> None
         "text_provider": "anthropic",
         "text_model": "claude-opus-5",
         "image_provider": "openai",
-        "image_model": "gpt-image-1",
+        "image_model": "gpt-image-2.5-sunburst",
         "version": 2,
     }
 
@@ -369,8 +371,8 @@ def test_stored_credential_wins_over_environment_and_env_is_the_fallback(
     )
     engine = worker.build_engine(scheduler, session=http)
     assert engine.describe() == {
-        "text": {"provider": "openai", "model": "gpt-5"},
-        "image": {"provider": "gemini", "model": "gemini-2.5-flash-image"},
+        "text": {"provider": "openai", "model": "gpt-6-astra"},
+        "image": {"provider": "gemini", "model": "gemini-3.1-flash-image"},
     }
     draft = engine.generate_draft("Dato", POLICY)
     assert draft.figure == "10 %"

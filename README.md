@@ -101,8 +101,8 @@ es un cambio de código revisado.
 | --- | --- | --- | --- | --- |
 | `minimax` (predeterminado) | `MINIMAX_API_KEY` | `MiniMax-M2.7` | `image-01` | `api.minimax.io/anthropic/v1/messages`, `/v1/chat/completions`, `/v1/image_generation` |
 | `anthropic` | `ANTHROPIC_API_KEY` | `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` | no genera imágenes | `api.anthropic.com/v1/messages` |
-| `openai` | `OPENAI_API_KEY` | `gpt-5`, `gpt-5-mini`, `gpt-4.1` | `gpt-image-1` | `api.openai.com/v1/chat/completions`, `/v1/images/generations` |
-| `gemini` | `GEMINI_API_KEY` | `gemini-2.5-pro`, `gemini-2.5-flash` | `gemini-2.5-flash-image` | `generativelanguage.googleapis.com/v1beta/models/<modelo>:generateContent` |
+| `openai` | `OPENAI_API_KEY` | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | `gpt-image-2.5-sunburst` | `api.openai.com/v1/chat/completions`, `/v1/images/generations` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-3.8-flash`, `gemini-3.5-flash` | `gemini-3.1-flash-image` | `generativelanguage.googleapis.com/v1beta/models/<modelo>:generateContent` |
 
 MiniMax conserva su camino actual: `MINIMAX_API_STYLE=anthropic` por defecto y `openai` solo como
 compatibilidad explícita. Anthropic declara que no produce imágenes y falla con un error claro si

@@ -32,12 +32,12 @@ OPENAI_CHAT_COMPLETIONS_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 OPENAI_IMAGE_GENERATIONS_ENDPOINT = "https://api.openai.com/v1/images/generations"
 OPENAI_MODELS_ENDPOINT = "https://api.openai.com/v1/models"
 OPENAI_API_KEY_VARIABLE = "OPENAI_API_KEY"
-DEFAULT_OPENAI_MODEL = "gpt-5"
-DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-1"
+DEFAULT_OPENAI_MODEL = "gpt-6-astra"
+DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2.5-sunburst"
 DEFAULT_OPENAI_MAX_COMPLETION_TOKENS = 4_096
 MAX_OPENAI_MAX_COMPLETION_TOKENS = 32_768
 
-# gpt-image-1 solo ofrece tres tamaños; las proporciones apaisadas y verticales
+# El modelo de imagen solo ofrece tres tamaños; las proporciones apaisadas y verticales
 # se aproximan al tamaño más cercano y las dimensiones reales quedan en la evidencia.
 OPENAI_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "1:1": (1024, 1024),
@@ -86,7 +86,7 @@ OPENAI_ERRORS = ProviderErrorFamily(
 
 
 class OpenAIClient:
-    """Adaptador de texto (chat completions) e imagen (gpt-image-1)."""
+    """Adaptador de texto (chat completions) e imagen."""
 
     provider_name = PROVIDER_OPENAI
     supports_images = True

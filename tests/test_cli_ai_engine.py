@@ -155,7 +155,7 @@ def test_ai_engine_and_credential_commands_use_cas_and_never_print_secrets(
     )
     assert changed.exit_code == 0, changed.output
     assert "texto=anthropic/claude-sonnet-5" in changed.output
-    assert "imagen=openai/gpt-image-1" in changed.output
+    assert "imagen=openai/gpt-image-2.5-sunburst" in changed.output
     assert "version=2" in changed.output
 
     stale = runner.invoke(

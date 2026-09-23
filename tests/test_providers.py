@@ -169,7 +169,7 @@ def test_catalog_is_closed_and_anthropic_never_offers_images() -> None:
             text_provider="anthropic",
             text_model="claude-imaginary-9",
             image_provider="openai",
-            image_model="gpt-image-1",
+            image_model="gpt-image-2.5-sunburst",
         )
 
 
@@ -303,7 +303,7 @@ def test_openai_draft_forces_the_closed_function_without_temperature(
     assert call["url"] == OPENAI_CHAT_COMPLETIONS_ENDPOINT
     assert call["headers"]["Authorization"] == f"Bearer {SECRET}"
     body = call["json"]
-    assert body["model"] == "gpt-5"
+    assert body["model"] == "gpt-6-astra"
     assert "temperature" not in body
     assert body["tool_choice"] == {"type": "function", "function": {"name": DRAFT_TOOL_NAME}}
     assert body["parallel_tool_calls"] is False
@@ -354,7 +354,7 @@ def test_openai_image_maps_landscape_to_supported_size_and_validates_bytes(monke
     )
 
     assert image.provider == "openai"
-    assert image.model == "gpt-image-1"
+    assert image.model == "gpt-image-2.5-sunburst"
     assert (image.width, image.height) == (1536, 1024)
     assert image.mime_type == "image/png"
     call = session.calls[0]
@@ -386,8 +386,8 @@ def test_openai_key_check_uses_models_endpoint() -> None:
 
 
 def test_gemini_endpoint_is_fixed_and_model_name_cannot_escape_the_path() -> None:
-    assert generate_content_endpoint("gemini-2.5-pro") == (
-        f"{GEMINI_API_BASE}/models/gemini-2.5-pro:generateContent"
+    assert generate_content_endpoint("gemini-3.8-flash") == (
+        f"{GEMINI_API_BASE}/models/gemini-3.8-flash:generateContent"
     )
     for hostile in ("../other", "x:generateAnswer", "a?key=b", "m#f", "evil/path"):
         with pytest.raises(GeminiConfigurationError):
@@ -404,13 +404,13 @@ def test_gemini_draft_uses_function_calling_config_and_native_repair(
         FakeResponse(200, gemini_candidate(invalid)),
         FakeResponse(200, gemini_candidate(draft_payload)),
     )
-    client = GeminiClient(session=session, model="gemini-2.5-flash")
+    client = GeminiClient(session=session, model="gemini-3.5-flash")
 
     draft = client.generate_draft("Dato entregado", POLICY, institution="colmat")
 
     assert draft.figure == "10 %"
     first = session.calls[0]
-    assert first["url"] == f"{GEMINI_API_BASE}/models/gemini-2.5-flash:generateContent"
+    assert first["url"] == f"{GEMINI_API_BASE}/models/gemini-3.5-flash:generateContent"
     assert first["headers"]["x-goog-api-key"] == SECRET
     assert SECRET not in first["url"]
     body = first["json"]
@@ -474,7 +474,7 @@ def test_gemini_image_uses_inline_data_and_nominal_dimensions(monkeypatch) -> No
     )
 
     assert image.provider == "gemini"
-    assert image.model == "gemini-2.5-flash-image"
+    assert image.model == "gemini-3.1-flash-image"
     assert image.request_id == "img-1"
     assert (image.width, image.height) == (1344, 768)
     body = session.calls[0]["json"]
