@@ -7,8 +7,9 @@ automatiza la interfaz web de X.
 
 El proyecto nace en modo seguro. En `human_review`, toda salida de IA es un borrador y una persona
 distinta del autor debe aprobar el snapshot exacto. En `direct`, la ejecución usa identidades de
-servicio separadas y la publicación real exige dos seguros de entorno más `--live`. El webhook de
-Telegram puede consultar y registrar decisiones, pero no crea usuarios ni llama a X.
+servicio separadas y la publicación real exige dos seguros de entorno más `--live` y, además,
+dos seguros persistidos que el bot de Telegram abre con doble paso y cierra de inmediato. El
+webhook de Telegram consulta, ordena y registra decisiones, pero nunca llama a X ni a la IA.
 
 ## Capacidades
 
@@ -28,6 +29,9 @@ Telegram puede consultar y registrar decisiones, pero no crea usuarios ni llama 
 - Motores de IA conectables (MiniMax por defecto; Anthropic, OpenAI o Google Gemini) para
   proponer borradores e imágenes en memoria, con validación local cerrada y sin capacidad de
   aprobar, programar o publicar. El proveedor de texto y el de imagen pueden ser distintos.
+- Control operativo completo desde Telegram: agenda, seguros de publicación real, cola y
+  conciliación, equipo, diagnóstico y auditoría, con confirmación de dos pasos para todo lo
+  irreversible o con efecto externo.
 - Agenda diaria persistida, ejecución idempotente por slot y modos `human_review` y `direct`.
 - Workers `automation-run`, `generation-run` y `publication-run`, invocables por command jobs
   deterministas de un OpenClaw aislado en un host persistente.
@@ -255,15 +259,49 @@ Telegram autentica por `from.id`, nunca por `username`, y exige además el chat 
 | `/patrones` | Explica el patrón cerrado y los límites de la investigación asistida. |
 | `/investigar <tema>` | Encola una síntesis sin imagen según la línea mensual; consulta solo URLs oficiales autorizadas y nunca publica. |
 | `/calendario [días]` | Consulta entre 1 y 31 días de agenda persistida. |
-| `/modo [human_review\|direct]` | Consulta o solicita un modo, según RBAC y seguros. |
+| `/modo [human_review\|direct]` | Consulta o fija el modo; `direct` exige owner/admin, chat privado, el seguro persistido `direct` abierto y confirmación con botón. |
 | `/generar <brief>` | Encola según la línea mensual; el webhook no llama al motor de IA. |
 | `/publicar <id>` | Encola durablemente un borrador ya aprobado; el webhook no lo envía a X. |
+| `/agenda` | Estado de la agenda persistida, seguros y runs recientes; cualquier rol. |
+| `/agenda runs [1-20]` | Runs recientes con estado, intento y error; cualquier rol. |
+| `/agenda validar` | Valida el `config/automation.yaml` desplegado sin tocar la base; cualquier rol. |
+| `/agenda sincronizar` | Copia el YAML a la base con CAS y conserva el modo; owner, admin o scheduler, chat privado. |
+| `/agenda activar` | Activa la agenda con CAS; en `direct` exige confirmación con botón; owner, admin o scheduler, chat privado. |
+| `/agenda pausar` | Pausa la agenda con CAS; owner, admin o scheduler, desde cualquier chat autorizado. |
+| `/agenda reintentar <run_id>` | Solicita un reintento de un run `failed` sin borrador; owner, admin o scheduler, chat privado. |
+| `/seguros` | Estado de los seguros persistidos `live` y `direct`, con quién y cuándo los abrió; cualquier rol. |
+| `/seguro <live\|direct> off` | Cierra un seguro de inmediato (parada de emergencia); owner o admin, desde cualquier chat autorizado. |
+| `/seguro <live\|direct> on` | Abre un seguro con confirmación de botón; owner o admin, chat privado. |
+| `/cola [1-20]` | Solicitudes de publicación y generación con su estado; cualquier rol. |
+| `/cola conciliar <request_id> publicado <x_post_id>` | Cierra un `unknown` verificado como publicado, con confirmación; publisher, owner o admin, chat privado. |
+| `/cola conciliar <request_id> no_publicado` | Cierra un `unknown` verificado como no publicado, con confirmación; nunca reencola el snapshot. |
+| `/revisar <id>` | Reemite botones de aprobación y rechazo ligados al snapshot actual; reviewer distinto del autor. |
+| `/retirar <id>` | Devuelve a `draft` una aprobación que aún no entró en la cola; reviewer distinto del autor. |
+| `/baja <user_id>` | Desactiva a un integrante de rol delegable, con confirmación; solo owner y chat privado. |
+| `/alta <user_id>` | Reactiva a un integrante de rol delegable; solo owner y chat privado. |
+| `/rol <user_id> <rol>` | Cambia entre roles delegables; solo owner y chat privado. |
+| `/doctor` | Diagnóstico del plano de control: base, agenda, seguros, línea, YAML, colas y runs; cualquier rol. |
+| `/auditoria [1-50]` | Últimos eventos de auditoría; owner, admin o auditor. |
 | `/ayuda` | Muestra la guía integrada. |
 
 Los callbacks de aprobación o rechazo usan nonces expirables y de un solo uso. Editar texto,
 fecha, evidencia o imagen invalida la aprobación anterior. Ni los comandos ni los callbacks del
 webhook llaman directamente a X: solo consultan o mutan el estado transaccional. Cualquier acceso
 a X queda fuera del proceso web y bajo los seguros del worker persistente.
+
+Las órdenes irreversibles o con efecto externo —abrir un seguro, pasar a `direct`, activar la
+agenda en `direct`, dar de baja a alguien y conciliar un `unknown`— nunca se ejecutan con una
+sola línea de texto. El bot responde con un teclado `Confirmar`/`Cancelar` cuyo nonce vive en
+`control_confirmations`, ligado a `from.id`, al chat privado, a la acción y a la versión CAS
+leída; vale diez minutos, se consume una sola vez y el callback vuelve a exigir el mismo permiso
+que la orden. Cerrar un seguro o pausar la agenda es la dirección segura y se aplica de inmediato
+desde cualquier chat autorizado. Cada orden, confirmación y cancelación deja auditoría con actor,
+momento, acción y resultado.
+
+Desde Telegram nunca se crean owners ni admins, ni se modifican sus membresías: esas altas y
+bajas siguen exigiendo `team-add` en el host. Tampoco se reencola un snapshot cuyo envío terminó
+`failed` o `unknown`: la conciliación solo documenta el resultado verificado y, para publicar de
+nuevo, hay que revisar, aprobar y encolar una revisión nueva.
 
 Las altas administrativas no confían en `@username`: el owner entrega el `from.id` decimal y el
 bot crea o vincula únicamente un chat privado cuyo `chat_id` coincide con ese ID. Los roles que se
@@ -344,7 +382,11 @@ colmat-x automation-status --actor-id OWNER_ID
 ```
 
 `automation-calendar` previsualiza el YAML local; `/calendario` y `automation-status` consultan la
-configuración que ya fue persistida.
+configuración que ya fue persistida. El mismo flujo existe en Telegram: `/agenda validar` valida
+el YAML desplegado con el plano de control, `/agenda sincronizar` lo copia con CAS, `/agenda
+activar` y `/agenda pausar` cambian `enabled`, y `/agenda reintentar` deja la solicitud de
+reintento. El bot lee la versión vigente antes de escribir; si otra escritura se cruza, la orden
+falla y hay que repetirla.
 
 Si un run termina en `failed` antes de persistir un borrador, el scheduler seguirá devolviendo un
 resultado no saludable para ese slot en vez de ocultarlo como un duplicado exitoso. Un owner,
@@ -505,6 +547,8 @@ colmat-x ai-credential-keypair
 colmat-x ai-credential-set openai --actor-id OWNER_ID --env-file /ruta/segura/generation-worker.env
 colmat-x ai-credential-verify openai --actor-id OWNER_ID --env-file /ruta/segura/generation-worker.env
 colmat-x ai-credential-delete openai --actor-id OWNER_ID
+colmat-x safeguards-status --actor-id USER_ID
+colmat-x safeguards-set live on --actor-id OWNER_ID --expected-version VERSION
 colmat-x automation-run --env-file /ruta/segura/automation-worker.env
 colmat-x generation-run --env-file /var/lib/colmat-x/generation-worker.env --limit 5
 colmat-x publication-run --env-file /var/lib/colmat-x/publication-worker.env --live --limit 5
@@ -562,6 +606,37 @@ confirma saldo, precios o capacidad de escritura, que deben revisarse en la cons
 primera prueba con una cuenta controlada y una sola pieza. El flujo YAML heredado usa solo
 `COLMAT_LIVE_ENABLED`; el worker nuevo en modo `direct` exige simultáneamente los dos gates y
 `--live` en esa invocación:
+
+### Seguros de publicación real: dos capas
+
+Las variables de entorno son la **capacidad**: viven en los archivos `0600` del host del worker
+y solo cambian con acceso al host. Encima hay una capa de **intención operativa** persistida en
+la tabla `publication_safeguards`: dos seguros, `live` y `direct`, con versión CAS, evidencia de
+quién y cuándo los abrió y auditoría de cada cambio. Nacen cerrados; una base sin fila equivale a
+ambos en `false`. Los workers exigen las dos capas a la vez:
+
+| Efecto | Exige en el host (variables del worker) | Exige en la plataforma (bot o CLI) |
+| --- | --- | --- |
+| `publication-run` envía a X un snapshot aprobado | `COLMAT_LIVE_ENABLED=true` y `--live` | seguro `live` abierto |
+| `automation-run` publica sin revisión en `direct` | ambas variables en `true` y `--live` | seguros `live` y `direct` abiertos, modo `direct` y agenda activa |
+| Registrar el modo `direct` en la configuración | `COLMAT_DIRECT_PUBLISH_ENABLED=true` en el proceso que escribe **o** | seguro `direct` abierto |
+
+Lo que el bot controla: abrir cada seguro con doble paso (owner o admin, chat privado, botón de
+un solo uso), cerrarlo de inmediato desde cualquier chat autorizado, pasar a `direct` y volver a
+`human_review`, activar y pausar la agenda, y observar todo con `/seguros`, `/agenda` y
+`/doctor`. El worker relee los seguros persistidos antes de cada envío, de modo que un cierre
+desde Telegram detiene la siguiente publicación sin redeploy y sin tocar el host. El mismo estado
+se opera desde el host con `safeguards-status` y `safeguards-set`.
+
+Lo que sigue exigiendo acceso al host, y por qué: las variables `COLMAT_LIVE_ENABLED` y
+`COLMAT_DIRECT_PUBLISH_ENABLED` de los archivos del worker, la opción `--live` del command job,
+las credenciales de X y MiniMax, `x-whoami` (la única verificación que contacta a X, y el webhook
+no tiene credenciales), la alta o baja de owners y admins, el flujo YAML heredado (`approve`,
+`withdraw`, `retry`, `reconcile-published` sobre la SQLite local) y la aplicación del esquema. Con
+esa división, una cuenta de Telegram comprometida puede como máximo detener la operación o dejar
+todo armado en la plataforma, pero nunca convierte por sí sola una instalación cerrada en una que
+publica: la capacidad sigue en el host. Al desplegar esta versión sobre una instalación existente,
+los seguros persistidos aparecen cerrados y hay que abrirlos deliberadamente.
 
 ```bash
 # En el entorno seguro del worker:
@@ -727,6 +802,11 @@ colmat-x reconcile-published TU_ID ID_DEL_POST_EN_X
 # Si comprobaste que no aparece:
 colmat-x retry TU_ID --confirm-not-published
 ```
+
+En la cola de plataforma (`/publicar`), un `unknown` se concilia desde Telegram con
+`/cola conciliar <request_id> publicado <x_post_id>` o `... no_publicado`, siempre con confirmación
+y tras comprobar la cuenta. El snapshot nunca se reencola: publicar de nuevo exige revisar y
+aprobar una revisión nueva.
 
 Si un lease vence, `run-due` convierte primero ese intento a `unknown` y termina sin sincronizar
 ni publicar nada más. Antes de confirmar que no se publicó, verifica también que el proceso o

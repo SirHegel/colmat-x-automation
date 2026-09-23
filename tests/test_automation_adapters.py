@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -658,7 +658,15 @@ def test_repository_maps_block_failure_and_unknown_without_leaking_secret(
 
 def setup_direct_publisher(store, policy, tmp_path, monkeypatch, *, x_client=None, media=True):
     services = bootstrap_services(store, direct=True, monkeypatch=monkeypatch)
-    _owner, _scheduler, _author, reviewer, publisher = services
+    owner, _scheduler, _author, reviewer, publisher = services
+    # Los seguros persistidos nacen cerrados; el publisher directo exige ambos abiertos.
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=0,
+        live_enabled=True,
+        direct_publish_enabled=True,
+        now=NOW,
+    )
     repository = make_repository(store, services, tmp_path)
     slot = make_slot(
         mode=AutomationMode.DIRECT,
@@ -1077,3 +1085,25 @@ def test_review_outbox_never_retries_ambiguous_telegram_delivery(
         actor_id=owner.id,
     )
     assert persisted.status_value is expected_persisted
+
+
+def test_direct_publisher_blocks_when_persisted_safeguard_closes_after_claim(
+    store, policy, tmp_path, monkeypatch
+) -> None:
+    services, _repository, prepared, x_client, publisher = setup_direct_publisher(
+        store, policy, tmp_path, monkeypatch
+    )
+    owner, *_ = services
+    # El entorno del host sigue armado; el cierre desde el bot debe ganar igualmente.
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(AutomationError, match="seguro persistido live"):
+        publisher.publish(prepared)
+
+    assert x_client.upload_calls == []
+    assert x_client.post_calls == []

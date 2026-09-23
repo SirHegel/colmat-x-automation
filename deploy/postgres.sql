@@ -1239,6 +1239,69 @@ CREATE INDEX IF NOT EXISTS ix_publication_requests_queue
 CREATE INDEX IF NOT EXISTS ix_publication_requests_lease
     ON publication_requests(workspace_id, status, lease_expires_at);
 
+-- Seguros persistidos de publicación real. Nacen cerrados: sin fila, el worker
+-- se comporta como si ambos estuvieran en false. Complementan las variables de
+-- entorno del host; nunca las sustituyen.
+CREATE TABLE IF NOT EXISTS publication_safeguards (
+    workspace_id VARCHAR(80) PRIMARY KEY,
+    live_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    direct_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    live_enabled_by VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT,
+    live_enabled_at TIMESTAMPTZ,
+    direct_enabled_by VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT,
+    direct_enabled_at TIMESTAMPTZ,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT ck_publication_safeguards_version CHECK (version >= 1),
+    CONSTRAINT ck_publication_safeguards_live_evidence CHECK (
+        (live_enabled AND live_enabled_by IS NOT NULL AND live_enabled_at IS NOT NULL)
+        OR (NOT live_enabled AND live_enabled_by IS NULL AND live_enabled_at IS NULL)
+    ),
+    CONSTRAINT ck_publication_safeguards_direct_evidence CHECK (
+        (
+            direct_publish_enabled
+            AND direct_enabled_by IS NOT NULL
+            AND direct_enabled_at IS NOT NULL
+        ) OR (
+            NOT direct_publish_enabled
+            AND direct_enabled_by IS NULL
+            AND direct_enabled_at IS NULL
+        )
+    )
+);
+
+-- Segundo paso de las órdenes sensibles del bot: un nonce por orden, ligado a
+-- persona, chat privado, acción y parámetros exactos; se consume una sola vez.
+CREATE TABLE IF NOT EXISTS control_confirmations (
+    id VARCHAR(36) PRIMARY KEY,
+    nonce_hash VARCHAR(64) NOT NULL UNIQUE,
+    workspace_id VARCHAR(80) NOT NULL,
+    action VARCHAR(40) NOT NULL,
+    parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+    user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    telegram_user_id VARCHAR(32) NOT NULL,
+    chat_id VARCHAR(32) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    consumed_by VARCHAR(36),
+    outcome VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT ck_control_confirmations_nonce_hash_length CHECK (length(nonce_hash) = 64),
+    CONSTRAINT ck_control_confirmations_outcome CHECK (
+        outcome IS NULL OR outcome IN ('confirmed', 'cancelled')
+    ),
+    CONSTRAINT ck_control_confirmations_consumption CHECK (
+        (consumed_at IS NULL AND outcome IS NULL AND consumed_by IS NULL)
+        OR (consumed_at IS NOT NULL AND outcome IS NOT NULL AND consumed_by IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_control_confirmations_expiry
+    ON control_confirmations(expires_at, consumed_at);
+CREATE INDEX IF NOT EXISTS ix_control_confirmations_pending
+    ON control_confirmations(workspace_id, user_id, consumed_at);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     sequence BIGSERIAL PRIMARY KEY,
     workspace_id VARCHAR(80) NOT NULL,

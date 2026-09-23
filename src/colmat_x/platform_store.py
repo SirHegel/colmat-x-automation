@@ -106,6 +106,13 @@ DEFAULT_GENERATION_NOTIFICATION_LEASE_SECONDS = 120
 MAX_GENERATION_NOTIFICATION_LEASE_SECONDS = 600
 DEFAULT_AUTOMATION_REVIEW_NOTIFICATION_LEASE_SECONDS = 120
 MAX_AUTOMATION_REVIEW_NOTIFICATION_LEASE_SECONDS = 600
+CONTROL_CONFIRMATION_MAX_LIFETIME = timedelta(minutes=15)
+MAX_PENDING_CONTROL_CONFIRMATIONS_PER_USER = 5
+MANUAL_RECONCILIATION_NOT_PUBLISHED_ERROR = (
+    "Conciliación manual: se comprobó que la publicación no aparece en X"
+)
+_CONTROL_ACTION_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+_PROVIDER_POST_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 DEFAULT_TELEGRAM_UPDATE_LEASE_SECONDS = 30
 MAX_TELEGRAM_UPDATE_LEASE_SECONDS = 300
 _UNSET = object()
@@ -1456,6 +1463,102 @@ class AIProviderStatus(Base):
             "reported_by": self.reported_by,
             "reported_at": _format_time(self.reported_at),
         }
+
+
+class PublicationSafeguards(Base):
+    """Seguros operativos de publicación real, persistidos y auditados.
+
+    Complementan, nunca sustituyen, las variables de entorno del host. El worker
+    exige ambos: el entorno arma la capacidad y esta fila expresa la intención
+    operativa vigente, que el bot puede abrir con doble paso y cerrar de inmediato.
+    """
+
+    __tablename__ = "publication_safeguards"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_publication_safeguards_version"),
+        CheckConstraint(
+            "(live_enabled AND live_enabled_by IS NOT NULL AND live_enabled_at IS NOT NULL) OR "
+            "(NOT live_enabled AND live_enabled_by IS NULL AND live_enabled_at IS NULL)",
+            name="ck_publication_safeguards_live_evidence",
+        ),
+        CheckConstraint(
+            "(direct_publish_enabled AND direct_enabled_by IS NOT NULL "
+            "AND direct_enabled_at IS NOT NULL) OR "
+            "(NOT direct_publish_enabled AND direct_enabled_by IS NULL "
+            "AND direct_enabled_at IS NULL)",
+            name="ck_publication_safeguards_direct_evidence",
+        ),
+    )
+
+    workspace_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    live_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    direct_publish_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    live_enabled_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    live_enabled_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    direct_enabled_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    direct_enabled_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+
+
+class ControlConfirmation(Base):
+    """Nonce de un solo uso para el segundo paso de una orden sensible del bot."""
+
+    __tablename__ = "control_confirmations"
+    __table_args__ = (
+        UniqueConstraint("nonce_hash", name="uq_control_confirmations_nonce_hash"),
+        CheckConstraint(
+            "length(nonce_hash) = 64",
+            name="ck_control_confirmations_nonce_hash_length",
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('confirmed', 'cancelled')",
+            name="ck_control_confirmations_outcome",
+        ),
+        CheckConstraint(
+            "(consumed_at IS NULL AND outcome IS NULL AND consumed_by IS NULL) OR "
+            "(consumed_at IS NOT NULL AND outcome IS NOT NULL AND consumed_by IS NOT NULL)",
+            name="ck_control_confirmations_consumption",
+        ),
+        Index("ix_control_confirmations_expiry", "expires_at", "consumed_at"),
+        Index(
+            "ix_control_confirmations_pending",
+            "workspace_id",
+            "user_id",
+            "consumed_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    parameters: Mapped[Any] = mapped_column(JSON, nullable=False, default=dict)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    telegram_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    chat_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    consumed_by: Mapped[str | None] = mapped_column(String(36))
+    outcome: Mapped[str | None] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+
+
+@dataclass(frozen=True)
+class IssuedControlConfirmation:
+    """Nonce entregable a Telegram y el registro persistido que lo limita."""
+
+    nonce: str = field(repr=False)
+    confirmation: ControlConfirmation
 
 
 class AuditEvent(Base):
@@ -3605,6 +3708,16 @@ class PlatformStore:
             "content.publish.request": Permission.PUBLISH_DRAFTS,
             "content.approve": Permission.REVIEW_DRAFTS,
             "content.reject": Permission.REVIEW_DRAFTS,
+            "automation.view": Permission.VIEW_AUTOMATION,
+            "automation.schedule.manage": Permission.MANAGE_SCHEDULE,
+            "publication.safeguards.view": Permission.VIEW_AUTOMATION,
+            "publication.safeguards.manage": Permission.MANAGE_AUTOMATION_MODE,
+            "content.queue.view": Permission.VIEW_DRAFTS,
+            "content.queue.reconcile": Permission.PUBLISH_DRAFTS,
+            "content.withdraw": Permission.REVIEW_DRAFTS,
+            "content.review.request": Permission.REVIEW_DRAFTS,
+            "diagnostics.view": Permission.VIEW_AUTOMATION,
+            "audit.view": Permission.VIEW_AUDIT,
         }
         required_permission = permission_map.get(permission_value)
         if (
@@ -5608,7 +5721,7 @@ class PlatformStore:
             if requested_mode is AutomationMode.DIRECT and (
                 "mode" in normalized or normalized.get("enabled") is True or direct_material_changed
             ):
-                _require_direct_publish_kill_switch()
+                _require_direct_publish_arming(session, workspace)
             effective_enabled = normalized.get("enabled", current.enabled)
             if effective_enabled:
                 effective_slots = normalized.get("slots")
@@ -7878,6 +7991,632 @@ class PlatformStore:
                 statement = statement.where(AuditEvent.sequence > after_sequence)
             return list(session.scalars(statement.order_by(AuditEvent.sequence).limit(limit)))
 
+    # ------------------------------------------------------------------
+    # Seguros persistidos de publicación real (capa operativa del bot)
+    # ------------------------------------------------------------------
+
+    def get_publication_safeguards(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> PublicationSafeguards:
+        """Devuelve los seguros persistidos; sin fila, ambos nacen cerrados en versión 0."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.VIEW_AUTOMATION)
+            safeguards = session.get(PublicationSafeguards, workspace)
+            if safeguards is None:
+                return _default_publication_safeguards(workspace)
+            return safeguards
+
+    def update_publication_safeguards(
+        self,
+        *,
+        actor_id: str,
+        expected_version: int,
+        live_enabled: object = _UNSET,
+        direct_publish_enabled: object = _UNSET,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> PublicationSafeguards:
+        """Abre o cierra un seguro con CAS; solo owner/admin y siempre con auditoría.
+
+        La primera escritura exige ``expected_version=0`` y crea la fila en versión 1.
+        Abrir deja constancia de quién y cuándo; cerrar borra esa evidencia para que
+        una apertura posterior vuelva a firmarse.
+        """
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ValueError("expected_version debe ser un entero no negativo")
+        if expected_version < 0:
+            raise ValueError("expected_version debe ser un entero no negativo")
+        if live_enabled is _UNSET and direct_publish_enabled is _UNSET:
+            raise ValueError("Se requiere al menos un cambio de seguros")
+        normalized: dict[str, bool] = {}
+        if live_enabled is not _UNSET:
+            normalized["live_enabled"] = _normalize_bool(live_enabled, "live_enabled")
+        if direct_publish_enabled is not _UNSET:
+            normalized["direct_publish_enabled"] = _normalize_bool(
+                direct_publish_enabled, "direct_publish_enabled"
+            )
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_AUTOMATION_MODE)
+            current = session.scalar(
+                select(PublicationSafeguards)
+                .where(PublicationSafeguards.workspace_id == workspace)
+                .with_for_update()
+            )
+            current_version = 0 if current is None else current.version
+            if current_version != expected_version:
+                raise ConflictError(f"Los seguros cambiaron (versión actual {current_version})")
+            previous = _publication_safeguards_audit_snapshot(
+                current if current is not None else _default_publication_safeguards(workspace)
+            )
+            values: dict[str, Any] = {
+                "version": current_version + 1,
+                "updated_by": actor,
+                "updated_at": timestamp,
+            }
+            if "live_enabled" in normalized:
+                values["live_enabled"] = normalized["live_enabled"]
+                values["live_enabled_by"] = actor if normalized["live_enabled"] else None
+                values["live_enabled_at"] = timestamp if normalized["live_enabled"] else None
+            if "direct_publish_enabled" in normalized:
+                values["direct_publish_enabled"] = normalized["direct_publish_enabled"]
+                values["direct_enabled_by"] = (
+                    actor if normalized["direct_publish_enabled"] else None
+                )
+                values["direct_enabled_at"] = (
+                    timestamp if normalized["direct_publish_enabled"] else None
+                )
+            if current is None:
+                created = PublicationSafeguards(
+                    **{
+                        "workspace_id": workspace,
+                        "live_enabled": False,
+                        "direct_publish_enabled": False,
+                        **values,
+                    }
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(created)
+                        session.flush()
+                except IntegrityError as exc:
+                    raise ConflictError("Otra operación inicializó los seguros") from exc
+                updated = created
+            else:
+                changed = session.execute(
+                    update(PublicationSafeguards)
+                    .where(
+                        PublicationSafeguards.workspace_id == workspace,
+                        PublicationSafeguards.version == expected_version,
+                    )
+                    .values(**values)
+                )
+                if changed.rowcount != 1:
+                    raise ConflictError("Otra operación actualizó los seguros")
+                session.flush()
+                session.refresh(current)
+                updated = current
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="publication_safeguards.updated",
+                entity_type="publication_safeguards",
+                entity_id=workspace,
+                detail={
+                    "previous": previous,
+                    "current": _publication_safeguards_audit_snapshot(updated),
+                    "changes": normalized,
+                },
+                now=timestamp,
+            )
+            return updated
+
+    # ------------------------------------------------------------------
+    # Confirmaciones de dos pasos para órdenes sensibles del bot
+    # ------------------------------------------------------------------
+
+    def issue_control_confirmation(
+        self,
+        *,
+        actor_id: str,
+        action: str,
+        parameters: Mapping[str, Any],
+        telegram_user_id: int | str,
+        chat_id: int | str,
+        expires_at: datetime,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> IssuedControlConfirmation:
+        """Emite un nonce ligado a persona, chat privado, acción y parámetros exactos."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        normalized_action = _normalize_control_action(action)
+        normalized_parameters = _normalize_json(dict(parameters), field_name="parameters")
+        if not isinstance(normalized_parameters, dict):
+            raise ValueError("parameters debe ser un objeto JSON")
+        telegram_identity = _normalize_telegram_user_id(telegram_user_id)
+        normalized_chat = _normalize_chat_id(chat_id)
+        if normalized_chat != telegram_identity:
+            raise ValueError("Las confirmaciones solo se emiten en el chat privado del actor")
+        timestamp = _normalize_now(now)
+        expiration = _normalize_now(expires_at)
+        if expiration <= timestamp:
+            raise ValueError("expires_at debe estar en el futuro")
+        if expiration > timestamp + CONTROL_CONFIRMATION_MAX_LIFETIME:
+            raise ValueError("La confirmación no puede durar más de 15 minutos")
+        with self._sessions.begin() as session:
+            user, _membership = self._resolve_telegram_identity(
+                session,
+                workspace_id=workspace,
+                telegram_user_id=telegram_identity,
+                chat_id=normalized_chat,
+            )
+            if user.id != actor:
+                raise AuthorizationError("La identidad de Telegram no corresponde al actor")
+            pending = session.scalar(
+                select(func.count(ControlConfirmation.id)).where(
+                    ControlConfirmation.workspace_id == workspace,
+                    ControlConfirmation.user_id == user.id,
+                    ControlConfirmation.consumed_at.is_(None),
+                    ControlConfirmation.expires_at > timestamp,
+                )
+            )
+            if (pending or 0) >= MAX_PENDING_CONTROL_CONFIRMATIONS_PER_USER:
+                raise ConflictError(
+                    "Hay demasiadas confirmaciones pendientes; resuelve o deja vencer "
+                    "las anteriores"
+                )
+            nonce = secrets.token_urlsafe(24)
+            confirmation = ControlConfirmation(
+                nonce_hash=_hash_nonce(nonce),
+                workspace_id=workspace,
+                action=normalized_action,
+                parameters=normalized_parameters,
+                user_id=user.id,
+                telegram_user_id=telegram_identity,
+                chat_id=normalized_chat,
+                expires_at=expiration,
+                created_at=timestamp,
+            )
+            session.add(confirmation)
+            session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=user.id,
+                action="telegram.control_confirmation_issued",
+                entity_type="control_confirmation",
+                entity_id=confirmation.id,
+                detail={
+                    "action": normalized_action,
+                    "parameters": normalized_parameters,
+                    "telegram_user_id": telegram_identity,
+                    "chat_id": normalized_chat,
+                    "expires_at": _format_time(expiration),
+                },
+                now=timestamp,
+            )
+            return IssuedControlConfirmation(nonce=nonce, confirmation=confirmation)
+
+    def consume_control_confirmation(
+        self,
+        nonce: str,
+        *,
+        action: str,
+        telegram_user_id: int | str,
+        chat_id: int | str,
+        confirm: bool,
+        now: datetime | None = None,
+    ) -> ControlConfirmation:
+        """Consume el nonce una sola vez, tanto al confirmar como al cancelar."""
+
+        nonce_hash = _hash_nonce(nonce)
+        normalized_action = _normalize_control_action(action)
+        telegram_identity = _normalize_telegram_user_id(telegram_user_id)
+        normalized_chat = _normalize_chat_id(chat_id)
+        if not isinstance(confirm, bool):
+            raise ValueError("confirm debe ser booleano")
+        timestamp = _normalize_now(now)
+        generic_error = "La confirmación es inválida, expiró o ya fue utilizada"
+        with self._sessions.begin() as session:
+            confirmation = session.scalar(
+                select(ControlConfirmation).where(ControlConfirmation.nonce_hash == nonce_hash)
+            )
+            if (
+                confirmation is None
+                or confirmation.action != normalized_action
+                or confirmation.telegram_user_id != telegram_identity
+                or confirmation.chat_id != normalized_chat
+                or confirmation.consumed_at is not None
+                or confirmation.expires_at <= timestamp
+            ):
+                raise ConflictError(generic_error)
+            user, _membership = self._resolve_telegram_identity(
+                session,
+                workspace_id=confirmation.workspace_id,
+                telegram_user_id=telegram_identity,
+                chat_id=normalized_chat,
+            )
+            if user.id != confirmation.user_id:
+                raise ConflictError(generic_error)
+            outcome = "confirmed" if confirm else "cancelled"
+            result = session.execute(
+                update(ControlConfirmation)
+                .where(
+                    ControlConfirmation.id == confirmation.id,
+                    ControlConfirmation.consumed_at.is_(None),
+                    ControlConfirmation.expires_at > timestamp,
+                )
+                .values(consumed_at=timestamp, consumed_by=user.id, outcome=outcome)
+            )
+            if result.rowcount != 1:
+                raise ConflictError(generic_error)
+            session.flush()
+            confirmation.consumed_at = timestamp
+            confirmation.consumed_by = user.id
+            confirmation.outcome = outcome
+            self._audit(
+                session,
+                workspace_id=confirmation.workspace_id,
+                actor_id=user.id,
+                action=f"telegram.control_confirmation_{outcome}",
+                entity_type="control_confirmation",
+                entity_id=confirmation.id,
+                detail={
+                    "action": normalized_action,
+                    "parameters": confirmation.parameters,
+                    "telegram_user_id": telegram_identity,
+                    "chat_id": normalized_chat,
+                },
+                now=timestamp,
+            )
+            return confirmation
+
+    # ------------------------------------------------------------------
+    # Retiro de aprobación y conciliación manual de la cola
+    # ------------------------------------------------------------------
+
+    def withdraw_approval(
+        self,
+        draft_id: str,
+        *,
+        actor_id: str,
+        expected_snapshot_hash: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> Draft:
+        """Devuelve a ``draft`` un snapshot aprobado que todavía no entró en la cola.
+
+        Exige el permiso de revisión y una persona distinta del autor. Si ya existe
+        una solicitud de publicación encolada o reclamada, no se retira nada: la
+        parada correcta es cerrar el seguro persistido ``live``.
+        """
+
+        actor = _normalize_actor(actor_id)
+        expected = _normalize_sha256(expected_snapshot_hash, required=True)
+        normalized_reason = _normalize_note(reason, required=True)
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            draft = self._get_draft_for_update(session, draft_id)
+            self._authorize(session, actor, draft.workspace_id, Permission.REVIEW_DRAFTS)
+            if DraftStatus(draft.status) is not DraftStatus.APPROVED:
+                raise ConflictError("Solo se puede retirar la aprobación de un draft aprobado")
+            revision = self._current_revision(session, draft)
+            require_distinct_approver(author_id=revision.created_by, approver_id=actor)
+            if revision.snapshot_hash != expected or draft.approved_revision_id != revision.id:
+                raise StaleSnapshotError("El snapshot aprobado ya no coincide con el contenido")
+            active_request = session.scalar(
+                select(PublicationRequest.id).where(
+                    PublicationRequest.draft_id == draft.id,
+                    PublicationRequest.revision_id == revision.id,
+                    PublicationRequest.status.in_(
+                        (
+                            PublicationRequestStatus.QUEUED.value,
+                            PublicationRequestStatus.CLAIMED.value,
+                        )
+                    ),
+                )
+            )
+            if active_request is not None:
+                raise ConflictError(
+                    "El snapshot ya tiene una solicitud de publicación activa; "
+                    "cierra el seguro live para detenerla"
+                )
+            pending_attempt = session.scalar(
+                select(PublishAttempt.id).where(
+                    PublishAttempt.draft_id == draft.id,
+                    PublishAttempt.revision_id == revision.id,
+                    PublishAttempt.status == PublishStatus.PENDING.value,
+                )
+            )
+            if pending_attempt is not None:
+                raise ConflictError("Existe un intento de publicación pendiente para el snapshot")
+            changed = session.execute(
+                update(Draft)
+                .where(
+                    Draft.id == draft.id,
+                    Draft.status == DraftStatus.APPROVED.value,
+                    Draft.current_revision_id == revision.id,
+                )
+                .values(
+                    status=DraftStatus.DRAFT.value,
+                    approved_revision_id=None,
+                    updated_at=timestamp,
+                )
+            )
+            if changed.rowcount != 1:
+                raise ConflictError("Otra operación cambió el draft antes de retirar la aprobación")
+            session.refresh(draft)
+            self._audit(
+                session,
+                workspace_id=draft.workspace_id,
+                actor_id=actor,
+                action="draft.approval_withdrawn",
+                entity_type="draft",
+                entity_id=draft.id,
+                detail={
+                    "revision_id": revision.id,
+                    "snapshot_hash": revision.snapshot_hash,
+                    "reason": normalized_reason,
+                },
+                now=timestamp,
+            )
+            linked_runs = list(
+                session.scalars(
+                    select(AutomationRun)
+                    .where(
+                        AutomationRun.workspace_id == draft.workspace_id,
+                        AutomationRun.draft_id == draft.id,
+                        AutomationRun.status == AutomationRunStatus.READY.value,
+                    )
+                    .with_for_update()
+                )
+            )
+            for run in linked_runs:
+                run.status = AutomationRunStatus.FAILED.value
+                run.error = _sanitize_automation_error(
+                    f"Aprobación retirada por revisión humana: {normalized_reason}"
+                )
+                run.finished_by = actor
+                run.finished_at = timestamp
+                run.updated_at = timestamp
+                self._audit(
+                    session,
+                    workspace_id=run.workspace_id,
+                    actor_id=actor,
+                    action="automation.run_failed",
+                    entity_type="automation_run",
+                    entity_id=run.id,
+                    detail={
+                        "previous_status": AutomationRunStatus.READY.value,
+                        "status": run.status,
+                        "draft_id": draft.id,
+                        "trigger": "draft.approval_withdrawn",
+                    },
+                    now=timestamp,
+                )
+            return draft
+
+    def reconcile_publication_request(
+        self,
+        request_id: str,
+        *,
+        actor_id: str,
+        published: bool,
+        provider_post_id: str | None = None,
+        note: str,
+        now: datetime | None = None,
+    ) -> PublicationRequest:
+        """Cierra una solicitud ``unknown`` tras verificar manualmente la cuenta de X.
+
+        ``published=True`` exige el ID real del post y deja el draft como publicado.
+        ``published=False`` marca fallido el intento inconcluso cuando existe; si no
+        hubo intento persistido, la solicitud conserva ``unknown`` y solo se anota.
+        Nunca se reencola el mismo snapshot: una nueva publicación exige revisión y
+        aprobación nuevas.
+        """
+
+        normalized_request_id = _normalize_entity_id(request_id)
+        actor = _normalize_actor(actor_id)
+        if not isinstance(published, bool):
+            raise ValueError("published debe ser booleano")
+        normalized_note = _normalize_note(note, required=True, max_length=500)
+        normalized_post_id: str | None = None
+        if published:
+            if not isinstance(provider_post_id, str) or (
+                _PROVIDER_POST_ID_PATTERN.fullmatch(provider_post_id.strip()) is None
+            ):
+                raise ValueError("provider_post_id debe ser el ID decimal del post en X")
+            normalized_post_id = provider_post_id.strip()
+        elif provider_post_id is not None:
+            raise ValueError("provider_post_id solo aplica cuando published=True")
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            request = session.scalar(
+                select(PublicationRequest)
+                .where(PublicationRequest.id == normalized_request_id)
+                .with_for_update()
+            )
+            if request is None:
+                raise NotFoundError(
+                    f"No existe la solicitud de publicación '{normalized_request_id}'"
+                )
+            self._authorize(session, actor, request.workspace_id, Permission.PUBLISH_DRAFTS)
+            if PublicationRequestStatus(request.status) is not PublicationRequestStatus.UNKNOWN:
+                raise ConflictError("Solo se concilia una solicitud en estado unknown")
+            attempt: PublishAttempt | None = None
+            if request.publish_attempt_id is not None:
+                attempt = session.get(PublishAttempt, request.publish_attempt_id)
+            if attempt is None:
+                attempt = session.scalar(
+                    select(PublishAttempt)
+                    .where(
+                        PublishAttempt.workspace_id == request.workspace_id,
+                        PublishAttempt.channel == request.channel,
+                        PublishAttempt.idempotency_key
+                        == _publication_attempt_idempotency_key(request.id, request.claim_fence),
+                    )
+                    .with_for_update()
+                )
+            draft = self._get_draft_for_update(session, request.draft_id)
+            revision = session.get(Revision, request.revision_id)
+            if revision is None:  # pragma: no cover - protegido por FK
+                raise NotFoundError("La revisión de la solicitud ya no existe")
+            if attempt is not None and PublishStatus(attempt.status) is PublishStatus.FAILED:
+                raise ConflictError("El intento persistido ya es un fallo claro; no hay ambigüedad")
+            if published:
+                assert normalized_post_id is not None
+                if (
+                    draft.current_revision_id != revision.id
+                    or draft.approved_revision_id != revision.id
+                ) and DraftStatus(draft.status) is not DraftStatus.PUBLISHED:
+                    raise StaleSnapshotError(
+                        "El draft cambió después de la solicitud; concilia primero su revisión"
+                    )
+                if attempt is None:
+                    attempt = PublishAttempt(
+                        workspace_id=request.workspace_id,
+                        draft_id=draft.id,
+                        revision_id=revision.id,
+                        requested_by=actor,
+                        channel=request.channel,
+                        idempotency_key=_publication_attempt_idempotency_key(
+                            request.id, request.claim_fence
+                        ),
+                        snapshot_hash=request.snapshot_hash,
+                        status=PublishStatus.SUCCEEDED.value,
+                        provider_post_id=normalized_post_id,
+                        started_at=timestamp,
+                        finished_at=timestamp,
+                    )
+                    session.add(attempt)
+                    session.flush()
+                elif PublishStatus(attempt.status) is PublishStatus.SUCCEEDED:
+                    if attempt.provider_post_id != normalized_post_id:
+                        raise ConflictError("El intento ya registró otro ID de post en X")
+                else:
+                    attempt.status = PublishStatus.SUCCEEDED.value
+                    attempt.provider_post_id = normalized_post_id
+                    attempt.error = None
+                    attempt.finished_at = timestamp
+                if DraftStatus(draft.status) is not DraftStatus.PUBLISHED:
+                    draft.status = DraftStatus.PUBLISHED.value
+                    draft.updated_at = timestamp
+                request.status = PublicationRequestStatus.SUCCEEDED.value
+                request.publish_attempt_id = attempt.id
+                request.error = None
+                target_run_status = AutomationRunStatus.SUCCEEDED
+            else:
+                if attempt is not None:
+                    attempt.status = PublishStatus.FAILED.value
+                    attempt.error = MANUAL_RECONCILIATION_NOT_PUBLISHED_ERROR
+                    attempt.finished_at = timestamp
+                    request.status = PublicationRequestStatus.FAILED.value
+                    request.publish_attempt_id = attempt.id
+                request.error = _sanitize_automation_error(
+                    f"{MANUAL_RECONCILIATION_NOT_PUBLISHED_ERROR}: {normalized_note}"
+                )
+                target_run_status = AutomationRunStatus.FAILED
+            request.updated_at = timestamp
+            request.finished_at = request.finished_at or timestamp
+            self._audit(
+                session,
+                workspace_id=request.workspace_id,
+                actor_id=actor,
+                action="publication_request.reconciled",
+                entity_type="publication_request",
+                entity_id=request.id,
+                detail={
+                    "draft_id": request.draft_id,
+                    "revision_id": request.revision_id,
+                    "outcome": "published" if published else "not_published",
+                    "provider_post_id": normalized_post_id,
+                    "publish_attempt_id": attempt.id if attempt is not None else None,
+                    "status": request.status,
+                    "note": normalized_note,
+                },
+                now=timestamp,
+            )
+            linked_run = session.scalar(
+                select(AutomationRun)
+                .where(
+                    AutomationRun.workspace_id == request.workspace_id,
+                    AutomationRun.draft_id == request.draft_id,
+                    AutomationRun.status == AutomationRunStatus.PUBLISHING.value,
+                )
+                .with_for_update()
+            )
+            if linked_run is not None:
+                previous_status = linked_run.status
+                linked_run.status = target_run_status.value
+                linked_run.error = (
+                    None if target_run_status is AutomationRunStatus.SUCCEEDED else request.error
+                )
+                linked_run.finished_by = actor
+                linked_run.finished_at = timestamp
+                linked_run.updated_at = timestamp
+                self._audit(
+                    session,
+                    workspace_id=linked_run.workspace_id,
+                    actor_id=actor,
+                    action=f"automation.run_{linked_run.status}",
+                    entity_type="automation_run",
+                    entity_id=linked_run.id,
+                    detail={
+                        "previous_status": previous_status,
+                        "status": linked_run.status,
+                        "draft_id": request.draft_id,
+                        "trigger": "publication_request.reconciled",
+                    },
+                    now=timestamp,
+                )
+            session.flush()
+            return request
+
+    def get_publish_attempt(self, attempt_id: str, *, actor_id: str) -> PublishAttempt:
+        normalized_id = _normalize_entity_id(attempt_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            attempt = session.get(PublishAttempt, normalized_id)
+            if attempt is None:
+                raise NotFoundError(f"No existe el intento de publicación '{normalized_id}'")
+            self._authorize(session, actor, attempt.workspace_id, Permission.VIEW_DRAFTS)
+            return attempt
+
+    def list_recent_audit_events(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        limit: int = 20,
+    ) -> list[AuditEvent]:
+        """Últimos eventos, del más reciente al más antiguo; solo con permiso de auditoría."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        normalized_limit = _normalize_bounded_int(limit, "limit", minimum=1, maximum=100)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.VIEW_AUDIT)
+            return list(
+                session.scalars(
+                    select(AuditEvent)
+                    .where(AuditEvent.workspace_id == workspace)
+                    .order_by(AuditEvent.sequence.desc())
+                    .limit(normalized_limit)
+                )
+            )
+
     def _review_draft(
         self,
         draft_id: str,
@@ -9701,6 +10440,67 @@ def _require_direct_publish_kill_switch() -> None:
         raise ConflictError(
             f"El modo directo está bloqueado: {DIRECT_PUBLISH_ENV} debe valer exactamente true"
         )
+
+
+def _require_direct_publish_arming(session: Session, workspace_id: str) -> None:
+    """Arma el modo directo por entorno del proceso o por el seguro persistido.
+
+    El worker sigue exigiendo su propio entorno del host para contactar a X; este
+    armado solo autoriza a registrar la intención ``direct`` en la configuración.
+    """
+
+    if os.getenv(DIRECT_PUBLISH_ENV, "").strip().lower() == "true":
+        return
+    safeguards = session.get(PublicationSafeguards, workspace_id)
+    if safeguards is not None and safeguards.direct_publish_enabled:
+        return
+    raise ConflictError(
+        f"El modo directo está bloqueado: {DIRECT_PUBLISH_ENV} debe valer exactamente true "
+        "en este proceso o el seguro persistido direct debe estar abierto"
+    )
+
+
+def _default_publication_safeguards(workspace_id: str) -> PublicationSafeguards:
+    """Fila transitoria que representa un espacio sin seguros configurados: todo cerrado."""
+
+    return PublicationSafeguards(
+        workspace_id=workspace_id,
+        live_enabled=False,
+        direct_publish_enabled=False,
+        live_enabled_by=None,
+        live_enabled_at=None,
+        direct_enabled_by=None,
+        direct_enabled_at=None,
+        version=0,
+        updated_by=None,
+        updated_at=None,
+    )
+
+
+def _publication_safeguards_audit_snapshot(safeguards: PublicationSafeguards) -> dict[str, Any]:
+    return {
+        "live_enabled": bool(safeguards.live_enabled),
+        "direct_publish_enabled": bool(safeguards.direct_publish_enabled),
+        "live_enabled_by": safeguards.live_enabled_by,
+        "live_enabled_at": (
+            _format_time(safeguards.live_enabled_at)
+            if safeguards.live_enabled_at is not None
+            else None
+        ),
+        "direct_enabled_by": safeguards.direct_enabled_by,
+        "direct_enabled_at": (
+            _format_time(safeguards.direct_enabled_at)
+            if safeguards.direct_enabled_at is not None
+            else None
+        ),
+        "version": safeguards.version,
+    }
+
+
+def _normalize_control_action(value: object) -> str:
+    if not isinstance(value, str) or _CONTROL_ACTION_PATTERN.fullmatch(value) is None:
+        raise ValueError("La acción de control no tiene un formato válido")
+    return value
 
 
 def _local_day_bounds(value: datetime, timezone: str) -> tuple[datetime, datetime]:

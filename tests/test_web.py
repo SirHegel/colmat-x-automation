@@ -13,6 +13,7 @@ from colmat_x.rbac import Role
 from colmat_x.research_registry import RESEARCH_ONLY_BRIEF_PREFIX, ResearchRegistryError
 from colmat_x.telegram_bot import (
     BotAutomationMode,
+    ControlAction,
     SendMessage,
     WebhookAuthenticationError,
     WebhookResult,
@@ -684,9 +685,15 @@ def test_platform_telegram_operations_expose_calendar_and_cas_mode() -> None:
 
     calendar = operations.get_calendar(days=2, telegram_user_id=7, chat_id=9)
     current = operations.get_mode(telegram_user_id=7, chat_id=9)
-    changed = operations.set_mode(
+    refused = operations.set_mode(
         BotAutomationMode.DIRECT,
         request_id="telegram:10:modo",
+        telegram_user_id=7,
+        chat_id=9,
+    )
+    changed = operations.set_mode(
+        BotAutomationMode.HUMAN_REVIEW,
+        request_id="telegram:11:modo",
         telegram_user_id=7,
         chat_id=9,
     )
@@ -696,23 +703,27 @@ def test_platform_telegram_operations_expose_calendar_and_cas_mode() -> None:
     assert "2026-08-30 16:30 — tarde" in calendar
     assert "modo human_review" in calendar
     assert "versión 3" in current
+    # direct nunca se aplica en un solo paso desde Telegram.
+    assert refused.accepted is False
+    assert "dos pasos" in refused.text
     assert changed.accepted is True
     assert "versión 4" in changed.text
+    assert len(store.mode_changes) == 1
     assert store.mode_changes[0][0:2] == ("reviewer-1", 3)
-    assert getattr(store.mode_changes[0][2], "value", None) == "direct"
+    assert getattr(store.mode_changes[0][2], "value", None) == "human_review"
     assert store.mode_changes[0][3] == [
         {
             "id": "manana",
             "at": "08:30",
             "weekdays": ["lunes"],
-            "mode": "direct",
+            "mode": "human_review",
             "category": "dato_semana",
             "evidence": {"verified": False, "reference": None},
         },
         {
             "id": "tarde",
             "at": "16:30",
-            "mode": "direct",
+            "mode": "human_review",
             "generate_image": True,
         },
     ]
@@ -736,8 +747,9 @@ def test_platform_telegram_mode_change_rejects_malformed_persisted_slots() -> No
     assert store.settings.mode == "human_review"
 
 
-def test_platform_telegram_mode_change_uses_real_cas_and_rbac(monkeypatch) -> None:
-    monkeypatch.setenv("COLMAT_DIRECT_PUBLISH_ENABLED", "true")
+def test_platform_telegram_mode_change_uses_real_cas_and_rbac() -> None:
+    # Sin la variable de entorno del proceso: el bot arma direct solo con el seguro
+    # persistido, abierto por el owner, y una confirmación de un solo uso.
     with PlatformStore("sqlite+pysqlite:///:memory:") as store:
         owner, _membership = store.bootstrap_owner(
             email="owner@web.test",
@@ -784,20 +796,49 @@ def test_platform_telegram_mode_change_uses_real_cas_and_rbac(monkeypatch) -> No
         )
         operations = PlatformTelegramOperations(store)
 
-        changed = operations.set_mode(
+        refused = operations.set_mode(
             BotAutomationMode.DIRECT,
             request_id="telegram:20:modo",
             telegram_user_id=101,
             chat_id=-202,
         )
+        store.bind_telegram_chat(101, telegram_user_id=101, actor_id=owner.id, user_id=owner.id)
+        blocked = operations.request_direct_mode(
+            request_id="telegram:21:modo",
+            telegram_user_id=101,
+            chat_id=101,
+        )
+        store.update_publication_safeguards(
+            actor_id=owner.id,
+            expected_version=0,
+            direct_publish_enabled=True,
+        )
+        prompt = operations.request_direct_mode(
+            request_id="telegram:22:modo",
+            telegram_user_id=101,
+            chat_id=101,
+        )
+        assert prompt.keyboard is not None
+        nonce = prompt.keyboard[0][0].callback_data.split(":")[2]
+        changed = operations.resolve_confirmation(
+            nonce,
+            action=ControlAction.MODE_DIRECT,
+            confirm=True,
+            request_id="telegram:23:confirm",
+            telegram_user_id=101,
+            chat_id=101,
+        )
         denied = operations.set_mode(
             BotAutomationMode.HUMAN_REVIEW,
-            request_id="telegram:21:modo",
+            request_id="telegram:24:modo",
             telegram_user_id=102,
             chat_id=-303,
         )
         settings = store.get_automation_settings(actor_id=owner.id)
 
+    assert refused.accepted is False
+    assert blocked.accepted is False
+    assert "/seguro direct on" in blocked.text
     assert changed.accepted is True
     assert denied.accepted is False
     assert settings.mode == "direct"

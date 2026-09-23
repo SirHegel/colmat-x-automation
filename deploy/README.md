@@ -47,7 +47,9 @@ de esquema cuando la DSN es PostgreSQL; solo SQLite local conserva auto-iniciali
 `DATABASE_URL_UNPOOLED` únicamente fuera de Vercel y úsala solo para aplicar el DDL.
 
 Aplica el esquema fuera de Vercel, antes del primer despliegue, y vuelve a aplicar el archivo antes
-de actualizar una instalación existente. El script es repetible y conserva los registros:
+de actualizar una instalación existente (esta versión añade `publication_safeguards` y
+`control_confirmations`; readiness falla hasta que existan). El script es repetible y conserva
+los registros:
 
 ```bash
 : "${DATABASE_URL_UNPOOLED:?DATABASE_URL_UNPOOLED es obligatoria}"
@@ -311,6 +313,12 @@ Con la agenda desactivada, automation debe devolver `status=paused`. Generation 
 deben seguir bloqueados mientras sus gates estén en `false`. No abras esos gates durante el
 aprovisionamiento.
 
+Los gates del archivo no bastan por sí solos: publication y automation en `direct` también exigen
+los seguros persistidos `live` y `direct`, que nacen cerrados y se abren con doble paso desde
+Telegram (`/seguro live on`, `/seguro direct on`) o desde el host (`safeguards-set`). Cerrarlos
+(`/seguro live off`, desde cualquier chat autorizado) es la parada de emergencia que no requiere
+tocar el host: el worker los relee antes de cada envío.
+
 ## OpenClaw aislado como orquestador
 
 Crea un perfil dedicado a Colmat, mantén su gateway ligado a `127.0.0.1` y no publiques el puerto.
@@ -388,11 +396,15 @@ Antes de activarlo:
 3. Sincroniza slots con evidencia real y auditable mientras el sistema sigue en `human_review`.
 4. Verifica que scheduler, autor, reviewer y publisher sean cuentas activas con los roles correctos
    y que autor y reviewer sean distintos.
-5. Detén el job, pausa la agenda con CAS y cambia a `direct` con owner o admin. La operación exige
-   que `COLMAT_DIRECT_PUBLISH_ENABLED=true` esté presente en ese entorno.
+5. Detén el job, pausa la agenda con CAS y cambia a `direct` con owner o admin. Desde el host, la
+   operación exige `COLMAT_DIRECT_PUBLISH_ENABLED=true` en ese entorno; desde Telegram, exige el
+   seguro persistido `direct` abierto (`/seguro direct on`) y la confirmación con botón de
+   `/modo direct`.
 6. Activa de nuevo la agenda con owner o admin: un scheduler puede activar `human_review`, pero no
-   puede autorizar ni reautorizar `direct`.
-7. Habilita ambos gates en el archivo privado del worker y añade `--live` al job fijo.
+   puede autorizar ni reautorizar `direct`. Desde Telegram, `/agenda activar` en `direct` pide
+   confirmación.
+7. Habilita ambos gates en el archivo privado del worker, añade `--live` al job fijo y abre el
+   seguro persistido `live` (`/seguro live on` o `safeguards-set live on`).
 8. Ejecuta manualmente un solo slot controlado antes de habilitar el job recurrente.
 
 Usa la versión que devuelva cada consulta:

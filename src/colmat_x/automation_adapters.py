@@ -775,6 +775,13 @@ class PlatformXPublisher:
             raise AutomationError(f"Publicación bloqueada: {LIVE_PUBLISH_ENV} no está activo")
         if environment.get(DIRECT_PUBLISH_ENV, "").strip().casefold() != "true":
             raise AutomationError(f"Publicación bloqueada: {DIRECT_PUBLISH_ENV} no está activo")
+        # Los seguros persistidos se releen en cada publicación: el bot puede cerrarlos
+        # entre el claim y el envío, y ese cierre debe ganar.
+        safeguards = self.store.get_publication_safeguards(actor_id=self.publisher_actor_id)
+        if not safeguards.live_enabled:
+            raise AutomationError("Publicación bloqueada: el seguro persistido live está cerrado")
+        if not safeguards.direct_publish_enabled:
+            raise AutomationError("Publicación bloqueada: el seguro persistido direct está cerrado")
         if prepared.claim.slot.mode is not AutomationMode.DIRECT:
             raise AutomationError("El publisher directo solo admite slots en modo direct")
         if not prepared.candidate.evidence_verified:

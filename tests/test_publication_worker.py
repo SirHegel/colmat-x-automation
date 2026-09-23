@@ -106,6 +106,13 @@ def _bootstrap_team(store: PlatformStore) -> Team:
     editor = _add_member(store, owner.id, Role.EDITOR, 1)
     reviewer = _add_member(store, owner.id, Role.REVIEWER, 1)
     publisher = _add_member(store, owner.id, Role.PUBLISHER, 1)
+    # El seguro persistido live nace cerrado; los tests de publicación lo abren a propósito.
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=0,
+        live_enabled=True,
+        now=NOW,
+    )
     return Team(owner.id, scheduler.id, editor.id, reviewer.id, publisher.id)
 
 
@@ -642,3 +649,27 @@ def test_publication_run_cli_defers_identity_verification_to_worker(
     assert worker_kwargs["x_client"] is not None
     assert worker_kwargs["scheduler_actor_id"] == "scheduler-service"
     assert worker_kwargs["publisher_actor_id"] == "publisher-service"
+
+
+def test_closed_persisted_live_safeguard_blocks_queue_without_claiming(
+    store, tmp_path: Path
+) -> None:
+    team = _bootstrap_team(store)
+    _draft, _revision, request, _run_id = _prepare_request(store, team)
+    store.update_publication_safeguards(
+        actor_id=team.owner_id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW,
+    )
+    x_client = FakeX()
+
+    with pytest.raises(AutomationError, match="seguro persistido live"):
+        _worker(store, team, x_client, tmp_path).run()
+
+    persisted = store.get_publication_request(request.id, actor_id=team.publisher_id)
+    assert persisted.status_value is PublicationRequestStatus.QUEUED
+    assert x_client.identity_calls == []
+    assert x_client.post_calls == []
+    with store.session() as session:
+        assert list(session.scalars(select(PublishAttempt))) == []

@@ -19,6 +19,9 @@ _POST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 _SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORM_USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,35}$")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_PROVIDER_POST_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
+_CONTROL_CALLBACK_PREFIXES = frozenset({"confirm", "cancel"})
+MAX_INLINE_KEYBOARD_BUTTONS = 8
 MAX_TELEGRAM_INTEGER = 9_223_372_036_854_775_807
 TELEGRAM_DELEGATABLE_ROLES = frozenset({"editor", "reviewer", "publisher", "scheduler", "auditor"})
 RESEARCH_PATTERN_STEPS = (
@@ -85,6 +88,16 @@ class BotPermission(StrEnum):
     REQUEST_PUBLISH = "content.publish.request"
     APPROVE = "content.approve"
     REJECT = "content.reject"
+    VIEW_AUTOMATION = "automation.view"
+    MANAGE_SCHEDULE = "automation.schedule.manage"
+    VIEW_SAFEGUARDS = "publication.safeguards.view"
+    MANAGE_SAFEGUARDS = "publication.safeguards.manage"
+    VIEW_QUEUE = "content.queue.view"
+    RECONCILE = "content.queue.reconcile"
+    WITHDRAW = "content.withdraw"
+    REQUEST_REVIEW = "content.review.request"
+    VIEW_DIAGNOSTICS = "diagnostics.view"
+    VIEW_AUDIT = "audit.view"
 
 
 class BotAutomationMode(StrEnum):
@@ -95,6 +108,57 @@ class BotAutomationMode(StrEnum):
 class CallbackDecision(StrEnum):
     APPROVE = "approve"
     REJECT = "reject"
+
+
+class ControlAction(StrEnum):
+    """Órdenes que exigen un segundo paso con botón, nonce y chat privado."""
+
+    SAFEGUARD_LIVE_ON = "live_on"
+    SAFEGUARD_DIRECT_ON = "direct_on"
+    MODE_DIRECT = "mode_direct"
+    AGENDA_ENABLE = "agenda_on"
+    USER_DEACTIVATE = "user_off"
+    RECONCILE_PUBLISHED = "rec_pub"
+    RECONCILE_NOT_PUBLISHED = "rec_nopub"
+
+
+class ControlVerb(StrEnum):
+    CONFIRM = "confirm"
+    CANCEL = "cancel"
+
+
+class SafeguardGate(StrEnum):
+    LIVE = "live"
+    DIRECT = "direct"
+
+
+# Cada confirmación vuelve a exigir en el callback el mismo permiso que la orden.
+CONTROL_ACTION_PERMISSIONS: Mapping[ControlAction, BotPermission] = {
+    ControlAction.SAFEGUARD_LIVE_ON: BotPermission.MANAGE_SAFEGUARDS,
+    ControlAction.SAFEGUARD_DIRECT_ON: BotPermission.MANAGE_SAFEGUARDS,
+    ControlAction.MODE_DIRECT: BotPermission.MANAGE_MODE,
+    ControlAction.AGENDA_ENABLE: BotPermission.MANAGE_SCHEDULE,
+    ControlAction.USER_DEACTIVATE: BotPermission.MANAGE_TEAM,
+    ControlAction.RECONCILE_PUBLISHED: BotPermission.RECONCILE,
+    ControlAction.RECONCILE_NOT_PUBLISHED: BotPermission.RECONCILE,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class InlineButton:
+    text: str
+    callback_data: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not 1 <= len(self.text) <= 64:
+            raise ValueError("El texto del botón debe tener entre 1 y 64 caracteres")
+        if _parse_callback_data(self.callback_data) is None and (
+            _parse_control_callback_data(self.callback_data) is None
+        ):
+            raise ValueError("El botón solo admite callback_data del esquema cerrado")
+
+
+InlineKeyboard: TypeAlias = tuple[tuple[InlineButton, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +201,11 @@ class DecisionResult:
 class CommandResult:
     text: str
     accepted: bool = True
+    keyboard: InlineKeyboard | None = None
+
+    def __post_init__(self) -> None:
+        if self.keyboard is not None:
+            _validate_inline_keyboard(self.keyboard)
 
 
 class TelegramUpdateStore(Protocol):
@@ -306,6 +375,115 @@ class TelegramBotOperations(Protocol):
         chat_id: int,
     ) -> DecisionResult: ...
 
+    # --- Agenda -------------------------------------------------------
+
+    def get_automation_status(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def list_automation_runs(self, *, limit: int, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def validate_automation_config(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def sync_automation_config(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        """Copia el YAML desplegado a la base con CAS; no activa ni ejecuta nada."""
+
+    def enable_automation(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        """Activa la agenda; en modo direct devuelve un teclado de confirmación."""
+
+    def disable_automation(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult: ...
+
+    def retry_automation_run(
+        self, run_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult: ...
+
+    # --- Seguros persistidos de publicación real ----------------------
+
+    def get_safeguards(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def request_safeguard_change(
+        self,
+        gate: SafeguardGate,
+        enabled: bool,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Cerrar aplica de inmediato; abrir devuelve un teclado de confirmación."""
+
+    def request_direct_mode(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        """Nunca cambia a direct en un solo paso: devuelve la confirmación."""
+
+    # --- Cola, revisión y conciliación --------------------------------
+
+    def list_queue(self, *, limit: int, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def request_reconciliation(
+        self,
+        publication_request_id: str,
+        *,
+        published: bool,
+        provider_post_id: str | None,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Devuelve una confirmación; la conciliación solo se aplica al confirmar."""
+
+    def withdraw_approval(
+        self, post_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult: ...
+
+    def request_review(
+        self, post_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        """Reemite botones de aprobación/rechazo ligados al snapshot actual."""
+
+    # --- Equipo -------------------------------------------------------
+
+    def request_user_deactivation(
+        self, user_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult: ...
+
+    def reactivate_user(
+        self, user_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult: ...
+
+    def change_user_role(
+        self,
+        user_id: str,
+        role: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult: ...
+
+    # --- Diagnóstico, auditoría y confirmaciones ------------------------
+
+    def run_diagnostics(self, *, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def list_audit(self, *, limit: int, telegram_user_id: int, chat_id: int) -> str: ...
+
+    def resolve_confirmation(
+        self,
+        nonce: str,
+        *,
+        action: ControlAction,
+        confirm: bool,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        """Consume el nonce una sola vez y, si se confirmó, aplica la orden ligada."""
+
 
 class TelegramActionClient(Protocol):
     def send_message(
@@ -314,6 +492,7 @@ class TelegramActionClient(Protocol):
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        reply_markup: Mapping[str, object] | None = None,
     ) -> object: ...
 
     def edit_message_text(
@@ -340,6 +519,21 @@ class SendMessage:
     chat_id: int
     text: str
     reply_to_message_id: int | None = None
+    keyboard: InlineKeyboard | None = None
+
+    def __post_init__(self) -> None:
+        if self.keyboard is not None:
+            _validate_inline_keyboard(self.keyboard)
+
+    def reply_markup(self) -> dict[str, object] | None:
+        if self.keyboard is None:
+            return None
+        return {
+            "inline_keyboard": [
+                [{"text": button.text, "callback_data": button.callback_data} for button in row]
+                for row in self.keyboard
+            ]
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -560,6 +754,20 @@ class TelegramWebhookProcessor:
                 "/modo [human_review|direct] — consultar o solicitar un modo operativo\n"
                 "/generar <brief> — crear un borrador sujeto a revisión\n"
                 "/publicar <id> — solicitar la cola de un borrador ya aprobado\n"
+                "/agenda [runs|validar|sincronizar|activar|pausar|reintentar <run>] — "
+                "estado y operación de la agenda persistida\n"
+                "/seguros — estado de los seguros persistidos de publicación real\n"
+                "/seguro <live|direct> <on|off> — abrir (doble paso) o cerrar un seguro "
+                "(owner/admin)\n"
+                "/cola [n] — solicitudes de publicación y generación\n"
+                "/cola conciliar <request_id> publicado <x_post_id>|no_publicado — cerrar un "
+                "unknown verificado (doble paso)\n"
+                "/revisar <id> — reemitir botones de aprobación para un borrador en revisión\n"
+                "/retirar <id> — retirar una aprobación que aún no entró en la cola\n"
+                "/baja <user_id> | /alta <user_id> | /rol <user_id> <rol> — equipo "
+                "(solo owner, chat privado)\n"
+                "/doctor — diagnóstico del plano de control\n"
+                "/auditoria [n] — últimos eventos de auditoría\n"
                 "/ayuda — esta guía\n"
                 "Las altas usan from.id numérico, un chat privado y roles separados; nunca se "
                 "confía en @username. El modo direct exige autorización y doble compuerta; el "
@@ -702,6 +910,20 @@ class TelegramWebhookProcessor:
                     telegram_user_id=event.actor.telegram_user_id,
                     chat_id=event.actor.chat_id,
                 )
+            elif mode is BotAutomationMode.DIRECT:
+                if not _is_private_actor_chat(event.actor):
+                    return (self._private_only_message(event, "cambiar a direct"),)
+                result = self._operations.request_direct_mode(
+                    request_id=_request_id(update_id, command),
+                    telegram_user_id=event.actor.telegram_user_id,
+                    chat_id=event.actor.chat_id,
+                )
+                text = CommandResult(
+                    "Advertencia: direct solo puede activarse con rol administrativo, "
+                    "kill switch y doble compuerta. " + result.text,
+                    accepted=result.accepted,
+                    keyboard=result.keyboard,
+                )
             elif mode is not None:
                 result = self._operations.set_mode(
                     mode,
@@ -709,13 +931,7 @@ class TelegramWebhookProcessor:
                     telegram_user_id=event.actor.telegram_user_id,
                     chat_id=event.actor.chat_id,
                 )
-                if mode is BotAutomationMode.DIRECT:
-                    text = (
-                        "Advertencia: direct solo puede activarse con rol administrativo, "
-                        "kill switch y doble compuerta. " + result.text
-                    )
-                else:
-                    text = result.text
+                text = result.text
             else:
                 return (self._usage_message(event, "/modo [human_review|direct]"),)
         elif command == "generar":
@@ -745,15 +961,16 @@ class TelegramWebhookProcessor:
             )
             text = result.text
         else:
+            control = self._process_control_command(
+                event,
+                command,
+                argument,
+                update_id=update_id,
+            )
+            if control is not None:
+                return control
             text = "Comando desconocido. Usa /ayuda para ver las opciones disponibles."
-        return (
-            SendMessage(
-                telegram_user_id=event.actor.telegram_user_id,
-                chat_id=event.actor.chat_id,
-                text=_operation_text(text),
-                reply_to_message_id=event.message_id,
-            ),
-        )
+        return (self._reply(event, text),)
 
     def _process_callback(
         self,
@@ -762,6 +979,16 @@ class TelegramWebhookProcessor:
         update_id: int,
         claim: TelegramUpdateClaim,
     ) -> tuple[BotAction, ...]:
+        control = _parse_control_callback_data(event.data)
+        if control is not None:
+            verb, action, control_nonce = control
+            return self._process_control_callback(
+                event,
+                verb=verb,
+                action=action,
+                nonce=control_nonce,
+                update_id=update_id,
+            )
         parsed = _parse_callback_data(event.data)
         if parsed is None:
             return (self._callback_error(event, "Acción inválida o vencida."),)
@@ -905,6 +1132,325 @@ class TelegramWebhookProcessor:
             ),
         )
 
+    # ------------------------------------------------------------------
+    # Comandos de control operativo (agenda, seguros, cola, equipo, diagnóstico)
+    # ------------------------------------------------------------------
+
+    def _process_control_command(
+        self,
+        event: _MessageEvent,
+        command: str,
+        argument: str,
+        *,
+        update_id: int,
+    ) -> tuple[BotAction, ...] | None:
+        """Despacha los comandos nuevos; devuelve ``None`` si el comando no existe."""
+
+        if command == "agenda":
+            return self._agenda_command(event, argument, update_id=update_id)
+        if command == "seguros":
+            if argument:
+                return (self._usage_message(event, "/seguros"),)
+            if not self._allowed(event.actor, BotPermission.VIEW_SAFEGUARDS):
+                return (self._forbidden_message(event, "consultar los seguros"),)
+            return (self._reply(event, self._operations.get_safeguards(**self._identity(event))),)
+        if command == "seguro":
+            return self._safeguard_command(event, argument, update_id=update_id)
+        if command == "cola":
+            return self._queue_command(event, argument, update_id=update_id)
+        if command == "retirar":
+            if not self._allowed(event.actor, BotPermission.WITHDRAW):
+                return (self._forbidden_message(event, "retirar una aprobación"),)
+            post_id = _publication_post_id(argument)
+            if post_id is None:
+                return (self._usage_message(event, "/retirar <id de borrador aprobado>"),)
+            result = self._operations.withdraw_approval(
+                post_id,
+                request_id=_request_id(update_id, command),
+                **self._identity(event),
+            )
+            return (self._reply(event, result),)
+        if command == "revisar":
+            if not self._allowed(event.actor, BotPermission.REQUEST_REVIEW):
+                return (self._forbidden_message(event, "solicitar botones de revisión"),)
+            post_id = _publication_post_id(argument)
+            if post_id is None:
+                return (self._usage_message(event, "/revisar <id de borrador en revisión>"),)
+            result = self._operations.request_review(
+                post_id,
+                request_id=_request_id(update_id, command),
+                **self._identity(event),
+            )
+            return (self._reply(event, result),)
+        if command in {"baja", "alta", "rol"}:
+            return self._team_command(event, command, argument, update_id=update_id)
+        if command == "doctor":
+            if argument:
+                return (self._usage_message(event, "/doctor"),)
+            if not self._allowed(event.actor, BotPermission.VIEW_DIAGNOSTICS):
+                return (self._forbidden_message(event, "ejecutar el diagnóstico"),)
+            return (self._reply(event, self._operations.run_diagnostics(**self._identity(event))),)
+        if command == "auditoria":
+            if not self._allowed(event.actor, BotPermission.VIEW_AUDIT):
+                return (self._forbidden_message(event, "consultar la auditoría"),)
+            limit = _bounded_count(argument, default=10, maximum=50)
+            if limit is None:
+                return (self._usage_message(event, "/auditoria [eventos entre 1 y 50]"),)
+            return (
+                self._reply(
+                    event,
+                    self._operations.list_audit(limit=limit, **self._identity(event)),
+                ),
+            )
+        return None
+
+    def _agenda_command(
+        self,
+        event: _MessageEvent,
+        argument: str,
+        *,
+        update_id: int,
+    ) -> tuple[BotAction, ...]:
+        usage = "/agenda [runs [1-20]|validar|sincronizar|activar|pausar|reintentar <run_id>]"
+        parts = argument.split()
+        subcommand = parts[0].casefold() if parts else ""
+        rest = parts[1:]
+        identity = self._identity(event)
+        if subcommand == "":
+            if not self._allowed(event.actor, BotPermission.VIEW_AUTOMATION):
+                return (self._forbidden_message(event, "consultar la agenda"),)
+            return (self._reply(event, self._operations.get_automation_status(**identity)),)
+        if subcommand == "runs":
+            if not self._allowed(event.actor, BotPermission.VIEW_AUTOMATION):
+                return (self._forbidden_message(event, "consultar la agenda"),)
+            limit = _bounded_count(" ".join(rest), default=5, maximum=20)
+            if limit is None:
+                return (self._usage_message(event, usage),)
+            return (
+                self._reply(event, self._operations.list_automation_runs(limit=limit, **identity)),
+            )
+        if subcommand == "validar":
+            if rest:
+                return (self._usage_message(event, usage),)
+            if not self._allowed(event.actor, BotPermission.VIEW_AUTOMATION):
+                return (self._forbidden_message(event, "validar la agenda"),)
+            return (self._reply(event, self._operations.validate_automation_config(**identity)),)
+        if subcommand in {"sincronizar", "activar", "pausar", "reintentar"}:
+            if not self._allowed(event.actor, BotPermission.MANAGE_SCHEDULE):
+                return (self._forbidden_message(event, "operar la agenda"),)
+            request_id = _request_id(update_id, f"agenda:{subcommand}")
+            if subcommand == "pausar":
+                # Pausar es la dirección segura: se admite desde cualquier chat autorizado.
+                if rest:
+                    return (self._usage_message(event, usage),)
+                result = self._operations.disable_automation(request_id=request_id, **identity)
+                return (self._reply(event, result),)
+            if not _is_private_actor_chat(event.actor):
+                return (self._private_only_message(event, "sincronizar, activar o reintentar"),)
+            if subcommand == "sincronizar":
+                if rest:
+                    return (self._usage_message(event, usage),)
+                result = self._operations.sync_automation_config(request_id=request_id, **identity)
+                return (self._reply(event, result),)
+            if subcommand == "activar":
+                if rest:
+                    return (self._usage_message(event, usage),)
+                result = self._operations.enable_automation(request_id=request_id, **identity)
+                return (self._reply(event, result),)
+            run_id = _entity_id_argument(rest[0]) if len(rest) == 1 else None
+            if run_id is None:
+                return (self._usage_message(event, usage),)
+            result = self._operations.retry_automation_run(
+                run_id, request_id=request_id, **identity
+            )
+            return (self._reply(event, result),)
+        return (self._usage_message(event, usage),)
+
+    def _safeguard_command(
+        self,
+        event: _MessageEvent,
+        argument: str,
+        *,
+        update_id: int,
+    ) -> tuple[BotAction, ...]:
+        if not self._allowed(event.actor, BotPermission.MANAGE_SAFEGUARDS):
+            return (self._forbidden_message(event, "operar los seguros de publicación"),)
+        parsed = _safeguard_arguments(argument)
+        if parsed is None:
+            return (self._usage_message(event, "/seguro <live|direct> <on|off>"),)
+        gate, enabled = parsed
+        # Cerrar un seguro es la parada de emergencia y vale desde cualquier chat autorizado;
+        # abrirlo exige chat privado y un segundo paso con botón.
+        if enabled and not _is_private_actor_chat(event.actor):
+            return (self._private_only_message(event, "abrir un seguro de publicación"),)
+        result = self._operations.request_safeguard_change(
+            gate,
+            enabled,
+            request_id=_request_id(update_id, f"seguro:{gate.value}:{'on' if enabled else 'off'}"),
+            **self._identity(event),
+        )
+        return (self._reply(event, result),)
+
+    def _queue_command(
+        self,
+        event: _MessageEvent,
+        argument: str,
+        *,
+        update_id: int,
+    ) -> tuple[BotAction, ...]:
+        parts = argument.split()
+        identity = self._identity(event)
+        if not parts or parts[0].casefold() != "conciliar":
+            if not self._allowed(event.actor, BotPermission.VIEW_QUEUE):
+                return (self._forbidden_message(event, "consultar la cola"),)
+            limit = _bounded_count(argument, default=10, maximum=20)
+            if limit is None:
+                return (
+                    self._usage_message(
+                        event,
+                        "/cola [1-20] | /cola conciliar <request_id> publicado <x_post_id> | "
+                        "/cola conciliar <request_id> no_publicado",
+                    ),
+                )
+            return (self._reply(event, self._operations.list_queue(limit=limit, **identity)),)
+        if not self._allowed(event.actor, BotPermission.RECONCILE):
+            return (self._forbidden_message(event, "conciliar la cola"),)
+        if not _is_private_actor_chat(event.actor):
+            return (self._private_only_message(event, "conciliar resultados ambiguos"),)
+        reconciliation = _reconciliation_arguments(parts[1:])
+        if reconciliation is None:
+            return (
+                self._usage_message(
+                    event,
+                    "/cola conciliar <request_id> publicado <x_post_id> | "
+                    "/cola conciliar <request_id> no_publicado",
+                ),
+            )
+        request_target, published, provider_post_id = reconciliation
+        result = self._operations.request_reconciliation(
+            request_target,
+            published=published,
+            provider_post_id=provider_post_id,
+            request_id=_request_id(update_id, "cola:conciliar"),
+            **identity,
+        )
+        return (self._reply(event, result),)
+
+    def _team_command(
+        self,
+        event: _MessageEvent,
+        command: str,
+        argument: str,
+        *,
+        update_id: int,
+    ) -> tuple[BotAction, ...]:
+        if not self._allowed(event.actor, BotPermission.MANAGE_TEAM):
+            return (self._forbidden_message(event, "administrar usuarios de Telegram"),)
+        if not _is_private_actor_chat(event.actor):
+            return (self._private_management_message(event),)
+        parts = argument.split()
+        identity = self._identity(event)
+        request_id = _request_id(update_id, command)
+        if command == "rol":
+            user_id = _entity_id_argument(parts[0]) if len(parts) == 2 else None
+            role = _role_argument(parts[1]) if len(parts) == 2 else None
+            if user_id is None or role is None:
+                return (
+                    self._usage_message(
+                        event,
+                        "/rol <user_id> <editor|reviewer|publisher|scheduler|auditor>",
+                    ),
+                )
+            result = self._operations.change_user_role(
+                user_id, role, request_id=request_id, **identity
+            )
+            return (self._reply(event, result),)
+        user_id = _entity_id_argument(parts[0]) if len(parts) == 1 else None
+        if user_id is None:
+            return (self._usage_message(event, f"/{command} <user_id>"),)
+        if command == "baja":
+            result = self._operations.request_user_deactivation(
+                user_id, request_id=request_id, **identity
+            )
+        else:
+            result = self._operations.reactivate_user(user_id, request_id=request_id, **identity)
+        return (self._reply(event, result),)
+
+    def _process_control_callback(
+        self,
+        event: _CallbackEvent,
+        *,
+        verb: ControlVerb,
+        action: ControlAction,
+        nonce: str,
+        update_id: int,
+    ) -> tuple[BotAction, ...]:
+        permission = CONTROL_ACTION_PERMISSIONS[action]
+        if not self._allowed(event.actor, BotPermission.ACCESS) or not self._allowed(
+            event.actor, permission
+        ):
+            return (self._callback_error(event, "No tienes permiso para esta acción."),)
+        if not _is_private_actor_chat(event.actor):
+            return (self._callback_error(event, "Confirma únicamente en tu chat privado."),)
+        confirm = verb is ControlVerb.CONFIRM
+        result = self._operations.resolve_confirmation(
+            nonce,
+            action=action,
+            confirm=confirm,
+            request_id=_request_id(update_id, f"{verb.value}:{action.value}"),
+            telegram_user_id=event.actor.telegram_user_id,
+            chat_id=event.actor.chat_id,
+        )
+        if not result.accepted:
+            notice = "No se aplicó la orden."
+        elif confirm:
+            notice = "Orden confirmada y registrada."
+        else:
+            notice = "Orden cancelada; no se aplicó ningún cambio."
+        return (
+            AnswerCallbackQuery(
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+                callback_query_id=event.callback_query_id,
+                text=notice,
+                show_alert=not result.accepted,
+            ),
+            EditMessageText(
+                telegram_user_id=event.actor.telegram_user_id,
+                chat_id=event.actor.chat_id,
+                message_id=event.message_id,
+                text=_operation_text(result.text),
+            ),
+        )
+
+    @staticmethod
+    def _identity(event: _MessageEvent) -> dict[str, int]:
+        return {
+            "telegram_user_id": event.actor.telegram_user_id,
+            "chat_id": event.actor.chat_id,
+        }
+
+    @staticmethod
+    def _reply(event: _MessageEvent, result: CommandResult | str) -> SendMessage:
+        text = result if isinstance(result, str) else result.text
+        keyboard = None if isinstance(result, str) else result.keyboard
+        return SendMessage(
+            telegram_user_id=event.actor.telegram_user_id,
+            chat_id=event.actor.chat_id,
+            text=_operation_text(text),
+            reply_to_message_id=event.message_id,
+            keyboard=keyboard,
+        )
+
+    @staticmethod
+    def _private_only_message(event: _MessageEvent, operation: str) -> SendMessage:
+        return SendMessage(
+            telegram_user_id=event.actor.telegram_user_id,
+            chat_id=event.actor.chat_id,
+            text=f"Por seguridad, solo puedes {operation} en el chat privado con el bot.",
+            reply_to_message_id=event.message_id,
+        )
+
     def _allowed(self, actor: _Actor, permission: BotPermission) -> bool:
         return self._authorizer.is_allowed(
             telegram_user_id=actor.telegram_user_id,
@@ -980,11 +1526,20 @@ def execute_bot_actions(
     for action in ordered:
         try:
             if isinstance(action, SendMessage):
-                result = client.send_message(
-                    action.chat_id,
-                    action.text,
-                    reply_to_message_id=action.reply_to_message_id,
-                )
+                reply_markup = action.reply_markup()
+                if reply_markup is None:
+                    result = client.send_message(
+                        action.chat_id,
+                        action.text,
+                        reply_to_message_id=action.reply_to_message_id,
+                    )
+                else:
+                    result = client.send_message(
+                        action.chat_id,
+                        action.text,
+                        reply_to_message_id=action.reply_to_message_id,
+                        reply_markup=reply_markup,
+                    )
             elif isinstance(action, EditMessageText):
                 reply_markup = {"inline_keyboard": []} if action.remove_inline_keyboard else None
                 result = client.edit_message_text(
@@ -1021,15 +1576,19 @@ def serialize_bot_actions(actions: Sequence[BotAction]) -> tuple[dict[str, objec
     serialized: list[dict[str, object]] = []
     for action in actions:
         if isinstance(action, SendMessage):
-            serialized.append(
-                {
-                    "kind": "send_message",
-                    "telegram_user_id": action.telegram_user_id,
-                    "chat_id": action.chat_id,
-                    "text": action.text,
-                    "reply_to_message_id": action.reply_to_message_id,
-                }
-            )
+            item: dict[str, object] = {
+                "kind": "send_message",
+                "telegram_user_id": action.telegram_user_id,
+                "chat_id": action.chat_id,
+                "text": action.text,
+                "reply_to_message_id": action.reply_to_message_id,
+            }
+            if action.keyboard is not None:
+                item["keyboard"] = [
+                    [{"text": button.text, "callback_data": button.callback_data} for button in row]
+                    for row in action.keyboard
+                ]
+            serialized.append(item)
         elif isinstance(action, EditMessageText):
             serialized.append(
                 {
@@ -1074,13 +1633,10 @@ def deserialize_bot_actions(
         text = item.get("text")
         if not isinstance(text, str):
             raise ValueError("La acción durable requiere texto")
-        if kind == "send_message" and set(item) == {
-            "kind",
-            "telegram_user_id",
-            "chat_id",
-            "text",
-            "reply_to_message_id",
-        }:
+        if kind == "send_message" and set(item) in (
+            {"kind", "telegram_user_id", "chat_id", "text", "reply_to_message_id"},
+            {"kind", "telegram_user_id", "chat_id", "text", "reply_to_message_id", "keyboard"},
+        ):
             reply = item.get("reply_to_message_id")
             actions.append(
                 SendMessage(
@@ -1090,6 +1646,7 @@ def deserialize_bot_actions(
                     reply_to_message_id=(
                         None if reply is None else _stored_integer(reply, "reply_to_message_id")
                     ),
+                    keyboard=(_stored_keyboard(item["keyboard"]) if "keyboard" in item else None),
                 )
             )
         elif kind == "edit_message_text" and set(item) == {
@@ -1178,6 +1735,97 @@ def approval_callback_data(nonce: str) -> str:
 
 def rejection_callback_data(nonce: str) -> str:
     return _callback_data(CallbackDecision.REJECT, nonce)
+
+
+def confirmation_callback_data(action: ControlAction, nonce: str) -> str:
+    return _control_callback_data(ControlVerb.CONFIRM, action, nonce)
+
+
+def cancellation_callback_data(action: ControlAction, nonce: str) -> str:
+    return _control_callback_data(ControlVerb.CANCEL, action, nonce)
+
+
+def confirmation_keyboard(action: ControlAction, nonce: str) -> InlineKeyboard:
+    """Teclado canónico de dos botones para el segundo paso de una orden sensible."""
+
+    return (
+        (
+            InlineButton("Confirmar", confirmation_callback_data(action, nonce)),
+            InlineButton("Cancelar", cancellation_callback_data(action, nonce)),
+        ),
+    )
+
+
+def _control_callback_data(verb: ControlVerb, action: ControlAction, nonce: str) -> str:
+    if not isinstance(action, ControlAction):
+        raise ValueError("La acción de control debe pertenecer al catálogo cerrado")
+    if not isinstance(nonce, str) or _CALLBACK_NONCE_PATTERN.fullmatch(nonce) is None:
+        raise ValueError("El nonce del callback no tiene un formato seguro")
+    value = f"{verb.value}:{action.value}:{nonce}"
+    if len(value.encode("utf-8")) > 64:
+        raise ValueError("callback_data supera el límite de 64 bytes de Telegram")
+    return value
+
+
+def _parse_control_callback_data(
+    value: object,
+) -> tuple[ControlVerb, ControlAction, str] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(encoded) > 64:
+        return None
+    parts = value.split(":")
+    if len(parts) != 3 or parts[0] not in _CONTROL_CALLBACK_PREFIXES:
+        return None
+    raw_verb, raw_action, nonce = parts
+    if _CALLBACK_NONCE_PATTERN.fullmatch(nonce) is None:
+        return None
+    try:
+        return ControlVerb(raw_verb), ControlAction(raw_action), nonce
+    except ValueError:
+        return None
+
+
+def _validate_inline_keyboard(keyboard: object) -> None:
+    if not isinstance(keyboard, tuple) or not keyboard:
+        raise ValueError("El teclado debe ser una tupla no vacía de filas")
+    total = 0
+    for row in keyboard:
+        if not isinstance(row, tuple) or not row:
+            raise ValueError("Cada fila del teclado debe ser una tupla no vacía")
+        for button in row:
+            if not isinstance(button, InlineButton):
+                raise ValueError("El teclado solo admite InlineButton")
+            total += 1
+    if total > MAX_INLINE_KEYBOARD_BUTTONS:
+        raise ValueError("El teclado supera el máximo de botones permitido")
+
+
+def _stored_keyboard(value: object) -> InlineKeyboard:
+    if not isinstance(value, list) or not value:
+        raise ValueError("El teclado durable debe ser una lista no vacía")
+    rows: list[tuple[InlineButton, ...]] = []
+    for raw_row in value:
+        if not isinstance(raw_row, list) or not raw_row:
+            raise ValueError("La fila durable del teclado no es válida")
+        buttons: list[InlineButton] = []
+        for raw_button in raw_row:
+            if (
+                not isinstance(raw_button, Mapping)
+                or set(raw_button) != {"text", "callback_data"}
+                or not isinstance(raw_button.get("text"), str)
+                or not isinstance(raw_button.get("callback_data"), str)
+            ):
+                raise ValueError("El botón durable no es válido")
+            buttons.append(InlineButton(raw_button["text"], raw_button["callback_data"]))
+        rows.append(tuple(buttons))
+    keyboard = tuple(rows)
+    _validate_inline_keyboard(keyboard)
+    return keyboard
 
 
 def _callback_data(decision: CallbackDecision, nonce: str) -> str:
@@ -1496,6 +2144,59 @@ def _publication_post_id(argument: str) -> str | None:
     if not argument or _POST_ID_PATTERN.fullmatch(argument) is None:
         return None
     return argument
+
+
+def _bounded_count(argument: str, *, default: int, maximum: int) -> int | None:
+    if not argument:
+        return default
+    if re.fullmatch(r"[1-9][0-9]?", argument) is None:
+        return None
+    value = int(argument)
+    return value if value <= maximum else None
+
+
+def _entity_id_argument(argument: str) -> str | None:
+    if not argument or len(argument) > 36 or _PLATFORM_USER_ID_PATTERN.fullmatch(argument) is None:
+        return None
+    return argument
+
+
+def _safeguard_arguments(argument: str) -> tuple[SafeguardGate, bool] | None:
+    parts = argument.split()
+    if len(parts) != 2:
+        return None
+    try:
+        gate = SafeguardGate(parts[0].casefold())
+    except ValueError:
+        return None
+    switch = parts[1].casefold()
+    if switch not in {"on", "off"}:
+        return None
+    return gate, switch == "on"
+
+
+def _reconciliation_arguments(parts: Sequence[str]) -> tuple[str, bool, str | None] | None:
+    """Interpreta ``<request_id> publicado <x_post_id>`` o ``<request_id> no_publicado``."""
+
+    if len(parts) < 2:
+        return None
+    request_id = _entity_id_argument(parts[0])
+    outcome = parts[1].casefold()
+    if request_id is None:
+        return None
+    if outcome == "publicado" and len(parts) == 3:
+        provider_post_id = parts[2]
+        if _PROVIDER_POST_ID_PATTERN.fullmatch(provider_post_id) is None:
+            return None
+        return request_id, True, provider_post_id
+    if outcome == "no_publicado" and len(parts) == 2:
+        return request_id, False, None
+    return None
+
+
+def _role_argument(argument: str) -> str | None:
+    role = argument.casefold()
+    return role if role in TELEGRAM_DELEGATABLE_ROLES else None
 
 
 def _request_id(update_id: int, command: str) -> str:
