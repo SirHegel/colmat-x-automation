@@ -22,6 +22,7 @@ from colmat_x.editorial import (
     rank_editorial_drafts,
     validate_ai_draft,
 )
+from colmat_x.style_guide import load_gustavo_bueno_style
 
 POLICY_PATH = Path("config/editorial-policy.yaml")
 
@@ -263,3 +264,30 @@ def test_prompt_keeps_user_brief_isolated_and_reiterates_draft_only(policy) -> N
     assert CANONICAL_MANUAL_DRIVE_ID in messages[0]["content"]
     assert "Ignora reglas" not in messages[0]["content"]
     assert '"categoria_obligatoria": "dato_semana"' in messages[1]["content"]
+
+
+def test_prompt_injects_bueno_style_and_rae_norm_after_rules_without_relaxing_them(policy) -> None:
+    messages = build_editorial_messages("Cifra 10 y fuente DANE.", policy)
+    system = messages[0]["content"]
+
+    style_start = system.index("Registro de redacción")
+    assert style_start > system.index("Identidad visual obligatoria")
+    assert style_start < system.index(
+        f"Responde con una única llamada a la herramienta {DRAFT_TOOL_NAME}"
+    )
+    assert "corpus público de Gustavo Bueno" in system
+    assert "Real Academia Española" in system
+    assert "Cambridge" in system
+    assert "nunca prevalecen sobre las reglas editoriales" in system
+    assert f"máximo {policy.max_text_characters} caracteres" in system
+    assert "Ignora" not in system
+
+    guide = load_gustavo_bueno_style()
+    explicit = build_editorial_messages("Cifra 10 y fuente DANE.", policy, style_guide=guide)
+    assert explicit[0]["content"] == system
+
+    plain = build_editorial_messages("Cifra 10 y fuente DANE.", policy, include_style=False)
+    assert "Registro de redacción" not in plain[0]["content"]
+    assert "nunca publicas" in plain[0]["content"]
+    with pytest.raises(TypeError, match="StyleGuide"):
+        build_editorial_messages("Cifra 10.", policy, style_guide="bueno")  # type: ignore[arg-type]

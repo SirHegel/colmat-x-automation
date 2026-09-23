@@ -1,0 +1,246 @@
+version: 1
+
+metadata:
+  nombre: "Guía de estilo derivada del corpus de Gustavo Bueno"
+  finalidad: >-
+    Modular el registro de los borradores de COLMAT para que suenen a la prosa de
+    Gustavo Bueno (materialismo filosófico) y no a ensayo académico anglosajón. Cada
+    directiva y cada término del léxico citan las claves de la evidencia estilométrica
+    que los respaldan; sin evidencia en el corpus no hay directiva.
+  evidencia: config/estilo-gustavo-bueno-evidencia.yaml
+  manifiesto: config/gustavo-bueno-corpus-manifest.yaml
+  derivada_el: "2026-09-23"
+  advertencia: >-
+    La guía no reproduce textos de Gustavo Bueno, protegidos por derechos de autor:
+    recoge rasgos estadísticos, conectores y léxico. Nunca se le atribuyen frases,
+    cifras ni opiniones que no estén en el encargo verificado.
+
+norma_ortografica:
+  autoridad: >-
+    Real Academia Española y ASALE (Ortografía de la lengua española de 2010,
+    Diccionario panhispánico de dudas y Diccionario de la lengua española)
+  variedad: >-
+    español peninsular neutro, el de Bueno; se admite el léxico institucional y
+    territorial colombiano que la pieza exija
+  reglas:
+    - "Comillas angulares «» como primera opción; las inglesas “” solo dentro de otras comillas."
+    - "Signos de apertura ¿ y ¡ siempre."
+    - "Coma decimal y espacio antes del símbolo (25,2 %); millares con punto o espacio, nunca con coma."
+    - "Raya — para incisos, sin espacio interior; el guion corto no la sustituye."
+    - "«Solo» y los demostrativos sin tilde (Ortografía 2010), aunque el corpus, anterior, escriba «sólo»."
+    - "Mayúscula inicial solo donde la RAE la prescribe: Estado, Nación e Imperio en sentido político e instituciones; minúscula en cargos, meses, gentilicios y disciplinas."
+    - "Abreviaturas y siglas según la RAE: etc., p. ej., EE. UU.; siglas sin puntos ni plural en s."
+    - "Fechas en formato hispánico: 23 de septiembre de 2026."
+  prohibiciones:
+    - "Coma de Oxford y puntuación encerrada en las comillas al modo inglés."
+    - "Punto decimal, coma de millares y símbolo pegado a la cifra (25.2%)."
+    - "Title Case y mayúsculas enfáticas."
+    - "Anglicismos y calcos: «evidencia» por prueba, «soportar» por apoyar, «asumir» por suponer, «en base a», «a nivel de», «hacer sentido», «empoderar», «disruptivo», «insight», «feedback»."
+    - "Manuales de estilo anglosajones (Cambridge, Oxford, Chicago, APA) y cualquier corrector o norma distinta de la RAE."
+
+lexico:
+  - termino: Idea
+    clave: "lexico_tecnico.Idea (mayúscula)"
+    uso: "con mayúscula solo en sentido técnico (la Idea de Estado); en minúscula en el uso corriente"
+  - termino: concepto
+    clave: "lexico_tecnico.concepto"
+    uso: "lo categorial, propio de una ciencia o técnica; las Ideas atraviesan varias categorías"
+  - termino: Estado
+    clave: "lexico_tecnico.Estado"
+    uso: "la sociedad política organizada; mayúscula en sentido político"
+  - termino: sociedad política
+    clave: "lexico_tecnico.sociedad política"
+    uso: "la unidad política real, frente a la retórica de «sociedad civil»"
+  - termino: institución
+    clave: "lexico_tecnico.institución"
+    uso: "toda pauta cultural estable; se analiza, no se venera"
+  - termino: ideología
+    clave: "lexico_tecnico.ideología"
+    uso: "representación interesada que se presenta como verdad; se tritura, no se «deconstruye»"
+  - termino: mito
+    clave: "lexico_tecnico.mito"
+    uso: "idea confusa que encubre relaciones reales (el mito de la cultura, de la felicidad)"
+  - termino: totalidad
+    clave: "lexico_tecnico.totalidad"
+    uso: "todo con partes; atributivo si las partes están conectadas, distributivo si son independientes"
+  - termino: dialéctica
+    clave: "lexico_tecnico.dialéctica"
+    uso: "conflicto real entre partes, no síntesis conciliadora"
+  - termino: symploké
+    clave: "lexico_tecnico.symploké"
+    uso: "unas cosas están conectadas con otras y otras no; ni todo con todo ni nada con nada"
+  - termino: materialismo filosófico
+    clave: "lexico_tecnico.materialismo filosófico"
+    uso: "el sistema, nombrado completo, nunca «materialismo» a secas"
+  - termino: ejercicio / representación
+    clave: "lexico_tecnico.ejercicio / representación"
+    uso: "lo que se hace frente a lo que se dice; la brecha entre ambos es materia de crítica"
+
+directivas:
+  - id: distinguir-antes-de-afirmar
+    regla: >-
+      Abre distinguiendo: «X no es Y, sino Z», «no es lo mismo X que Y». La contraposición
+      «no… sino» es la figura dominante del corpus y organiza el argumento en una frase.
+    evidencia:
+      - clave: "figuras_por_10k.no X sino Y.por_10k"
+        minimo: 10
+      - clave: "figuras_por_10k.no X sino Y.documentos_pct"
+        minimo: 80
+      - clave: "figuras_por_10k.distinguir / distinción.por_10k"
+        minimo: 3
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: reformular-y-ejemplificar
+    regla: >-
+      Encadena con los conectores del corpus: reformula («es decir»), ejemplifica («por
+      ejemplo»), concluye («por tanto») y admite la reserva irónica («acaso», «cabe») y la
+      concesión seca («sin embargo», «ahora bien»).
+    evidencia:
+      - clave: "conectores_por_10k.es decir.por_10k"
+        minimo: 5
+      - clave: "conectores_por_10k.por ejemplo.por_10k"
+        minimo: 5
+      - clave: "conectores_por_10k.acaso.por_10k"
+        minimo: 3
+      - clave: "conectores_por_10k.por tanto.por_10k"
+        minimo: 3
+    ejemplos:
+      - es decir
+      - por ejemplo
+      - acaso
+      - por tanto
+      - sin embargo
+      - cabría / cabe
+      - precisamente
+      - ahora bien
+      - en efecto
+    ejemplos_en: conectores_por_10k
+
+  - id: ironia-por-comillas
+    regla: >-
+      La ironía se marca con comillas angulares sobre una sola palabra o con adjetivos de
+      distanciamiento («supuesto», «pretendido», «los llamados»), nunca con exclamaciones
+      ni sarcasmo explícito.
+    evidencia:
+      - clave: "figuras_por_10k.comillas irónicas de una palabra.por_10k"
+        minimo: 20
+      - clave: "figuras_por_10k.supuesto / pretendido / presunto.por_10k"
+        minimo: 4
+      - clave: "figuras_por_10k.los llamados / la llamada.por_10k"
+        minimo: 1
+      - clave: "oracion.exclamativas_pct"
+        minimo: null
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: critica-como-trituracion
+    regla: >-
+      La crítica muestra confusa u oscura la idea contraria y reconstruye la cuestión desde
+      sus partes; clasifica y numera cuando hay alternativas, sin adjetivos morales ni
+      indignación.
+    evidencia:
+      - clave: "figuras_por_10k.confusión / oscuridad (crítica).por_10k"
+        minimo: 1.5
+      - clave: "figuras_por_10k.clasificación / clasificar.por_10k"
+        minimo: 1.5
+      - clave: "figuras_por_10k.enumeración numerada (1) (2).por_10k"
+        minimo: 2
+      - clave: "parrafo.numerados_pct"
+        minimo: 5
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: puntuacion-densa
+    regla: >-
+      Puntuación de argumentación densa: comillas angulares, paréntesis para precisar, punto
+      y coma o dos puntos para articular; en X vale más una frase compuesta bien articulada
+      que tres cortas y sueltas.
+    evidencia:
+      - clave: "puntuacion_por_10k.comillas angulares «»"
+        minimo: 60
+      - clave: "puntuacion_por_10k.paréntesis ("
+        minimo: 50
+      - clave: "puntuacion_por_10k.punto y coma ;"
+        minimo: 15
+      - clave: "puntuacion_por_10k.dos puntos :"
+        minimo: 20
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: pregunta-que-se-responde
+    regla: >-
+      Si abres con pregunta, respóndela en la misma pieza con una distinción; las
+      interrogativas son escasas y siempre se cierran, nunca quedan como gancho.
+    evidencia:
+      - clave: "oracion.interrogativas_pct"
+        minimo: 2
+      - clave: "aperturas.pregunta_inicial_pct"
+        minimo: 3
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: mayuscula-de-idea
+    regla: >-
+      «Idea» con mayúscula solo para una Idea filosófica (Idea de Estado, de Nación, de
+      Cultura) y «concepto» para lo categorial; Estado, Nación e Imperio con mayúscula en
+      sentido político.
+    evidencia:
+      - clave: "lexico_tecnico.Idea (mayúscula).ocurrencias"
+        minimo: 100
+      - clave: "lexico_tecnico.concepto.ocurrencias"
+        minimo: 100
+      - clave: "lexico_tecnico.Estado.ocurrencias"
+        minimo: 100
+      - clave: "lexico_tecnico.Nación (mayúscula).ocurrencias"
+        minimo: 50
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: frase-larga-comprimida
+    regla: >-
+      El corpus argumenta con frases largas (mediana superior a 25 palabras) y párrafos de
+      dos a cuatro oraciones; en X comprime esa estructura en una tesis, una distinción y la
+      cifra con su fuente, sin perder la subordinación que da precisión.
+    evidencia:
+      - clave: "oracion.mediana_palabras"
+        minimo: 25
+      - clave: "parrafo.media_oraciones"
+        minimo: 2
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: latinismos-y-tecnicismos
+    regla: >-
+      Latinismos clásicos («sui generis», «de facto», «a fortiori») y léxico técnico solo
+      cuando aclaran; nunca como adorno ni donde estorben a la cifra.
+    evidencia:
+      - clave: "figuras_por_10k.latinismos.por_10k"
+        minimo: 0.5
+      - clave: "corpus.palabras_largas_pct"
+        minimo: 8
+    ejemplos: null
+    ejemplos_en: null
+
+  - id: cierre-adversativo
+    regla: >-
+      Cierra con una vuelta de tuerca, no con moraleja: la última frase suele arrancar con
+      «pero» o con la tesis reafirmada y remata la distinción con la que se abrió.
+    evidencia:
+      - clave: "cierres.primeras_palabras_ultima_oracion.pero"
+        minimo: 5
+      - clave: "cierres.pregunta_final_pct"
+        minimo: null
+    ejemplos: null
+    ejemplos_en: null
+
+limites:
+  - >-
+    Estas directivas modulan el registro y no relajan ninguna regla editorial: la cifra
+    literal, la fuente literal, el máximo de 280 caracteres, la taxonomía cerrada, la
+    separación entre doctrina, escuela y partido y la identidad visual mandan siempre.
+  - >-
+    Nunca se atribuyen a Gustavo Bueno citas, cifras ni opiniones; el estilo es un
+    registro, no una suplantación.
+  - >-
+    La abreviatura «&c.» del corpus se sustituye por «etc.», como prescribe la RAE.

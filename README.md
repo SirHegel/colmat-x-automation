@@ -205,6 +205,47 @@ puede reutilizar el bot de Telegram: `overview`, `select_engine`, `store_credent
 `delete_credential`, `verify_credential`, `resolve_api_key`, `build_engine`,
 `report_worker_status` y `run_pending_verifications`.
 
+## Estilo de Gustavo Bueno y norma RAE
+
+El generador no redacta con un registro genérico: el prompt incorpora una **guía de estilo
+derivada de un corpus real** de textos de Gustavo Bueno, publicados en abierto por la Fundación
+Gustavo Bueno y su escuela. La cadena es reproducible y trazable:
+
+1. `config/gustavo-bueno-corpus-sources.yaml` declara los tres índices autorizados (El Catoblepas
+   en `nodulo.org`, *Filosofía en español* en `filosofia.org` y los artículos de prensa firmados en
+   `fgbueno.es`), las condiciones de uso verificadas de cada sitio y el retardo mínimo por host.
+2. `colmat-x bueno-corpus-build` descarga solo desde la lista blanca de `research_fetch`, lee
+   `robots.txt` de cada host, respeta sus rutas prohibidas y su `Crawl-delay` (60 s en
+   `filosofia.org`), se identifica con un `User-Agent` propio y guarda los textos **fuera de Git**
+   (`.state/corpus/gustavo-bueno`, ignorado). Lo único versionado es
+   `config/gustavo-bueno-corpus-manifest.yaml`: URL, título, año, fecha de descarga y SHA-256 del
+   cuerpo recibido y del texto extraído de cada pieza.
+3. `colmat-x bueno-corpus-verify` comprueba que cada texto local coincide con su huella.
+4. `colmat-x bueno-style-derive` recalcula `config/estilo-gustavo-bueno-evidencia.yaml` (longitud
+   de frase y párrafo, conectores, léxico técnico del materialismo filosófico, puntuación, aperturas,
+   cierres, figuras argumentales, n-gramas) y sella la evidencia con el SHA-256 del manifiesto;
+   `--check` falla si la evidencia versionada se desvía del corpus.
+5. `config/estilo-gustavo-bueno.yaml` es la guía: cada término del léxico y cada directiva citan
+   claves de la evidencia con un mínimo exigido, y el cargador rechaza cualquier afirmación sin
+   respaldo, un manifiesto distinto, una autoridad ortográfica que no sea la RAE o un bloque de
+   estilo demasiado largo.
+
+`build_editorial_messages` inserta ese bloque después de la identidad visual y antes de la orden
+de responder por herramienta. El estilo **modula el registro y no relaja ninguna regla**: cifra y
+fuente literales, 280 caracteres, taxonomía cerrada, separación institucional, identidad visual y
+`publication_authorized=false` siguen mandando; el propio prompt lo reitera. La norma ortográfica y
+de estilo es exclusivamente la de la Real Academia Española (comillas angulares, coma decimal,
+`25,2 %`, sin coma de Oxford, sin *Title Case* ni convenciones de manuales anglosajones). Los textos
+de Bueno están protegidos por derechos de autor: no se copian en el repositorio ni en la guía, y
+nunca se le atribuyen citas ni opiniones.
+
+```bash
+colmat-x bueno-corpus-build            # descarga cortés; tarda ~1 h por el Crawl-delay de filosofia.org
+colmat-x bueno-corpus-verify           # huellas locales frente al manifiesto
+colmat-x bueno-style-derive            # regenera la evidencia y valida la guía
+colmat-x bueno-style-derive --check    # solo comprueba; falla ante cualquier desvío
+```
+
 ## Equipo, jerarquía y Telegram
 
 `SirHegel` es el owner canónico del workspace. En una base **nueva y vacía**, se crea una sola vez
