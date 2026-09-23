@@ -468,8 +468,7 @@ class PlatformTelegramOperations:
         if not safeguards.direct_publish_enabled:
             return CommandResult(
                 "direct está bloqueado: abre primero el seguro persistido con "
-                "/seguro direct on (owner/admin, chat privado, doble paso). El host del worker "
-                "además debe tener COLMAT_DIRECT_PUBLISH_ENABLED=true y --live.",
+                "/seguro direct on (owner/admin, chat privado, doble paso).",
                 accepted=False,
             )
         slots = tuple(current.slots or ())
@@ -844,9 +843,9 @@ class PlatformTelegramOperations:
             "• direct: "
             + _state(safeguards.direct_publish_enabled)
             + _signed(safeguards.direct_enabled_by, safeguards.direct_enabled_at),
-            "El worker solo contacta a X cuando estos seguros están abiertos y, además, el host "
-            "tiene COLMAT_LIVE_ENABLED=true (y COLMAT_DIRECT_PUBLISH_ENABLED=true más --live "
-            "para direct). Las variables del host no son visibles ni operables desde el bot.",
+            "El worker solo contacta a X cuando estos seguros están abiertos: son la "
+            "autoridad única y se releen en cada envío, así que cerrarlos detiene la "
+            "publicación en el acto, sin tocar el servidor.",
         ]
         return "\n".join(lines)
 
@@ -894,8 +893,8 @@ class PlatformTelegramOperations:
         if gate is SafeguardGate.LIVE:
             text = (
                 "Vas a abrir el seguro persistido live. Con él abierto, publication-run y "
-                "automation-run pueden enviar a X snapshots aprobados, siempre que el host "
-                "tenga COLMAT_LIVE_ENABLED=true y --live."
+                "automation-run pueden enviar a X snapshots aprobados. Es la única "
+                "autorización que hace falta: no requiere ningún cambio en el servidor."
             )
         else:
             text = (
@@ -1249,9 +1248,9 @@ class PlatformTelegramOperations:
         except _SAFE_ERRORS:
             lines.append("• Runs: sin permiso para consultarlos.")
         lines.append(
-            "• Host: la identidad de X (x-whoami), las credenciales de MiniMax y las variables "
-            "COLMAT_LIVE_ENABLED/COLMAT_DIRECT_PUBLISH_ENABLED viven solo en el worker; el "
-            "webhook no las tiene ni las verifica."
+            "• Host: la identidad de X (x-whoami) y las credenciales de X y de los motores "
+            "viven solo en el worker; el webhook no las tiene ni las verifica. Los seguros de "
+            "publicación sí son operables desde aquí."
         )
         return "\n".join(lines)
 

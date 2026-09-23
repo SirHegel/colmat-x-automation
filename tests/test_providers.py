@@ -600,4 +600,7 @@ def test_engine_rejects_names_outside_the_closed_list() -> None:
     with pytest.raises(ProviderConfigurationError, match="uno de"):
         AIEngine(text_provider="openai", image_provider="anthropic")
     with pytest.raises(ProviderConfigurationError):
-        check_provider_api_key("codex", SECRET, session=RecordingSession())
+        check_provider_api_key("no-existe", SECRET, session=RecordingSession())
+    # `codex` es un alias coloquial aceptado que resuelve a openai, no una
+    # ampliación de la lista cerrada: sigue sin admitir URLs ni nombres libres.
+    assert AIEngine(text_provider="codex").provider_name == "openai"

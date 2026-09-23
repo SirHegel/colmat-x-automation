@@ -100,21 +100,43 @@ API_KEY_VARIABLES: tuple[str, ...] = tuple(
 )
 
 
+# Alias coloquiales admitidos en la entrada. No amplían la lista cerrada: se
+# resuelven a un nombre canónico antes de validar, y nunca aceptan una URL.
+PROVIDER_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "codex": PROVIDER_OPENAI,
+        "chatgpt": PROVIDER_OPENAI,
+        "gpt": PROVIDER_OPENAI,
+        "claude": PROVIDER_ANTHROPIC,
+        "google": PROVIDER_GEMINI,
+    }
+)
+
+
+def _canonical_provider_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    return PROVIDER_ALIASES.get(normalized, normalized)
+
+
 def normalize_provider_name(value: object, *, capability: str, field_name: str) -> str:
-    """Valida un nombre contra la lista cerrada; nunca acepta URLs ni alias."""
+    """Valida un nombre contra la lista cerrada; acepta alias, nunca URLs."""
 
     allowed = TEXT_PROVIDER_NAMES if capability == "text" else IMAGE_PROVIDER_NAMES
-    if not isinstance(value, str) or value.strip().casefold() not in allowed:
+    canonical = _canonical_provider_name(value)
+    if canonical is None or canonical not in allowed:
         raise ProviderConfigurationError(f"{field_name} debe ser uno de: {', '.join(allowed)}")
-    return value.strip().casefold()
+    return canonical
 
 
 def normalize_any_provider_name(value: object, *, field_name: str = "provider") -> str:
-    if not isinstance(value, str) or value.strip().casefold() not in PROVIDER_NAMES:
+    canonical = _canonical_provider_name(value)
+    if canonical is None or canonical not in PROVIDER_NAMES:
         raise ProviderConfigurationError(
             f"{field_name} debe ser uno de: {', '.join(PROVIDER_NAMES)}"
         )
-    return value.strip().casefold()
+    return canonical
 
 
 def normalize_model_name(provider: str, value: object, *, capability: str) -> str:

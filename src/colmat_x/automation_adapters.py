@@ -14,7 +14,6 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from colmat_x.automation import (
-    DIRECT_PUBLISH_ENV,
     AutomationError,
     AutomationEvent,
     AutomationEventKind,
@@ -770,13 +769,9 @@ class PlatformXPublisher:
         return PublicationReceipt(provider_post_id=response.id, channel="x")
 
     def _require_runtime_gates(self, prepared: PreparedAutomation) -> None:
-        environment = os.environ if self._environ is None else self._environ
-        if environment.get(LIVE_PUBLISH_ENV, "").strip().casefold() != "true":
-            raise AutomationError(f"Publicación bloqueada: {LIVE_PUBLISH_ENV} no está activo")
-        if environment.get(DIRECT_PUBLISH_ENV, "").strip().casefold() != "true":
-            raise AutomationError(f"Publicación bloqueada: {DIRECT_PUBLISH_ENV} no está activo")
-        # Los seguros persistidos se releen en cada publicación: el bot puede cerrarlos
-        # entre el claim y el envío, y ese cierre debe ganar.
+        # Los seguros persistidos son la autoridad única y se releen en cada
+        # publicación: el bot puede cerrarlos entre el claim y el envío, y ese
+        # cierre gana. No se exige ninguna variable de entorno del host.
         safeguards = self.store.get_publication_safeguards(actor_id=self.publisher_actor_id)
         if not safeguards.live_enabled:
             raise AutomationError("Publicación bloqueada: el seguro persistido live está cerrado")

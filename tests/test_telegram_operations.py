@@ -333,7 +333,10 @@ def test_safeguard_open_is_two_step_single_use_and_close_is_immediate(
 
     status = operations.get_safeguards(telegram_user_id=AUDITOR_TG, chat_id=AUDITOR_TG)
     assert "direct: ABIERTO" in status and "live: cerrado" in status
-    assert "COLMAT_LIVE_ENABLED" in status
+    # El estado ya no remite a variables del host: los seguros persistidos son
+    # la autoridad única y se operan enteramente desde el bot.
+    assert "COLMAT_LIVE_ENABLED" not in status
+    assert "autoridad única" in status
 
 
 def test_stale_safeguard_version_makes_the_confirmation_fail_closed(

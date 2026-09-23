@@ -1931,8 +1931,6 @@ def publication_run(
         _reject_publication_ai_credentials()
         if not live:
             raise ConfigError("publication-run exige la opción --live")
-        if os.getenv("COLMAT_LIVE_ENABLED", "").strip().casefold() != "true":
-            raise ConfigError("publication-run exige COLMAT_LIVE_ENABLED=true exactamente")
         scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
         publisher_actor_id = _required_worker_environment("COLMAT_AUTOMATION_PUBLISHER_ID")
         x_client = XApiClient(XCredentials.from_environment())
@@ -2232,9 +2230,6 @@ def _read_secret_input(label: str) -> str:
 def _require_direct_worker_preflight(*, live: bool) -> None:
     if not live:
         raise ConfigError("El modo direct exige además la opción --live del worker fijo")
-    for name in ("COLMAT_LIVE_ENABLED", "COLMAT_DIRECT_PUBLISH_ENABLED"):
-        if os.getenv(name, "").strip().casefold() != "true":
-            raise ConfigError(f"El modo direct exige {name}=true exactamente")
 
 
 def _require_persisted_safeguards(safeguards: object, *, direct: bool) -> None:

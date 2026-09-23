@@ -29,8 +29,8 @@ Antes de desplegar:
 - Configura OAuth 1.0a de usuario para la cuenta institucional de X y verifica su identidad.
 - Añade crédito y límites de gasto en X Developer Console. Tener credenciales válidas no implica
   tener saldo para publicar.
-- Mantén `COLMAT_LIVE_ENABLED=false` y `COLMAT_DIRECT_PUBLISH_ENABLED=false` durante todo el
-  aprovisionamiento.
+- No abras los seguros `live` ni `direct` durante el aprovisionamiento: nacen cerrados y ahí
+  deben quedarse hasta la puesta en marcha deliberada.
 
 La puntuación editorial y las plantillas ayudan a evaluar una pieza, pero no garantizan viralidad,
 impresiones ni crecimiento.
@@ -71,8 +71,6 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_WEBHOOK_SECRET=
 COLMAT_WEB_TELEGRAM_TIMEOUT_SECONDS=3
 WEB_AUTH_PEPPER=
-COLMAT_LIVE_ENABLED=false
-COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```
 
 `WEB_AUTH_PEPPER` debe ser aleatorio y contener al menos 32 caracteres. Solo protege HMAC de
@@ -230,8 +228,6 @@ X_CONSUMER_KEY=
 X_CONSUMER_SECRET=
 X_ACCESS_TOKEN=
 X_ACCESS_TOKEN_SECRET=
-COLMAT_LIVE_ENABLED=false
-COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```
 
 `/var/lib/colmat-x/generation-worker.env` opera MiniMax y Telegram, pero nunca X:
@@ -271,7 +267,6 @@ X_CONSUMER_KEY=
 X_CONSUMER_SECRET=
 X_ACCESS_TOKEN=
 X_ACCESS_TOKEN_SECRET=
-COLMAT_LIVE_ENABLED=false
 MINIMAX_API_KEY=
 ```
 
@@ -396,10 +391,9 @@ Antes de activarlo:
 3. Sincroniza slots con evidencia real y auditable mientras el sistema sigue en `human_review`.
 4. Verifica que scheduler, autor, reviewer y publisher sean cuentas activas con los roles correctos
    y que autor y reviewer sean distintos.
-5. Detén el job, pausa la agenda con CAS y cambia a `direct` con owner o admin. Desde el host, la
-   operación exige `COLMAT_DIRECT_PUBLISH_ENABLED=true` en ese entorno; desde Telegram, exige el
-   seguro persistido `direct` abierto (`/seguro direct on`) y la confirmación con botón de
-   `/modo direct`.
+5. Detén el job, pausa la agenda con CAS y cambia a `direct` con owner o admin. Exige el seguro
+   persistido `direct` abierto (`/seguro direct on` o `safeguards-set direct on`) y la
+   confirmación con botón de `/modo direct`.
 6. Activa de nuevo la agenda con owner o admin: un scheduler puede activar `human_review`, pero no
    puede autorizar ni reautorizar `direct`. Desde Telegram, `/agenda activar` en `direct` pide
    confirmación.
@@ -413,10 +407,11 @@ Usa la versión que devuelva cada consulta:
 colmat-x automation-status --actor-id OWNER_ID
 colmat-x automation-disable --actor-id SCHEDULER_ID --expected-version VERSION_1
 colmat-x automation-status --actor-id OWNER_ID
-COLMAT_DIRECT_PUBLISH_ENABLED=true colmat-x automation-mode direct \
+colmat-x safeguards-set direct on --actor-id OWNER_ID --expected-version VERSION_S
+colmat-x automation-mode direct \
   --actor-id OWNER_ID --expected-version VERSION_2
 colmat-x automation-status --actor-id OWNER_ID
-COLMAT_DIRECT_PUBLISH_ENABLED=true colmat-x automation-enable \
+colmat-x automation-enable \
   --actor-id OWNER_ID --expected-version VERSION_3
 ```
 
@@ -437,10 +432,10 @@ La invocación directa es:
   --env-file /var/lib/colmat-x/automation-worker.env --live
 ```
 
-Son tres confirmaciones independientes en ejecución: `COLMAT_LIVE_ENABLED=true`,
-`COLMAT_DIRECT_PUBLISH_ENABLED=true` y `--live`. Además, la base debe seguir habilitada, en modo
-`direct`, con la misma versión y el mismo hash de slot autorizados. El publisher revalida esos
-datos y ambos gates antes de crear el post.
+Son tres confirmaciones independientes en ejecución: los seguros persistidos `live` y `direct`
+abiertos, y `--live` en la invocación. Además, la base debe seguir habilitada, en modo `direct`,
+con la misma versión y el mismo hash de slot autorizados. El publisher revalida esos datos y
+relee ambos seguros antes de crear el post.
 
 ## Parada de emergencia y observabilidad
 

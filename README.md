@@ -637,52 +637,47 @@ X_CONSUMER_KEY=...
 X_CONSUMER_SECRET=...
 X_ACCESS_TOKEN=...
 X_ACCESS_TOKEN_SECRET=...
-COLMAT_LIVE_ENABLED=false
-COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```
 
 Después ejecuta `colmat-x doctor --credentials` y `colmat-x x-whoami` con el usuario o ID esperado.
 El primero valida presencia local; el segundo contacta X y bloquea una cuenta distinta. Ninguno
 confirma saldo, precios o capacidad de escritura, que deben revisarse en la consola. Realiza la
-primera prueba con una cuenta controlada y una sola pieza. El flujo YAML heredado usa solo
-`COLMAT_LIVE_ENABLED`; el worker nuevo en modo `direct` exige simultáneamente los dos gates y
-`--live` en esa invocación:
+primera prueba con una cuenta controlada y una sola pieza.
 
-### Seguros de publicación real: dos capas
+### Seguros de publicación real
 
-Las variables de entorno son la **capacidad**: viven en los archivos `0600` del host del worker
-y solo cambian con acceso al host. Encima hay una capa de **intención operativa** persistida en
-la tabla `publication_safeguards`: dos seguros, `live` y `direct`, con versión CAS, evidencia de
-quién y cuándo los abrió y auditoría de cada cambio. Nacen cerrados; una base sin fila equivale a
-ambos en `false`. Los workers exigen las dos capas a la vez:
+Los seguros viven en la tabla `publication_safeguards`: `live` y `direct`, con versión CAS,
+evidencia de quién y cuándo los abrió y auditoría de cada cambio. **Son la autoridad única** y se
+releen antes de cada envío. Nacen cerrados; una base sin fila equivale a ambos en `false`.
 
-| Efecto | Exige en el host (variables del worker) | Exige en la plataforma (bot o CLI) |
-| --- | --- | --- |
-| `publication-run` envía a X un snapshot aprobado | `COLMAT_LIVE_ENABLED=true` y `--live` | seguro `live` abierto |
-| `automation-run` publica sin revisión en `direct` | ambas variables en `true` y `--live` | seguros `live` y `direct` abiertos, modo `direct` y agenda activa |
-| Registrar el modo `direct` en la configuración | `COLMAT_DIRECT_PUBLISH_ENABLED=true` en el proceso que escribe **o** | seguro `direct` abierto |
+| Efecto | Exige |
+| --- | --- |
+| `publication-run` envía a X un snapshot aprobado | seguro `live` abierto y `--live` en la invocación |
+| `automation-run` publica sin revisión en `direct` | seguros `live` y `direct` abiertos, modo `direct`, agenda activa y `--live` |
+| Registrar el modo `direct` en la configuración | seguro `direct` abierto |
 
-Lo que el bot controla: abrir cada seguro con doble paso (owner o admin, chat privado, botón de
-un solo uso), cerrarlo de inmediato desde cualquier chat autorizado, pasar a `direct` y volver a
-`human_review`, activar y pausar la agenda, y observar todo con `/seguros`, `/agenda` y
-`/doctor`. El worker relee los seguros persistidos antes de cada envío, de modo que un cierre
-desde Telegram detiene la siguiente publicación sin redeploy y sin tocar el host. El mismo estado
-se opera desde el host con `safeguards-status` y `safeguards-set`.
+`--live` no autoriza: declara que **esa invocación** puede producir efectos externos, y distingue
+un run real de una pasada en seco. La autorización es del seguro persistido.
 
-Lo que sigue exigiendo acceso al host, y por qué: las variables `COLMAT_LIVE_ENABLED` y
-`COLMAT_DIRECT_PUBLISH_ENABLED` de los archivos del worker, la opción `--live` del command job,
-las credenciales de X y MiniMax, `x-whoami` (la única verificación que contacta a X, y el webhook
-no tiene credenciales), la alta o baja de owners y admins, el flujo YAML heredado (`approve`,
-`withdraw`, `retry`, `reconcile-published` sobre la SQLite local) y la aplicación del esquema. Con
-esa división, una cuenta de Telegram comprometida puede como máximo detener la operación o dejar
-todo armado en la plataforma, pero nunca convierte por sí sola una instalación cerrada en una que
-publica: la capacidad sigue en el host. Al desplegar esta versión sobre una instalación existente,
-los seguros persistidos aparecen cerrados y hay que abrirlos deliberadamente.
+Todo ello se opera desde Telegram: abrir cada seguro con doble paso (owner o admin, chat privado,
+botón de un solo uso), cerrarlo de inmediato desde cualquier chat autorizado, pasar a `direct` y
+volver a `human_review`, activar y pausar la agenda, y observarlo con `/seguros`, `/agenda` y
+`/doctor`. Un cierre desde el bot detiene la siguiente publicación sin redeploy y sin tocar el
+host. El mismo estado se opera desde el servidor con `safeguards-status` y `safeguards-set`.
+
+Antes existía una segunda capa de **capacidad** en variables del host
+(`COLMAT_LIVE_ENABLED`, `COLMAT_DIRECT_PUBLISH_ENABLED`) que se exigía junto al seguro. Se retiró
+a petición explícita del responsable del workspace, para que activar la publicación no dependa de
+tener acceso al servidor. **Consecuencia que conviene tener presente: quien controle el Telegram
+del owner puede abrir la publicación real sin tocar el host.** Sigue exigiendo acceso al servidor
+lo que no es un seguro: las credenciales de X y de los motores, `x-whoami` (la única verificación
+que contacta a X, y el webhook no tiene credenciales), la alta o baja de owners y admins, el flujo
+YAML heredado y la aplicación del esquema.
+
+Al desplegar esta versión sobre una instalación existente, los seguros persistidos aparecen
+cerrados y hay que abrirlos deliberadamente.
 
 ```bash
-# En el entorno seguro del worker:
-# COLMAT_LIVE_ENABLED=true
-# COLMAT_DIRECT_PUBLISH_ENABLED=true
 colmat-x automation-run --env-file /ruta/segura/automation-worker.env --live
 
 # /generar: OpenClaw reclama, MiniMax redacta y Telegram recibe revisión; nunca X
@@ -750,7 +745,7 @@ Configura el directorio de trabajo en la raíz del repositorio. No añadas `--li
 `automation-run` mientras la agenda esté en `human_review`; para `direct`, solo añádelo después de
 la autorización humana, la rotación de MiniMax, la verificación de identidad/crédito de X y la
 activación deliberada de ambos gates. `publication-run` exige su propio `--live`, pero sigue sin
-contactar X mientras `COLMAT_LIVE_ENABLED=false`.
+contactar X mientras el seguro `live` esté cerrado.
 
 Deja el job deshabilitado durante el aprovisionamiento. Antes de activarlo, ejecuta manualmente el
 mismo comando con el mismo usuario del sistema y confirma el JSON de salida, la auditoría y las

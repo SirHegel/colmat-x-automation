@@ -742,19 +742,23 @@ def test_direct_publisher_without_media_does_not_mark_ai_flag(
     assert x_client.post_calls[0][1] == {"media_ids": [], "made_with_ai": False}
 
 
-@pytest.mark.parametrize("missing_gate", [LIVE_PUBLISH_ENV, "COLMAT_DIRECT_PUBLISH_ENABLED"])
+@pytest.mark.parametrize("closed_gate", ["live_enabled", "direct_publish_enabled"])
 def test_direct_publisher_rechecks_both_kill_switches(
-    store, policy, tmp_path, monkeypatch, missing_gate
+    store, policy, tmp_path, monkeypatch, closed_gate
 ) -> None:
-    _services, _repository, prepared, x_client, publisher = setup_direct_publisher(
+    """Los seguros persistidos son la autoridad única; cerrar uno detiene el envío."""
+
+    services, _repository, prepared, x_client, publisher = setup_direct_publisher(
         store, policy, tmp_path, monkeypatch
     )
-    publisher._environ = {
-        LIVE_PUBLISH_ENV: "true",
-        "COLMAT_DIRECT_PUBLISH_ENABLED": "true",
-    }
-    del publisher._environ[missing_gate]
-    with pytest.raises(AutomationError, match=missing_gate):
+    owner = services[0]
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=1,
+        **{closed_gate: False},
+        now=NOW,
+    )
+    with pytest.raises(AutomationError, match="seguro persistido"):
         publisher.publish(prepared)
     assert x_client.post_calls == []
 
@@ -818,10 +822,17 @@ def test_direct_publisher_revalidates_claim_after_upload_before_post(
 def test_direct_publisher_revalidates_runtime_gate_after_upload(
     store, policy, tmp_path, monkeypatch
 ) -> None:
-    _services, _repository, prepared, x_client, publisher = setup_direct_publisher(
+    services, _repository, prepared, x_client, publisher = setup_direct_publisher(
         store, policy, tmp_path, monkeypatch
     )
-    x_client.after_upload = lambda: publisher._environ.pop(LIVE_PUBLISH_ENV)
+    owner = services[0]
+    # El owner cierra el seguro desde Telegram justo entre la subida y el envío.
+    x_client.after_upload = lambda: store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW,
+    )
 
     with pytest.raises(AutomationError, match="después de preparar la media"):
         publisher.publish(prepared)

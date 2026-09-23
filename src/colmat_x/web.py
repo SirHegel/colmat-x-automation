@@ -1056,7 +1056,9 @@ def _update_web_automation(
     if (
         can_manage_mode
         and mode is AutomationMode.DIRECT
-        and not _direct_mode_available(provider.environ)
+        and not _direct_mode_available(
+            runtime.store.get_publication_safeguards(actor_id=principal.user_id)
+        )
     ):
         raise ValueError("direct no está habilitado")
     expected_version = int(form.get("expected_version", ""))
@@ -1341,7 +1343,9 @@ def _render_dashboard(
         "can_manage_ai_engine": ai_engine["can_manage_engine"],
         "can_manage_ai_credentials": ai_engine["can_manage_credentials"],
         "assignable_roles": assignable_roles,
-        "direct_available": _direct_mode_available(provider.environ),
+        "direct_available": _direct_mode_available(
+            runtime.store.get_publication_safeguards(actor_id=principal.user_id)
+        ),
         "flash": _NOTICE_MESSAGES.get(notice or ""),
         "error": _ERROR_MESSAGES.get(error or ""),
     }
@@ -1537,10 +1541,17 @@ async def _uniform_login_delay(started_at: float) -> None:
         await asyncio.sleep(remaining)
 
 
-def _direct_mode_available(environ: Mapping[str, str]) -> bool:
-    return all(
-        environ.get(name, "").strip().casefold() == "true"
-        for name in ("COLMAT_DIRECT_PUBLISH_ENABLED", "COLMAT_LIVE_ENABLED")
+def _direct_mode_available(safeguards: object) -> bool:
+    """El modo direct depende del seguro persistido, no del entorno del panel.
+
+    El proceso web corre en Vercel y nunca tuvo las variables del worker, así que
+    leerlas aquí declaraba `direct` como no disponible aunque el owner lo hubiera
+    abierto desde Telegram.
+    """
+
+    return bool(
+        getattr(safeguards, "live_enabled", False)
+        and getattr(safeguards, "direct_publish_enabled", False)
     )
 
 
