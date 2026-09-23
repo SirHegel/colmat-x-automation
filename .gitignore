@@ -5,6 +5,9 @@
 .vercel/
 .state/
 logs/
+# Corpus de textos de Gustavo Bueno: protegido por derechos de autor; solo se versiona el manifiesto.
+corpus/
+*.corpus/
 *.db
 *.db-*
 *.sqlite

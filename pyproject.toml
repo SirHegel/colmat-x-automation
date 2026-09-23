@@ -39,6 +39,9 @@ packages = ["src/colmat_x"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "config/gustavo-bueno-books.yaml" = "colmat_x/data/gustavo-bueno-books.yaml"
+"config/estilo-gustavo-bueno.yaml" = "colmat_x/data/estilo-gustavo-bueno.yaml"
+"config/estilo-gustavo-bueno-evidencia.yaml" = "colmat_x/data/estilo-gustavo-bueno-evidencia.yaml"
+"config/gustavo-bueno-corpus-manifest.yaml" = "colmat_x/data/gustavo-bueno-corpus-manifest.yaml"
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"

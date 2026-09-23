@@ -68,6 +68,26 @@ from colmat_x.publication_worker import QueuedPublicationWorker, QueuePublicatio
 from colmat_x.rbac import AuthorizationError, Role, require_role_assignment
 from colmat_x.service import Outcome, run_due_posts
 from colmat_x.state import StateError, StateStore
+from colmat_x.style_analysis import (
+    DEFAULT_EVIDENCE_PATH,
+    StyleAnalysisError,
+    compute_evidence_from_corpus,
+    load_style_evidence,
+    write_style_evidence,
+)
+from colmat_x.style_corpus import (
+    DEFAULT_CORPUS_DIR,
+    DEFAULT_MANIFEST_PATH,
+    DEFAULT_SOURCES_PATH,
+    CorpusError,
+    PoliteFetcher,
+    build_corpus,
+    load_corpus_manifest,
+    load_corpus_sources,
+    verify_corpus,
+    write_corpus_manifest,
+)
+from colmat_x.style_guide import DEFAULT_STYLE_GUIDE_PATH, StyleGuideError, load_style_guide
 from colmat_x.telegram_api import (
     BotCommand,
     TelegramApiClient,
@@ -728,6 +748,172 @@ def ai_draft(
         }
     )
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+CorpusDirOption = Annotated[
+    Path,
+    typer.Option(
+        "--corpus-dir",
+        help="Directorio local, fuera de Git, donde viven los textos del corpus.",
+    ),
+]
+CorpusManifestOption = Annotated[
+    Path,
+    typer.Option(
+        "--manifest",
+        help="Manifiesto versionado con procedencia y SHA-256 de cada texto.",
+    ),
+]
+
+
+@app.command("bueno-corpus-build")
+def bueno_corpus_build(
+    sources_path: Annotated[
+        Path,
+        typer.Option("--sources", help="Lista blanca de índices y condiciones de uso."),
+    ] = DEFAULT_SOURCES_PATH,
+    corpus_dir: CorpusDirOption = DEFAULT_CORPUS_DIR,
+    manifest_path: CorpusManifestOption = DEFAULT_MANIFEST_PATH,
+    only_source: Annotated[
+        list[str] | None,
+        typer.Option("--source", help="Limita la descarga a una fuente por id; repetible."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Máximo de documentos por fuente (para pruebas)."),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume/--no-resume",
+            help="Reutiliza textos ya descargados cuyo SHA-256 coincide con el manifiesto.",
+        ),
+    ] = True,
+) -> None:
+    """Descarga el corpus de Gustavo Bueno desde sitios autorizados y escribe el manifiesto."""
+
+    try:
+        if limit is not None and limit < 1:
+            raise ValueError("limit debe ser un entero positivo")
+        sources = load_corpus_sources(sources_path)
+        previous = None
+        if resume and manifest_path.is_file():
+            previous = load_corpus_manifest(manifest_path)
+        manifest = build_corpus(
+            sources,
+            corpus_dir=corpus_dir,
+            fetcher=PoliteFetcher(),
+            only_sources=only_source or None,
+            limit_per_source=limit,
+            previous=previous,
+            progress=lambda message: typer.echo(message, err=True),
+        )
+        write_corpus_manifest(manifest, manifest_path)
+    except (CorpusError, OSError, ValueError) as exc:
+        _abort(exc)
+    totals = manifest.to_mapping()["totales"]
+    typer.echo(
+        json.dumps(
+            {
+                "manifest": str(manifest_path),
+                "corpus_dir": str(corpus_dir),
+                "documentos": totals["documentos"],
+                "palabras": totals["palabras"],
+                "caracteres": totals["caracteres"],
+                "omitidos": len(manifest.skipped),
+                "por_fuente": totals["por_fuente"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("bueno-corpus-verify")
+def bueno_corpus_verify(
+    corpus_dir: CorpusDirOption = DEFAULT_CORPUS_DIR,
+    manifest_path: CorpusManifestOption = DEFAULT_MANIFEST_PATH,
+) -> None:
+    """Comprueba que los textos locales coinciden con el manifiesto versionado."""
+
+    try:
+        manifest = load_corpus_manifest(manifest_path)
+    except CorpusError as exc:
+        _abort(exc)
+    verification = verify_corpus(manifest, corpus_dir)
+    typer.echo(
+        json.dumps(
+            {
+                "verificados": verification.verified,
+                "faltantes": list(verification.missing),
+                "alterados": list(verification.mismatched),
+                "ok": verification.ok,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if not verification.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("bueno-style-derive")
+def bueno_style_derive(
+    corpus_dir: CorpusDirOption = DEFAULT_CORPUS_DIR,
+    manifest_path: CorpusManifestOption = DEFAULT_MANIFEST_PATH,
+    evidence_path: Annotated[
+        Path,
+        typer.Option("--evidence", help="Evidencia estilométrica versionada que se regenera."),
+    ] = DEFAULT_EVIDENCE_PATH,
+    guide_path: Annotated[
+        Path,
+        typer.Option("--guide", help="Guía de estilo que debe seguir validando tras derivar."),
+    ] = DEFAULT_STYLE_GUIDE_PATH,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="No escribe: falla si la evidencia versionada difiere de la recalculada.",
+        ),
+    ] = False,
+) -> None:
+    """Recalcula la evidencia de estilo desde el corpus verificado y valida la guía."""
+
+    try:
+        manifest = load_corpus_manifest(manifest_path)
+        evidence = compute_evidence_from_corpus(manifest, corpus_dir, manifest_path=manifest_path)
+        if check:
+            stored = load_style_evidence(evidence_path)
+            normalized_stored = json.loads(json.dumps(stored, sort_keys=True))
+            normalized_computed = json.loads(json.dumps(evidence, sort_keys=True))
+            if normalized_stored != normalized_computed:
+                raise StyleAnalysisError(
+                    "La evidencia versionada no coincide con el corpus; ejecuta bueno-style-derive"
+                )
+        else:
+            write_style_evidence(evidence, evidence_path)
+        guide = load_style_guide(guide_path)
+    except (CorpusError, StyleAnalysisError, StyleGuideError, OSError) as exc:
+        _abort(exc)
+    typer.echo(
+        json.dumps(
+            {
+                "documentos": guide.corpus_documents,
+                "palabras": guide.corpus_words,
+                "directivas": len(guide.directives),
+                "lexico": len(guide.lexicon),
+                "manifiesto_sha256": guide.manifest_sha256,
+                "evidencia": str(evidence_path),
+                "modo": "check" if check else "write",
+                "prompt_caracteres": len(guide.generation_prompt()),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("automation-validate")
