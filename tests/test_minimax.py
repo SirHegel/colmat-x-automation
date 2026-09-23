@@ -150,8 +150,17 @@ def test_api_key_is_required_from_environment(monkeypatch) -> None:
 
     with pytest.raises(MiniMaxConfigurationError, match="MINIMAX_API_KEY"):
         MiniMaxClient(session=RecordingSession())
-    with pytest.raises(TypeError):
-        MiniMaxClient(api_key="forbidden")  # type: ignore[call-arg]
+    with pytest.raises(MiniMaxConfigurationError, match="vacía"):
+        MiniMaxClient(api_key="   ", session=RecordingSession())
+
+    # La única otra vía es la inyección en memoria desde el almacén cifrado: la
+    # clave viaja en la cabecera y nunca aparece en un error.
+    session = RecordingSession(FakeResponse(401, {"message": "bad injected-secret-value"}))
+    client = MiniMaxClient(api_key="injected-secret-value", session=session)
+    with pytest.raises(MiniMaxAPIError) as captured:
+        client.generate_draft("Dato", load_editorial_policy(POLICY_PATH))
+    assert session.calls[0]["headers"]["x-api-key"] == "injected-secret-value"
+    assert "injected-secret-value" not in str(captured.value)
 
 
 def test_api_style_is_allowlisted_and_can_be_selected_from_environment(monkeypatch) -> None:

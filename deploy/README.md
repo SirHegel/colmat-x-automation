@@ -8,11 +8,11 @@ La automatización se divide deliberadamente en componentes con autoridad distin
 | --- | --- | --- |
 | FastAPI y webhook de Telegram | Vercel | Plano de control: autenticación, comandos, callbacks y mutaciones auditadas. Nunca llama a X. |
 | PostgreSQL | Proveedor persistente | Fuente de verdad de usuarios, roles, revisiones, agenda, versión y runs. |
-| `automation-run` | Host persistente | Worker auditado de slots diarios: MiniMax genera propuestas; Colmat valida, persiste, notifica y solo publica texto en `direct` con todos los gates. |
-| `generation-run` | Host persistente | Consumer de `/generar`: MiniMax propone texto/imagen y siempre crea revisión humana. Nunca recibe X. |
-| `publication-run` | Host persistente | Consumer de `/publicar`: procesa solo snapshots aprobados con gates de X. No recibe MiniMax. |
+| `automation-run` | Host persistente | Worker auditado de slots diarios: el motor de IA persistido genera propuestas; Colmat valida, persiste, notifica y solo publica texto en `direct` con todos los gates. |
+| `generation-run` | Host persistente | Consumer de `/generar`: el motor de IA propone texto/imagen y siempre crea revisión humana. Nunca recibe X. |
+| `publication-run` | Host persistente | Consumer de `/publicar`: procesa solo snapshots aprobados con gates de X. No recibe claves de IA ni la clave privada de sobres. |
 | OpenClaw | Perfil aislado en el mismo host | Orquesta el comando fijo del worker y alerta por su resultado; no decide contenido, permisos ni aprobaciones. |
-| MiniMax | API externa | Solo genera propuestas de texto e imagen; no programa, aprueba ni publica. |
+| Motor de IA (MiniMax por defecto; Anthropic, OpenAI o Gemini) | API externa | Solo genera propuestas de texto e imagen; no programa, aprueba ni publica. La selección vive en `ai_engine_settings`. |
 | X | API oficial | Recibe snapshots aprobados desde `publication-run` o texto desde `automation-run` en `direct`, siempre bajo gates explícitos. |
 
 Vercel Cron, GitHub Actions, el timer heredado y OpenClaw no deben invocar simultáneamente el
@@ -21,9 +21,11 @@ operación clara ni la conciliación de resultados ambiguos.
 
 Antes de desplegar:
 
-- Rota cualquier clave MiniMax que haya aparecido en chats, logs o capturas. Usa exclusivamente la
-  clave nueva desde un gestor de secretos.
-- Confirma cuota de MiniMax para texto e imagen.
+- Rota cualquier clave de IA que haya aparecido en chats, logs o capturas. Usa exclusivamente la
+  clave nueva, desde el archivo `0600` del worker o sellada desde el panel.
+- Confirma cuota del proveedor elegido para texto e imagen.
+- Genera el par de sobres con `colmat-x ai-credential-keypair`; la clave privada solo va al
+  worker y la pública al panel y al worker.
 - Configura OAuth 1.0a de usuario para la cuenta institucional de X y verifica su identidad.
 - Añade crédito y límites de gasto en X Developer Console. Tener credenciales válidas no implica
   tener saldo para publicar.
@@ -74,8 +76,11 @@ COLMAT_DIRECT_PUBLISH_ENABLED=false
 `WEB_AUTH_PEPPER` debe ser aleatorio y contener al menos 32 caracteres. Solo protege HMAC de
 códigos y sesiones del panel; no se copia a OpenClaw ni a los workers.
 
-No cargues `MINIMAX_API_KEY` ni credenciales de X en Vercel. `/generar` solo inserta una solicitud
-durable; el worker persistente llama a MiniMax. El webhook no genera ni publica.
+No cargues claves de IA (`MINIMAX_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`), la clave privada de sobres ni credenciales de X en Vercel; la readiness falla si
+las encuentra. Sí puedes cargar `COLMAT_CREDENTIAL_PUBLIC_KEY` para que el panel selle claves.
+`/generar` solo inserta una solicitud durable; el worker persistente llama al motor de IA. El
+webhook no genera ni publica.
 
 Despliega y comprueba salud y readiness:
 
@@ -195,16 +200,21 @@ workers rechaza enlaces, propietarios distintos y permisos más amplios. No guar
 del checkout. El command job de OpenClaw debe ejecutar el worker con ese mismo usuario fijo, o
 mediante un mecanismo de privilegios limitado que cambie exactamente a ese usuario.
 
-Crea tres archivos separados. `/var/lib/colmat-x/automation-worker.env` puede usar MiniMax y X
-porque ejecuta el pipeline diario completo:
+Crea tres archivos separados. `/var/lib/colmat-x/automation-worker.env` puede usar los motores de
+IA y X porque ejecuta el pipeline diario completo. Cada clave de IA vive en su propio archivo
+`0600` con una sola variable; declara únicamente los proveedores que uses y, si el panel sella
+claves, la clave privada de sobres:
 
 ```dotenv
 DATABASE_URL=
 TELEGRAM_BOT_TOKEN=
 MINIMAX_API_STYLE=anthropic
-MINIMAX_MODEL=MiniMax-M2.7
-MINIMAX_IMAGE_MODEL=image-01
 COLMAT_MINIMAX_ENV_FILE=/var/lib/colmat-x/minimax.env
+# COLMAT_ANTHROPIC_ENV_FILE=/var/lib/colmat-x/anthropic.env
+# COLMAT_OPENAI_ENV_FILE=/var/lib/colmat-x/openai.env
+# COLMAT_GEMINI_ENV_FILE=/var/lib/colmat-x/gemini.env
+# COLMAT_CREDENTIAL_PRIVATE_KEY_ENV_FILE=/var/lib/colmat-x/sobres.env
+# COLMAT_CREDENTIAL_PUBLIC_KEY=
 COLMAT_TELEGRAM_ALERT_CHAT_ID=
 COLMAT_TELEGRAM_REVIEWER_USER_ID=
 COLMAT_AUTOMATION_SCHEDULER_ID=

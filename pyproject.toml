@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Colmat" }]
 dependencies = [
+  "cryptography>=43,<47",
   "fastapi>=0.116,<1",
   "Jinja2>=3.1.6,<4",
   "psycopg[binary]>=3.2,<4",

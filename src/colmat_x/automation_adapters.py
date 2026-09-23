@@ -35,7 +35,6 @@ from colmat_x.automation import (
 from colmat_x.editorial import EditorialPolicy
 from colmat_x.image_validation import sniff_supported_image_mime
 from colmat_x.media_paths import configured_worker_media_root, require_trusted_media_root
-from colmat_x.minimax import MiniMaxClient
 from colmat_x.platform_store import (
     AutomationReviewNotificationClaim,
     AutomationReviewNotificationStatus,
@@ -45,6 +44,11 @@ from colmat_x.platform_store import (
     PlatformStore,
     PlatformStoreError,
     PublishStatus,
+)
+from colmat_x.providers import (
+    ProviderConfigurationError,
+    image_provenance,
+    text_provenance,
 )
 from colmat_x.telegram_api import (
     TelegramApiClient,
@@ -121,12 +125,17 @@ class _UniqueUtcClock:
         return value
 
 
-class MiniMaxAutomationGenerator:
-    """Adapta MiniMax al puerto de generación sin concederle autoridad editorial."""
+class AIAutomationGenerator:
+    """Adapta un motor de IA al puerto de generación sin concederle autoridad editorial.
+
+    El cliente puede ser MiniMax, Anthropic, OpenAI, Gemini o un `AIEngine`
+    compuesto; en todos los casos declara `provider_name` y `model`, que quedan
+    en la evidencia del borrador.
+    """
 
     def __init__(
         self,
-        client: MiniMaxClient,
+        client: Any,
         *,
         policy: EditorialPolicy,
         editorial_line_resolver: Callable[[str], tuple[str, int] | None] | None = None,
@@ -135,6 +144,9 @@ class MiniMaxAutomationGenerator:
             raise TypeError("policy debe ser una EditorialPolicy validada")
         if editorial_line_resolver is not None and not callable(editorial_line_resolver):
             raise TypeError("editorial_line_resolver debe ser invocable")
+        if not callable(getattr(client, "generate_draft", None)):
+            raise TypeError("client debe implementar generate_draft")
+        text_provenance(client)
         self.client = client
         self.policy = policy
         self.editorial_line_resolver = editorial_line_resolver
@@ -187,19 +199,27 @@ class MiniMaxAutomationGenerator:
                 f"cifra={request.claim.slot.evidence_expected_figure!r}; "
                 f"fuente={request.claim.slot.evidence_expected_source!r}."
             )
-        draft = self.client.generate_draft(
-            model_brief,
-            self.policy,
-            category=request.category,
-            institution=request.institution,
-        )
+        try:
+            draft = self.client.generate_draft(
+                model_brief,
+                self.policy,
+                category=request.category,
+                institution=request.institution,
+            )
+        except ProviderConfigurationError as exc:
+            # Un fallo de configuración es local y no contiene contenido remoto ni
+            # secretos: su mensaje sí puede quedar como detalle claro del run.
+            raise AutomationGenerationError(
+                f"El motor de IA no está disponible para este worker: {exc}"
+            ) from exc
 
         # La verificación viene exclusivamente de la configuración del slot. Nunca
-        # se infiere a partir del texto, la cifra o la fuente redactados por MiniMax.
+        # se infiere a partir del texto, la cifra o la fuente redactados por la IA.
         verified = request.claim.slot.evidence_verified and draft_matches_expected_evidence(
             draft, request.claim.slot
         )
         reference = request.claim.slot.evidence_reference
+        provenance = text_provenance(self.client)
         return DraftCandidate(
             draft=draft,
             evidence_verified=verified,
@@ -207,6 +227,8 @@ class MiniMaxAutomationGenerator:
             editorial_line_month=editorial_month,
             editorial_line_version=editorial_version,
             editorial_line_sha256=editorial_sha256,
+            generator_provider=provenance["provider"],
+            generator_model=provenance["model"],
         )
 
     def generate_image(self, request: ImageGenerationRequest) -> GeneratedMedia:
@@ -214,23 +236,40 @@ class MiniMaxAutomationGenerator:
             raise TypeError("request debe ser ImageGenerationRequest")
         description = request.draft.visual.descripcion
         alt_text = _image_alt_text(request)
-        image = self.client.generate_image(
-            description,
-            self.policy,
-            aspect_ratio="16:9",
-            alt_text=alt_text,
-        )
+        try:
+            image = self.client.generate_image(
+                description,
+                self.policy,
+                aspect_ratio="16:9",
+                alt_text=alt_text,
+            )
+        except ProviderConfigurationError as exc:
+            raise AutomationGenerationError(
+                f"El motor de imagen no está disponible para este worker: {exc}"
+            ) from exc
         extension = _MIME_EXTENSIONS.get(image.mime_type)
         if extension is None:
-            raise AutomationGenerationError("MiniMax devolvió un tipo de imagen no admitido")
+            raise AutomationGenerationError("El proveedor devolvió un tipo de imagen no admitido")
         filename = f"{request.claim.slot.id}-{request.claim.local_date.isoformat()}{extension}"
+        provenance = image_provenance(self.client)
+        image_provider = getattr(image, "provider", None)
+        image_model = getattr(image, "model", None)
+        if provenance is not None:
+            image_provider = image_provider or provenance["provider"]
+            image_model = image_model or provenance["model"]
         return GeneratedMedia(
             content=image.content,
             filename=filename,
             mime_type=image.mime_type,
             sha256=image.sha256,
             alt_text=image.alt_text or alt_text,
+            provider=image_provider if isinstance(image_provider, str) else None,
+            model=image_model if isinstance(image_model, str) else None,
         )
+
+
+# Nombre histórico; el generador ya no está ligado a MiniMax.
+MiniMaxAutomationGenerator = AIAutomationGenerator
 
 
 class PlatformAutomationRepository:
@@ -373,6 +412,22 @@ class PlatformAutomationRepository:
                 "version": prepared.candidate.editorial_line_version,
                 "sha256": prepared.candidate.editorial_line_sha256,
             }
+        # Qué motor produjo cada parte queda en la evidencia para auditoría posterior.
+        evidence["ai_engine"] = {
+            "text": (
+                {
+                    "provider": prepared.candidate.generator_provider,
+                    "model": prepared.candidate.generator_model,
+                }
+                if prepared.candidate.generator_provider is not None
+                else None
+            ),
+            "image": (
+                {"provider": prepared.media.provider, "model": prepared.media.model}
+                if prepared.media is not None and prepared.media.provider is not None
+                else None
+            ),
+        }
         media_path: Path | None = None
         image: dict[str, object] | None = None
         if prepared.media is not None:
@@ -385,7 +440,8 @@ class PlatformAutomationRepository:
                 "metadata": {
                     "alt_text": prepared.media.alt_text,
                     "filename": prepared.media.filename,
-                    "source": "minimax",
+                    "source": prepared.media.provider or "minimax",
+                    "model": prepared.media.model,
                 },
             }
 

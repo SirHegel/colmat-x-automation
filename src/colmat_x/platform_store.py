@@ -45,10 +45,21 @@ from sqlalchemy.pool import NullPool, StaticPool
 from sqlalchemy.types import DateTime, TypeDecorator
 
 from colmat_x.editorial import EditorialCategory, Institution
+from colmat_x.providers.catalog import (
+    IMAGE_PROVIDER_NAMES,
+    PROVIDER_CATALOG,
+    PROVIDER_NAMES,
+    TEXT_PROVIDER_NAMES,
+    normalize_any_provider_name,
+    normalize_model_name,
+    normalize_provider_name,
+)
 from colmat_x.rbac import (
     AuthorizationError,
     Permission,
     Role,
+    has_permission,
+    require_any_permission,
     require_distinct_approver,
     require_permission,
     require_role_assignment,
@@ -98,6 +109,8 @@ MAX_AUTOMATION_REVIEW_NOTIFICATION_LEASE_SECONDS = 600
 DEFAULT_TELEGRAM_UPDATE_LEASE_SECONDS = 30
 MAX_TELEGRAM_UPDATE_LEASE_SECONDS = 300
 _UNSET = object()
+# Centinela público para servicios que reenvían argumentos opcionales al store.
+UNSET = _UNSET
 _RBAC_LOCKS_GUARD = threading.Lock()
 _RBAC_LOCKS: dict[str, threading.RLock] = {}
 _RBAC_USER_LOCKS: dict[str, threading.RLock] = {}
@@ -1311,6 +1324,140 @@ class AutomationReviewNotificationClaim:
     lease_expires_at: datetime
 
 
+def _sql_in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(value) for value in values)})"
+
+
+CREDENTIAL_CHECK_STATUSES = ("valid", "invalid", "error")
+CREDENTIAL_FINGERPRINT_PREFIX = 12
+
+
+class AIEngineSettings(Base):
+    """Selección persistida de proveedor y modelo; el worker la lee en cada run."""
+
+    __tablename__ = "ai_engine_settings"
+    __table_args__ = (
+        CheckConstraint(
+            _sql_in("text_provider", TEXT_PROVIDER_NAMES),
+            name="ck_ai_engine_settings_text_provider",
+        ),
+        CheckConstraint(
+            _sql_in("image_provider", IMAGE_PROVIDER_NAMES),
+            name="ck_ai_engine_settings_image_provider",
+        ),
+        CheckConstraint("version >= 1", name="ck_ai_engine_settings_version"),
+    )
+
+    workspace_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    text_provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    text_model: Mapped[str] = mapped_column(String(100), nullable=False)
+    image_provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    image_model: Mapped[str] = mapped_column(String(100), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "text_provider": self.text_provider,
+            "text_model": self.text_model,
+            "image_provider": self.image_provider,
+            "image_model": self.image_model,
+            "version": self.version,
+            "updated_by": self.updated_by,
+            "updated_at": _format_time(self.updated_at),
+        }
+
+
+class AIProviderCredential(Base):
+    """Clave de proveedor sellada. La fila nunca contiene el valor en claro."""
+
+    __tablename__ = "ai_provider_credentials"
+    __table_args__ = (
+        CheckConstraint(_sql_in("provider", PROVIDER_NAMES), name="ck_ai_credentials_provider"),
+        CheckConstraint("length(fingerprint) = 64", name="ck_ai_credentials_fingerprint"),
+        CheckConstraint("byte_length >= 1", name="ck_ai_credentials_length"),
+        CheckConstraint(
+            "last_verified_status IS NULL OR "
+            + _sql_in("last_verified_status", CREDENTIAL_CHECK_STATUSES),
+            name="ck_ai_credentials_verified_status",
+        ),
+    )
+
+    workspace_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20), primary_key=True)
+    envelope: Mapped[str] = mapped_column(Text, nullable=False)
+    key_id: Mapped[str] = mapped_column(String(16), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_four: Mapped[str] = mapped_column(String(4), nullable=False)
+    byte_length: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    updated_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    last_verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    last_verified_status: Mapped[str | None] = mapped_column(String(10))
+    last_verified_detail: Mapped[str | None] = mapped_column(String(300))
+    last_verified_by: Mapped[str | None] = mapped_column(String(80))
+    verification_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    verification_requested_by: Mapped[str | None] = mapped_column(String(80))
+
+    def public_view(self) -> dict[str, Any]:
+        """Metadatos mostrables: nunca el sobre ni la clave."""
+
+        return {
+            "provider": self.provider,
+            "configured": True,
+            "last_four": self.last_four,
+            "fingerprint_prefix": self.fingerprint[:CREDENTIAL_FINGERPRINT_PREFIX],
+            "key_id": self.key_id,
+            "created_by": self.created_by,
+            "created_at": _format_time(self.created_at),
+            "updated_by": self.updated_by,
+            "updated_at": _format_time(self.updated_at),
+            "last_verified_at": (
+                _format_time(self.last_verified_at) if self.last_verified_at else None
+            ),
+            "last_verified_status": self.last_verified_status,
+            "last_verified_detail": self.last_verified_detail,
+            "last_verified_by": self.last_verified_by,
+            "verification_pending": self.verification_requested_at is not None,
+        }
+
+
+class AIProviderStatus(Base):
+    """Disponibilidad publicada por el worker: presencia de clave en su entorno."""
+
+    __tablename__ = "ai_provider_status"
+    __table_args__ = (
+        CheckConstraint(_sql_in("provider", PROVIDER_NAMES), name="ck_ai_provider_status_name"),
+    )
+
+    workspace_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20), primary_key=True)
+    credential_in_environment: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    can_decrypt_credentials: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reported_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    reported_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "credential_in_environment": self.credential_in_environment,
+            "can_decrypt_credentials": self.can_decrypt_credentials,
+            "reported_by": self.reported_by,
+            "reported_at": _format_time(self.reported_at),
+        }
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
@@ -1334,6 +1481,9 @@ class DashboardSnapshot:
     settings: AutomationSettings
     drafts: tuple[tuple[Draft, Revision], ...]
     team: tuple[tuple[Membership, User, bool], ...]
+    ai_engine: AIEngineSettings | None = None
+    ai_provider_status: tuple[AIProviderStatus, ...] = ()
+    ai_credentials: tuple[AIProviderCredential, ...] = ()
 
 
 def approval_snapshot_hash(
@@ -1416,6 +1566,7 @@ class PlatformStore:
             Base.metadata.create_all(self.engine)
             if self.database_url.startswith("sqlite"):
                 _backfill_sqlite_automation_settings(self.engine)
+                _backfill_sqlite_ai_engine_settings(self.engine)
 
     def close(self) -> None:
         self.engine.dispose()
@@ -1481,7 +1632,23 @@ class PlatformStore:
                 now=timestamp,
             )
             session.add(settings)
+            engine_settings = self._new_ai_engine_settings(
+                workspace_id=workspace,
+                actor_id=user.id,
+                now=timestamp,
+            )
+            session.add(engine_settings)
             session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="ai_engine.settings_initialized",
+                entity_type="ai_engine_settings",
+                entity_id=workspace,
+                detail=_ai_engine_settings_audit_snapshot(engine_settings),
+                now=timestamp,
+            )
             self._audit(
                 session,
                 workspace_id=workspace,
@@ -2493,10 +2660,30 @@ class PlatformStore:
                     .order_by(Membership.created_at, Membership.id)
                 ).tuples()
             )
+            engine_settings = session.get(AIEngineSettings, workspace)
+            provider_status = tuple(
+                session.scalars(
+                    select(AIProviderStatus)
+                    .where(AIProviderStatus.workspace_id == workspace)
+                    .order_by(AIProviderStatus.provider)
+                )
+            )
+            credentials: tuple[AIProviderCredential, ...] = ()
+            if has_permission(role, Permission.MANAGE_AI_ENGINE):
+                credentials = tuple(
+                    session.scalars(
+                        select(AIProviderCredential)
+                        .where(AIProviderCredential.workspace_id == workspace)
+                        .order_by(AIProviderCredential.provider)
+                    )
+                )
             return DashboardSnapshot(
                 settings=settings,
                 drafts=draft_rows,
                 team=team_rows,
+                ai_engine=engine_settings,
+                ai_provider_status=provider_status,
+                ai_credentials=credentials,
             )
 
     def register_media_asset(
@@ -5481,6 +5668,507 @@ class PlatformStore:
             )
             return updated_settings
 
+    # --- Motor de IA: selección persistida, credenciales selladas y estado -------------
+
+    def actor_role(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> Role:
+        """Rol efectivo de un miembro activo; útil para adaptar vistas sin duplicar RBAC."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            return self._authorize(session, actor, workspace, Permission.VIEW_WORKSPACE)
+
+    def get_ai_engine_settings(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> AIEngineSettings:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.VIEW_AUTOMATION)
+            settings = session.get(AIEngineSettings, workspace)
+            if settings is None:
+                raise NotFoundError(f"El espacio '{workspace}' no tiene motor de IA configurado")
+            return settings
+
+    def update_ai_engine_settings(
+        self,
+        *,
+        actor_id: str,
+        expected_version: int,
+        text_provider: object = _UNSET,
+        text_model: object = _UNSET,
+        image_provider: object = _UNSET,
+        image_model: object = _UNSET,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> AIEngineSettings:
+        """Cambia proveedor o modelo con CAS; el catálogo cerrado valida cada valor."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        version = _normalize_positive_int(expected_version, "expected_version", maximum=None)
+        timestamp = _normalize_now(now)
+        supplied = (text_provider, text_model, image_provider, image_model)
+        if all(value is _UNSET for value in supplied):
+            raise ValueError("Se requiere al menos un cambio del motor de IA")
+
+        with self._sessions.begin() as session:
+            current = session.scalar(
+                select(AIEngineSettings)
+                .where(AIEngineSettings.workspace_id == workspace)
+                .with_for_update()
+            )
+            if current is None:
+                raise NotFoundError(f"El espacio '{workspace}' no tiene motor de IA configurado")
+            self._authorize(session, actor, workspace, Permission.MANAGE_AI_ENGINE)
+            if current.version != version:
+                raise ConflictError(f"El motor de IA cambió (versión actual {current.version})")
+
+            try:
+                new_text_provider = (
+                    current.text_provider
+                    if text_provider is _UNSET
+                    else normalize_provider_name(
+                        text_provider, capability="text", field_name="text_provider"
+                    )
+                )
+                new_image_provider = (
+                    current.image_provider
+                    if image_provider is _UNSET
+                    else normalize_provider_name(
+                        image_provider, capability="image", field_name="image_provider"
+                    )
+                )
+                if text_model is _UNSET:
+                    new_text_model = (
+                        current.text_model
+                        if new_text_provider == current.text_provider
+                        else PROVIDER_CATALOG[new_text_provider].default_text_model
+                    )
+                else:
+                    new_text_model = normalize_model_name(
+                        new_text_provider, text_model, capability="text"
+                    )
+                if image_model is _UNSET:
+                    if new_image_provider == current.image_provider:
+                        new_image_model = current.image_model
+                    else:
+                        default_image = PROVIDER_CATALOG[new_image_provider].default_image_model
+                        assert default_image is not None
+                        new_image_model = default_image
+                else:
+                    new_image_model = normalize_model_name(
+                        new_image_provider, image_model, capability="image"
+                    )
+            except Exception as exc:  # ProviderConfigurationError -> ValueError del store
+                raise ValueError(str(exc)) from exc
+
+            previous = _ai_engine_settings_audit_snapshot(current)
+            changed = session.execute(
+                update(AIEngineSettings)
+                .where(
+                    AIEngineSettings.workspace_id == workspace,
+                    AIEngineSettings.version == version,
+                )
+                .values(
+                    text_provider=new_text_provider,
+                    text_model=new_text_model,
+                    image_provider=new_image_provider,
+                    image_model=new_image_model,
+                    version=version + 1,
+                    updated_by=actor,
+                    updated_at=timestamp,
+                )
+            )
+            if changed.rowcount != 1:
+                raise ConflictError("Otra operación actualizó el motor de IA")
+            session.flush()
+            updated_settings = session.get(AIEngineSettings, workspace)
+            if updated_settings is None:  # pragma: no cover - protegido por la PK
+                raise NotFoundError("El motor de IA desapareció durante la actualización")
+            session.refresh(updated_settings)
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="ai_engine.settings_updated",
+                entity_type="ai_engine_settings",
+                entity_id=workspace,
+                detail={
+                    "previous": previous,
+                    "current": _ai_engine_settings_audit_snapshot(updated_settings),
+                },
+                now=timestamp,
+            )
+            return updated_settings
+
+    def list_ai_provider_status(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> list[AIProviderStatus]:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.VIEW_AUTOMATION)
+            return list(
+                session.scalars(
+                    select(AIProviderStatus)
+                    .where(AIProviderStatus.workspace_id == workspace)
+                    .order_by(AIProviderStatus.provider)
+                )
+            )
+
+    def report_ai_provider_status(
+        self,
+        *,
+        actor_id: str,
+        statuses: Mapping[str, bool],
+        can_decrypt_credentials: bool = False,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> list[AIProviderStatus]:
+        """El worker publica solo presencia de claves; audita únicamente los cambios."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        timestamp = _normalize_now(now)
+        if not isinstance(statuses, Mapping) or not statuses:
+            raise ValueError("statuses debe ser un mapa proveedor -> booleano")
+        normalized: dict[str, bool] = {}
+        for provider, configured in statuses.items():
+            try:
+                name = normalize_any_provider_name(provider)
+            except Exception as exc:
+                raise ValueError(str(exc)) from exc
+            normalized[name] = _normalize_bool(configured, f"statuses[{name}]")
+        decrypt = _normalize_bool(can_decrypt_credentials, "can_decrypt_credentials")
+        with self._sessions.begin() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_SCHEDULE)
+            rows: list[AIProviderStatus] = []
+            changes: dict[str, dict[str, Any]] = {}
+            for name, configured in normalized.items():
+                row = session.get(AIProviderStatus, (workspace, name))
+                if row is None:
+                    row = AIProviderStatus(
+                        workspace_id=workspace,
+                        provider=name,
+                        credential_in_environment=configured,
+                        can_decrypt_credentials=decrypt,
+                        reported_by=actor,
+                        reported_at=timestamp,
+                    )
+                    session.add(row)
+                    changes[name] = {"previous": None, "current": configured}
+                else:
+                    if (
+                        row.credential_in_environment != configured
+                        or row.can_decrypt_credentials != decrypt
+                    ):
+                        changes[name] = {
+                            "previous": row.credential_in_environment,
+                            "current": configured,
+                        }
+                    row.credential_in_environment = configured
+                    row.can_decrypt_credentials = decrypt
+                    row.reported_by = actor
+                    row.reported_at = timestamp
+                rows.append(row)
+            session.flush()
+            if changes:
+                self._audit(
+                    session,
+                    workspace_id=workspace,
+                    actor_id=actor,
+                    action="ai_engine.provider_status_changed",
+                    entity_type="ai_provider_status",
+                    entity_id=workspace,
+                    detail={"changes": changes, "can_decrypt_credentials": decrypt},
+                    now=timestamp,
+                )
+            for row in rows:
+                session.refresh(row)
+            return rows
+
+    def list_ai_credentials(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> list[AIProviderCredential]:
+        """Metadatos de las claves selladas; el sobre viaja pero nunca el valor."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_AI_ENGINE)
+            return list(
+                session.scalars(
+                    select(AIProviderCredential)
+                    .where(AIProviderCredential.workspace_id == workspace)
+                    .order_by(AIProviderCredential.provider)
+                )
+            )
+
+    def ai_credentials_configured(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> dict[str, bool]:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.VIEW_AUTOMATION)
+            stored = set(
+                session.scalars(
+                    select(AIProviderCredential.provider).where(
+                        AIProviderCredential.workspace_id == workspace
+                    )
+                )
+            )
+            return {name: name in stored for name in PROVIDER_NAMES}
+
+    def get_ai_credential_envelope(
+        self,
+        provider: str,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> AIProviderCredential | None:
+        """Sobre sellado para el worker; solo quien programa la agenda lo lee."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        name = _normalize_provider(provider)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_SCHEDULE)
+            return session.get(AIProviderCredential, (workspace, name))
+
+    def store_ai_credential(
+        self,
+        provider: str,
+        *,
+        actor_id: str,
+        envelope: str,
+        key_id: str,
+        fingerprint: str,
+        last_four: str,
+        byte_length: int,
+        verification: tuple[str, str] | None = None,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> AIProviderCredential:
+        """Crea o rota una clave sellada. La auditoría registra huella, nunca el valor."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        name = _normalize_provider(provider)
+        timestamp = _normalize_now(now)
+        if not isinstance(envelope, str) or not envelope or len(envelope) > 16_384:
+            raise ValueError("envelope debe ser un sobre sellado no vacío")
+        normalized_key_id = _normalize_short_text(key_id, "key_id", 16)
+        normalized_fingerprint = _normalize_sha256(fingerprint, required=True)
+        if not isinstance(last_four, str) or not 1 <= len(last_four) <= 4:
+            raise ValueError("last_four debe tener entre 1 y 4 caracteres")
+        length = _normalize_positive_int(byte_length, "byte_length", maximum=4_096)
+        verified_status, verified_detail = _normalize_verification(verification)
+        with self._sessions.begin() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_AI_CREDENTIALS)
+            current = session.get(AIProviderCredential, (workspace, name))
+            previous_prefix = (
+                current.fingerprint[:CREDENTIAL_FINGERPRINT_PREFIX] if current else None
+            )
+            if current is None:
+                current = AIProviderCredential(
+                    workspace_id=workspace,
+                    provider=name,
+                    envelope=envelope,
+                    key_id=normalized_key_id,
+                    fingerprint=normalized_fingerprint,
+                    last_four=last_four,
+                    byte_length=length,
+                    created_by=actor,
+                    created_at=timestamp,
+                    updated_by=actor,
+                    updated_at=timestamp,
+                )
+                session.add(current)
+                action = "ai_credential.stored"
+            else:
+                current.envelope = envelope
+                current.key_id = normalized_key_id
+                current.fingerprint = normalized_fingerprint
+                current.last_four = last_four
+                current.byte_length = length
+                current.updated_by = actor
+                current.updated_at = timestamp
+                action = "ai_credential.rotated"
+            current.last_verified_at = timestamp if verified_status else None
+            current.last_verified_status = verified_status
+            current.last_verified_detail = verified_detail
+            current.last_verified_by = actor if verified_status else None
+            current.verification_requested_at = None
+            current.verification_requested_by = None
+            session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action=action,
+                entity_type="ai_provider_credential",
+                entity_id=f"{workspace}:{name}",
+                detail={
+                    "provider": name,
+                    "fingerprint_prefix": normalized_fingerprint[:CREDENTIAL_FINGERPRINT_PREFIX],
+                    "previous_fingerprint_prefix": previous_prefix,
+                    "last_four": last_four,
+                    "key_id": normalized_key_id,
+                    "verification": verified_status,
+                },
+                now=timestamp,
+            )
+            session.refresh(current)
+            return current
+
+    def delete_ai_credential(
+        self,
+        provider: str,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> bool:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        name = _normalize_provider(provider)
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_AI_CREDENTIALS)
+            current = session.get(AIProviderCredential, (workspace, name))
+            if current is None:
+                return False
+            prefix = current.fingerprint[:CREDENTIAL_FINGERPRINT_PREFIX]
+            session.delete(current)
+            session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="ai_credential.deleted",
+                entity_type="ai_provider_credential",
+                entity_id=f"{workspace}:{name}",
+                detail={"provider": name, "fingerprint_prefix": prefix},
+                now=timestamp,
+            )
+            return True
+
+    def request_ai_credential_verification(
+        self,
+        provider: str,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> AIProviderCredential:
+        """Deja la solicitud durable; la ejecuta quien pueda abrir el sobre (el worker)."""
+
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        name = _normalize_provider(provider)
+        timestamp = _normalize_now(now)
+        with self._sessions.begin() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_AI_ENGINE)
+            current = session.get(AIProviderCredential, (workspace, name))
+            if current is None:
+                raise NotFoundError(f"No hay credencial sellada para '{name}'")
+            current.verification_requested_at = timestamp
+            current.verification_requested_by = actor
+            session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="ai_credential.verification_requested",
+                entity_type="ai_provider_credential",
+                entity_id=f"{workspace}:{name}",
+                detail={"provider": name},
+                now=timestamp,
+            )
+            session.refresh(current)
+            return current
+
+    def list_pending_ai_credential_verifications(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> list[AIProviderCredential]:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        with self._sessions() as session:
+            self._authorize(session, actor, workspace, Permission.MANAGE_SCHEDULE)
+            return list(
+                session.scalars(
+                    select(AIProviderCredential)
+                    .where(
+                        AIProviderCredential.workspace_id == workspace,
+                        AIProviderCredential.verification_requested_at.is_not(None),
+                    )
+                    .order_by(AIProviderCredential.provider)
+                )
+            )
+
+    def record_ai_credential_verification(
+        self,
+        provider: str,
+        *,
+        actor_id: str,
+        status: str,
+        detail: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+        now: datetime | None = None,
+    ) -> AIProviderCredential:
+        workspace = _normalize_workspace(workspace_id)
+        actor = _normalize_actor(actor_id)
+        name = _normalize_provider(provider)
+        timestamp = _normalize_now(now)
+        verified_status, verified_detail = _normalize_verification((status, detail))
+        with self._sessions.begin() as session:
+            role = self._authorize(session, actor, workspace, Permission.VIEW_AUTOMATION)
+            require_any_permission(role, (Permission.MANAGE_AI_ENGINE, Permission.MANAGE_SCHEDULE))
+            current = session.get(AIProviderCredential, (workspace, name))
+            if current is None:
+                raise NotFoundError(f"No hay credencial sellada para '{name}'")
+            current.last_verified_at = timestamp
+            current.last_verified_status = verified_status
+            current.last_verified_detail = verified_detail
+            current.last_verified_by = actor
+            current.verification_requested_at = None
+            current.verification_requested_by = None
+            session.flush()
+            self._audit(
+                session,
+                workspace_id=workspace,
+                actor_id=actor,
+                action="ai_credential.verified",
+                entity_type="ai_provider_credential",
+                entity_id=f"{workspace}:{name}",
+                detail={"provider": name, "status": verified_status},
+                now=timestamp,
+            )
+            session.refresh(current)
+            return current
+
     def claim_automation_run(
         self,
         *,
@@ -7358,6 +8046,24 @@ class PlatformStore:
         return user
 
     @staticmethod
+    @staticmethod
+    def _new_ai_engine_settings(
+        *, workspace_id: str, actor_id: str, now: datetime
+    ) -> AIEngineSettings:
+        minimax = PROVIDER_CATALOG["minimax"]
+        assert minimax.default_image_model is not None
+        return AIEngineSettings(
+            workspace_id=workspace_id,
+            text_provider=minimax.name,
+            text_model=minimax.default_text_model,
+            image_provider=minimax.name,
+            image_model=minimax.default_image_model,
+            version=1,
+            updated_by=actor_id,
+            updated_at=now,
+        )
+
+    @staticmethod
     def _new_automation_settings(
         *, workspace_id: str, actor_id: str, now: datetime
     ) -> AutomationSettings:
@@ -8189,6 +8895,39 @@ def _backfill_sqlite_automation_settings(engine: Any) -> None:
             )
 
 
+def _backfill_sqlite_ai_engine_settings(engine: Any) -> None:
+    """Crea la selección MiniMax por defecto en workspaces SQLite anteriores."""
+
+    with Session(engine) as session, session.begin():
+        workspaces = list(session.scalars(select(Membership.workspace_id).distinct()))
+        for workspace in workspaces:
+            if session.get(AIEngineSettings, workspace) is not None:
+                continue
+            actor_id = session.scalar(
+                select(Membership.user_id)
+                .where(Membership.workspace_id == workspace)
+                .order_by(
+                    case(
+                        (Membership.role == Role.OWNER.value, 0),
+                        (Membership.role == Role.ADMIN.value, 1),
+                        else_=2,
+                    ),
+                    Membership.created_at,
+                    Membership.id,
+                )
+                .limit(1)
+            )
+            if actor_id is None:
+                continue
+            session.add(
+                PlatformStore._new_ai_engine_settings(
+                    workspace_id=workspace,
+                    actor_id=actor_id,
+                    now=_utc_now(),
+                )
+            )
+
+
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, connection_record: Any) -> None:
     del connection_record
     cursor = dbapi_connection.cursor()
@@ -8988,6 +9727,34 @@ def _automation_settings_audit_snapshot(settings: AutomationSettings) -> dict[st
             else None
         ),
     }
+
+
+def _ai_engine_settings_audit_snapshot(settings: AIEngineSettings) -> dict[str, Any]:
+    return {
+        "text_provider": settings.text_provider,
+        "text_model": settings.text_model,
+        "image_provider": settings.image_provider,
+        "image_model": settings.image_model,
+        "version": settings.version,
+    }
+
+
+def _normalize_provider(value: object) -> str:
+    try:
+        return normalize_any_provider_name(value)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _normalize_verification(value: tuple[str, str] | None) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise ValueError("verification debe ser (estado, detalle)")
+    status, detail = value
+    if status not in CREDENTIAL_CHECK_STATUSES:
+        raise ValueError("El estado de verificación debe ser valid, invalid o error")
+    return status, _normalize_short_text(detail, "detalle de verificación", 300)
 
 
 def _normalize_workspace(value: str) -> str:

@@ -25,6 +25,38 @@ if (verificationCode) {
   });
 }
 
+// Motor de IA: el selector de modelo solo muestra los modelos del proveedor elegido.
+// La lista cerrada viene del servidor; aquí no se inyecta ningún valor nuevo.
+for (const providerSelect of document.querySelectorAll("[data-engine-provider]")) {
+  const capability = providerSelect.dataset.engineProvider;
+  const modelSelect = document.querySelector(`[data-engine-model="${capability}"]`);
+  if (!modelSelect) {
+    continue;
+  }
+
+  const refreshModels = () => {
+    let firstVisible = null;
+    let selectionVisible = false;
+    for (const option of modelSelect.options) {
+      const visible = option.dataset.provider === providerSelect.value;
+      option.hidden = !visible;
+      option.disabled = !visible;
+      if (visible && firstVisible === null) {
+        firstVisible = option;
+      }
+      if (visible && option.selected) {
+        selectionVisible = true;
+      }
+    }
+    if (!selectionVisible && firstVisible !== null) {
+      firstVisible.selected = true;
+    }
+  };
+
+  providerSelect.addEventListener("change", refreshModels);
+  refreshModels();
+}
+
 for (const form of document.querySelectorAll("form")) {
   form.addEventListener("submit", (event) => {
     const confirmation = form.dataset.confirm;

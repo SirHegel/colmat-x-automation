@@ -183,6 +183,10 @@ def make_prepared(
 
 
 class FakeMiniMax:
+    provider_name = "minimax"
+    model = "MiniMax-M2.7"
+    image_model = "image-01"
+
     def __init__(self, draft, *, mime_type: str = "image/png") -> None:
         self.draft = draft
         self.mime_type = mime_type

@@ -193,6 +193,9 @@ def automation_slot(
 
 def test_schema_contains_all_platform_tables() -> None:
     assert set(table_names()) == {
+        "ai_engine_settings",
+        "ai_provider_credentials",
+        "ai_provider_status",
         "approvals",
         "audit_events",
         "automation_review_notifications",

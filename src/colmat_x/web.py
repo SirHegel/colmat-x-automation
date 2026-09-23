@@ -24,6 +24,8 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import inspect, text
 from starlette.concurrency import run_in_threadpool
 
+from colmat_x.ai_engine import AICredentialError, AIEngineService
+from colmat_x.credential_cipher import PRIVATE_KEY_ENV, CredentialCipherError
 from colmat_x.platform_store import (
     CANONICAL_AUTOMATION_WEEKDAYS,
     AutomationMode,
@@ -34,6 +36,7 @@ from colmat_x.platform_store import (
     PlatformStore,
     StaleSnapshotError,
 )
+from colmat_x.providers import PROVIDER_CATALOG, PROVIDER_NAMES
 from colmat_x.rbac import AuthorizationError, Permission, Role, can_assign_role, has_permission
 from colmat_x.research_registry import (
     RESEARCH_ONLY_BRIEF_PREFIX,
@@ -78,9 +81,14 @@ SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 READINESS_CACHE_SECONDS = 5.0
 PRIVILEGED_WORKER_ENVIRONMENT = frozenset(
     {
+        "ANTHROPIC_API_KEY",
+        # La clave privada abre las credenciales selladas: solo el worker la tiene.
+        PRIVATE_KEY_ENV,
         "EXPECTED_X_USER_ID",
         "EXPECTED_X_USERNAME",
+        "GEMINI_API_KEY",
         "MINIMAX_API_KEY",
+        "OPENAI_API_KEY",
         "X_ACCESS_TOKEN",
         "X_ACCESS_TOKEN_SECRET",
         "X_CONSUMER_KEY",
@@ -704,16 +712,32 @@ class RuntimeProvider:
         processor: Any | None = None,
         telegram_client: Any | None = None,
         web_auth: Any | None = None,
+        ai_engine_service: Any | None = None,
     ) -> None:
         self.environ = os.environ if environ is None else environ
         self._injected = WebRuntime(store, processor, telegram_client)
         self._injected_web_auth = web_auth
+        self._injected_ai_engine_service = ai_engine_service
         self._runtime: WebRuntime | None = None
         self._web_auth: Any | None = None
+        self._ai_engine_service: Any | None = None
         self._lock = threading.Lock()
         self._web_auth_lock = threading.Lock()
+        self._ai_engine_lock = threading.Lock()
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, bool, dict[str, str]] | None = None
+
+    def get_ai_engine_service(self) -> Any:
+        """Servicio de motor y credenciales; sella con la clave pública, nunca abre."""
+
+        if self._injected_ai_engine_service is not None:
+            return self._injected_ai_engine_service
+        if self._ai_engine_service is not None:
+            return self._ai_engine_service
+        with self._ai_engine_lock:
+            if self._ai_engine_service is None:
+                self._ai_engine_service = AIEngineService(self.get().store, environ=self.environ)
+        return self._ai_engine_service
 
     def get(self) -> WebRuntime:
         if self._runtime is not None:
@@ -863,6 +887,7 @@ def create_app(
     processor: Any | None = None,
     telegram_client: Any | None = None,
     web_auth: Any | None = None,
+    ai_engine_service: Any | None = None,
     max_update_bytes: int = MAX_TELEGRAM_UPDATE_BYTES,
 ) -> FastAPI:
     if isinstance(max_update_bytes, bool) or not isinstance(max_update_bytes, int):
@@ -876,6 +901,7 @@ def create_app(
         processor=processor,
         telegram_client=telegram_client,
         web_auth=web_auth,
+        ai_engine_service=ai_engine_service,
     )
     app = FastAPI(
         title="Colmat X Automation",
@@ -1153,6 +1179,93 @@ def create_app(
             return _app_redirect(error="automation_failed")
         return _app_redirect(notice="automation_updated")
 
+    @app.post("/app/ai-engine")
+    async def update_ai_engine_from_dashboard(request: Request) -> Any:
+        try:
+            form, principal, _session_token = await _authenticated_web_post(provider, request)
+            await run_in_threadpool(_update_web_ai_engine, provider, principal, form)
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return _app_redirect(error="ai_engine_failed")
+        return _app_redirect(notice="ai_engine_updated")
+
+    @app.post("/app/ai-credentials")
+    async def store_ai_credential_from_dashboard(request: Request) -> Any:
+        # La clave solo existe en el formulario y en esta llamada: se sella y se
+        # descarta. Ningún error la refleja y ninguna respuesta la devuelve.
+        try:
+            form, principal, _session_token = await _authenticated_web_post(provider, request)
+            result = await run_in_threadpool(_store_web_ai_credential, provider, principal, form)
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except CredentialCipherError:
+            return _app_redirect(error="ai_credential_unavailable")
+        except (
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            ValueError,
+            AICredentialError,
+        ):
+            return _app_redirect(error="ai_credential_failed")
+        if result.check is None:
+            return _app_redirect(notice="ai_credential_stored_unverified")
+        if result.check.status == "valid":
+            return _app_redirect(notice="ai_credential_stored_valid")
+        if result.check.status == "invalid":
+            return _app_redirect(notice="ai_credential_stored_invalid")
+        return _app_redirect(notice="ai_credential_stored_unverified")
+
+    @app.post("/app/ai-credentials/{provider_name}/delete")
+    async def delete_ai_credential_from_dashboard(request: Request, provider_name: str) -> Any:
+        try:
+            _require_known_provider(provider_name)
+            _form, principal, _session_token = await _authenticated_web_post(provider, request)
+            service = await run_in_threadpool(provider.get_ai_engine_service)
+            deleted = await run_in_threadpool(
+                service.delete_credential, principal.user_id, provider_name
+            )
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return _app_redirect(error="ai_credential_failed")
+        if not deleted:
+            return _app_redirect(error="ai_credential_failed")
+        return _app_redirect(notice="ai_credential_deleted")
+
+    @app.post("/app/ai-credentials/{provider_name}/verify")
+    async def verify_ai_credential_from_dashboard(request: Request, provider_name: str) -> Any:
+        try:
+            _require_known_provider(provider_name)
+            _form, principal, _session_token = await _authenticated_web_post(provider, request)
+            service = await run_in_threadpool(provider.get_ai_engine_service)
+            verification = await run_in_threadpool(
+                service.verify_credential, principal.user_id, provider_name
+            )
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except (
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            ValueError,
+            AICredentialError,
+            CredentialCipherError,
+        ):
+            return _app_redirect(error="ai_credential_failed")
+        if verification.outcome == "requested" or verification.check is None:
+            return _app_redirect(notice="ai_credential_verification_requested")
+        return _app_redirect(notice=f"ai_credential_verified_{verification.check.status}")
+
     @app.post("/app/team")
     async def create_team_member(request: Request) -> Any:
         try:
@@ -1329,10 +1442,27 @@ def create_app(
 
 
 _NOTICE_MESSAGES = {
+    "ai_credential_deleted": "La clave fue eliminada de la base; el worker dejará de usarla.",
+    "ai_credential_stored_invalid": (
+        "La clave quedó sellada en la base, pero el proveedor la rechazó. Revísala o rótala."
+    ),
+    "ai_credential_stored_unverified": (
+        "La clave quedó sellada en la base; la comprobación con el proveedor no fue concluyente."
+    ),
+    "ai_credential_stored_valid": "La clave quedó sellada en la base y el proveedor la aceptó.",
+    "ai_credential_verification_requested": (
+        "La verificación quedó solicitada; el worker la ejecutará y publicará el resultado."
+    ),
+    "ai_credential_verified_error": "La comprobación con el proveedor no fue concluyente.",
+    "ai_credential_verified_invalid": "El proveedor rechazó la clave guardada. Rótala.",
+    "ai_credential_verified_valid": "El proveedor aceptó la clave guardada.",
+    "ai_engine_updated": "El motor de IA quedó actualizado; el worker lo usará en su próximo run.",
     "automation_updated": "La agenda y el modo editorial quedaron actualizados.",
     "draft_approved": "La revisión exacta quedó aprobada; aún no se publicó.",
     "draft_rejected": "La revisión exacta quedó rechazada.",
-    "generation_queued": "OpenClaw recibió la pieza y MiniMax la preparará para revisión.",
+    "generation_queued": (
+        "OpenClaw recibió la pieza y el motor de IA configurado la preparará para revisión."
+    ),
     "publication_queued": "La publicación aprobada quedó en la cola; el worker decide cuándo sale.",
     "team_created": (
         "La cuenta quedó creada. Para ingresar, un administrador debe vincular su Telegram "
@@ -1340,6 +1470,14 @@ _NOTICE_MESSAGES = {
     ),
 }
 _ERROR_MESSAGES = {
+    "ai_credential_failed": (
+        "No se guardó ni cambió la clave. Revisa permisos, formato y que el proveedor exista."
+    ),
+    "ai_credential_unavailable": (
+        "El almacén cifrado no está disponible en este despliegue; configura la clave pública "
+        "de sobres o usa el archivo 0600 del worker."
+    ),
+    "ai_engine_failed": "No se cambió el motor de IA. Recarga el panel y revisa tus permisos.",
     "automation_failed": "No se cambió la agenda. Recarga el panel y revisa tus permisos.",
     "generation_failed": "No se pudo encargar la pieza. Revisa la instrucción y vuelve a intentar.",
     "publication_failed": "No se encoló: el borrador debe seguir aprobado y sin cambios.",
@@ -1474,6 +1612,44 @@ def _update_web_automation(
     if can_manage_mode:
         changes["mode"] = mode
     runtime.store.update_automation_settings(**changes)
+
+
+def _update_web_ai_engine(
+    provider: RuntimeProvider,
+    principal: Any,
+    form: Mapping[str, str],
+) -> None:
+    service = provider.get_ai_engine_service()
+    expected_version = int(form.get("expected_version", ""))
+    service.select_engine(
+        principal.user_id,
+        expected_version=expected_version,
+        text_provider=form.get("text_provider", ""),
+        text_model=form.get("text_model", ""),
+        image_provider=form.get("image_provider", ""),
+        image_model=form.get("image_model", ""),
+    )
+
+
+def _store_web_ai_credential(
+    provider: RuntimeProvider,
+    principal: Any,
+    form: Mapping[str, str],
+) -> Any:
+    service = provider.get_ai_engine_service()
+    provider_name = form.get("provider", "")
+    _require_known_provider(provider_name)
+    return service.store_credential(
+        principal.user_id,
+        provider_name,
+        form.get("api_key", ""),
+        verify=form.get("verify", "true") != "false",
+    )
+
+
+def _require_known_provider(provider_name: str) -> None:
+    if provider_name not in PROVIDER_NAMES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown provider")
 
 
 def _approve_web_draft(
@@ -1664,6 +1840,7 @@ def _render_dashboard(
         for role in Role
         if can_assign_role(principal.role, role)
     ]
+    ai_engine = _dashboard_ai_engine(provider, snapshot, principal)
     context = {
         "principal": {
             "display_name": principal.display_name,
@@ -1699,6 +1876,10 @@ def _render_dashboard(
         "can_manage_automation": can_manage_automation,
         "can_manage_automation_mode": can_manage_automation_mode,
         "can_generate": has_permission(principal.role, Permission.CREATE_DRAFTS),
+        "ai_engine": ai_engine,
+        "ai_text_label": ai_engine["text_label"],
+        "can_manage_ai_engine": ai_engine["can_manage_engine"],
+        "can_manage_ai_credentials": ai_engine["can_manage_credentials"],
         "assignable_roles": assignable_roles,
         "direct_available": _direct_mode_available(provider.environ),
         "flash": _NOTICE_MESSAGES.get(notice or ""),
@@ -1709,6 +1890,28 @@ def _render_dashboard(
         name="dashboard.html",
         context=context,
     )
+
+
+def _dashboard_ai_engine(
+    provider: RuntimeProvider, snapshot: Any, principal: Any
+) -> dict[str, Any]:
+    """Contexto del motor de IA a partir del snapshot; nunca incluye sobres ni claves."""
+
+    service = provider.get_ai_engine_service()
+    overview = service.overview_from_rows(
+        snapshot.ai_engine,
+        snapshot.ai_provider_status,
+        snapshot.ai_credentials,
+        role=principal.role,
+    )
+    selection = overview.selection
+    text_entry = PROVIDER_CATALOG.get(selection.get("text_provider", ""))
+    image_entry = PROVIDER_CATALOG.get(selection.get("image_provider", ""))
+    return {
+        **overview.to_mapping(),
+        "text_label": text_entry.label if text_entry else "el motor de IA",
+        "image_label": image_entry.label if image_entry else "el motor de IA",
+    }
 
 
 def _dashboard_calendar(settings: Any, *, days: int = 7) -> list[dict[str, str]]:

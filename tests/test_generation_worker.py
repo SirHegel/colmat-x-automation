@@ -39,6 +39,10 @@ POLICY = load_editorial_policy(Path("config/editorial-policy.yaml"))
 
 
 class FakeMiniMax:
+    provider_name = "minimax"
+    model = "MiniMax-M2.7"
+    image_model = "image-01"
+
     def __init__(self, *, image: GeneratedImage | None = None) -> None:
         self.image = image
         self.draft_calls: list[str] = []

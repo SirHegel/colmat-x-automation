@@ -280,7 +280,7 @@ def test_ai_draft_outputs_validated_non_publishable_json(configured_project, mon
         )
         return draft
 
-    monkeypatch.setattr("colmat_x.cli.MiniMaxClient.generate_draft", fake_generate)
+    monkeypatch.setattr("colmat_x.providers.minimax.MiniMaxClient.generate_draft", fake_generate)
     result = runner.invoke(
         app,
         [

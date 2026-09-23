@@ -39,12 +39,19 @@ class Permission(StrEnum):
     VIEW_AUTOMATION = "automation:view"
     MANAGE_SCHEDULE = "automation:schedule:manage"
     MANAGE_AUTOMATION_MODE = "automation:mode:manage"
+    # Elegir proveedor y modelo altera coste y comportamiento de generación: es
+    # una decisión de operación, no de agenda, y queda fuera de scheduler y editor.
+    MANAGE_AI_ENGINE = "ai:engine:manage"
+    # Las claves de proveedor son secretos con consecuencias económicas: solo el
+    # owner, responsable último del workspace, las crea, rota o elimina.
+    MANAGE_AI_CREDENTIALS = "ai:credentials:manage"
     VIEW_TELEGRAM = "telegram:view"
     MANAGE_TELEGRAM = "telegram:manage"
     VIEW_AUDIT = "audit:view"
 
 
 _ALL_PERMISSIONS = frozenset(Permission)
+_OWNER_ONLY_PERMISSIONS = frozenset({Permission.MANAGE_AI_CREDENTIALS})
 
 # La tabla es deliberadamente explícita. No se heredan permisos por un número de
 # jerarquía: editor, reviewer, publisher y auditor son funciones distintas, no
@@ -52,7 +59,7 @@ _ALL_PERMISSIONS = frozenset(Permission)
 ROLE_PERMISSIONS: Mapping[Role, frozenset[Permission]] = MappingProxyType(
     {
         Role.OWNER: _ALL_PERMISSIONS,
-        Role.ADMIN: _ALL_PERMISSIONS,
+        Role.ADMIN: _ALL_PERMISSIONS - _OWNER_ONLY_PERMISSIONS,
         Role.EDITOR: frozenset(
             {
                 Permission.VIEW_WORKSPACE,
@@ -181,6 +188,8 @@ def validate_role_permissions() -> None:
         for permission in (Permission.CREATE_DRAFTS, Permission.EDIT_DRAFTS)
     ):
         raise RuntimeError("El reviewer no puede recibir permisos de edición")
+    if roles_with(Permission.MANAGE_AI_CREDENTIALS) != {Role.OWNER}:
+        raise RuntimeError("Solo el owner puede gestionar credenciales de IA")
 
 
 def _coerce_role(role: Role | str) -> Role:

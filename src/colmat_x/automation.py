@@ -253,8 +253,11 @@ class GeneratedMedia:
     mime_type: str
     sha256: str
     alt_text: str
+    provider: str | None = None
+    model: str | None = None
 
     def __post_init__(self) -> None:
+        _validate_provenance(self.provider, self.model, "La imagen generada")
         if not isinstance(self.content, bytes) or not self.content:
             raise AutomationGenerationError("La imagen generada debe contener bytes")
         if len(self.content) > MAX_GENERATED_IMAGE_BYTES:
@@ -298,10 +301,13 @@ class DraftCandidate:
     editorial_line_month: str | None = None
     editorial_line_version: int | None = None
     editorial_line_sha256: str | None = None
+    generator_provider: str | None = None
+    generator_model: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.draft, EditorialDraft):
             raise AutomationGenerationError("El candidato debe contener un EditorialDraft")
+        _validate_provenance(self.generator_provider, self.generator_model, "El candidato")
         if not isinstance(self.evidence_verified, bool):
             raise AutomationGenerationError("evidence_verified debe ser booleano")
         reference = self.evidence_reference
@@ -740,6 +746,8 @@ class DailyAutomation:
             editorial_line_month=candidate.editorial_line_month,
             editorial_line_version=candidate.editorial_line_version,
             editorial_line_sha256=candidate.editorial_line_sha256,
+            generator_provider=candidate.generator_provider,
+            generator_model=candidate.generator_model,
         )
         assessment = assess_engagement(validated)
         media = None
@@ -1234,3 +1242,18 @@ def _safe_failure(stage: str, error: Exception) -> str:
     if isinstance(error, AutomationError):
         return str(error)
     return f"{stage} falló de forma segura ({type(error).__name__})."
+
+
+def _validate_provenance(provider: str | None, model: str | None, subject: str) -> None:
+    """Proveedor y modelo van juntos y son texto corto; la evidencia los persiste."""
+
+    if provider is None and model is None:
+        return
+    for name, value in (("provider", provider), ("model", model)):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 120
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise AutomationGenerationError(f"{subject} requiere {name} de generador válido")

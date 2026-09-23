@@ -251,6 +251,101 @@ ORDER BY
     id
 ON CONFLICT (workspace_id) DO NOTHING;
 
+-- Motor de IA conectable: selección persistida, credenciales selladas y estado
+-- publicado por el worker. Las tres tablas son obligatorias para la readiness web.
+CREATE TABLE IF NOT EXISTS ai_engine_settings (
+    workspace_id VARCHAR(80) PRIMARY KEY,
+    text_provider VARCHAR(20) NOT NULL,
+    text_model VARCHAR(100) NOT NULL,
+    image_provider VARCHAR(20) NOT NULL,
+    image_model VARCHAR(100) NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT ck_ai_engine_settings_text_provider CHECK (
+        text_provider IN ('minimax', 'anthropic', 'openai', 'gemini')
+    ),
+    CONSTRAINT ck_ai_engine_settings_image_provider CHECK (
+        image_provider IN ('minimax', 'openai', 'gemini')
+    ),
+    CONSTRAINT ck_ai_engine_settings_version CHECK (version >= 1)
+);
+
+-- Backfill: cada workspace arranca con MiniMax, igual que la producción actual.
+INSERT INTO ai_engine_settings (
+    workspace_id,
+    text_provider,
+    text_model,
+    image_provider,
+    image_model,
+    version,
+    updated_by,
+    updated_at
+)
+SELECT DISTINCT ON (workspace_id)
+    workspace_id,
+    'minimax',
+    'MiniMax-M2.7',
+    'minimax',
+    'image-01',
+    1,
+    user_id,
+    CURRENT_TIMESTAMP
+FROM memberships
+ORDER BY
+    workspace_id,
+    CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+    created_at,
+    id
+ON CONFLICT (workspace_id) DO NOTHING;
+
+-- Claves selladas con la clave pública del worker. La fila nunca contiene el
+-- valor en claro: solo el sobre, una huella SHA-256 y los últimos caracteres.
+CREATE TABLE IF NOT EXISTS ai_provider_credentials (
+    workspace_id VARCHAR(80) NOT NULL,
+    provider VARCHAR(20) NOT NULL,
+    envelope TEXT NOT NULL,
+    key_id VARCHAR(16) NOT NULL,
+    fingerprint VARCHAR(64) NOT NULL,
+    last_four VARCHAR(4) NOT NULL,
+    byte_length INTEGER NOT NULL,
+    created_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    last_verified_at TIMESTAMPTZ,
+    last_verified_status VARCHAR(10),
+    last_verified_detail VARCHAR(300),
+    last_verified_by VARCHAR(80),
+    verification_requested_at TIMESTAMPTZ,
+    verification_requested_by VARCHAR(80),
+    PRIMARY KEY (workspace_id, provider),
+    CONSTRAINT ck_ai_credentials_provider CHECK (
+        provider IN ('minimax', 'anthropic', 'openai', 'gemini')
+    ),
+    CONSTRAINT ck_ai_credentials_fingerprint CHECK (length(fingerprint) = 64),
+    CONSTRAINT ck_ai_credentials_length CHECK (byte_length >= 1),
+    CONSTRAINT ck_ai_credentials_verified_status CHECK (
+        last_verified_status IS NULL
+        OR last_verified_status IN ('valid', 'invalid', 'error')
+    )
+);
+
+-- Disponibilidad publicada por el worker: presencia de clave en su entorno y si
+-- puede abrir sobres. Nunca contiene valores.
+CREATE TABLE IF NOT EXISTS ai_provider_status (
+    workspace_id VARCHAR(80) NOT NULL,
+    provider VARCHAR(20) NOT NULL,
+    credential_in_environment BOOLEAN NOT NULL,
+    can_decrypt_credentials BOOLEAN NOT NULL DEFAULT FALSE,
+    reported_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    reported_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (workspace_id, provider),
+    CONSTRAINT ck_ai_provider_status_name CHECK (
+        provider IN ('minimax', 'anthropic', 'openai', 'gemini')
+    )
+);
+
 CREATE TABLE IF NOT EXISTS editorial_lines (
     id VARCHAR(36) PRIMARY KEY,
     workspace_id VARCHAR(80) NOT NULL,

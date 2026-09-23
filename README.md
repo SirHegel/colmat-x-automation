@@ -1,8 +1,9 @@
 # Colmat X Automation
 
 Proyecto en Python para preparar, clasificar, revisar y publicar contenido institucional en X,
-con control operativo por Telegram. Usa exclusivamente las API oficiales de X, Telegram y
-MiniMax; nunca automatiza la interfaz web de X.
+con control operativo por Telegram. Usa exclusivamente las API oficiales de X, Telegram y de los
+motores de IA de una lista cerrada (MiniMax por defecto, Anthropic, OpenAI y Google Gemini); nunca
+automatiza la interfaz web de X.
 
 El proyecto nace en modo seguro. En `human_review`, toda salida de IA es un borrador y una persona
 distinta del autor debe aprobar el snapshot exacto. En `direct`, la ejecución usa identidades de
@@ -24,8 +25,9 @@ Telegram puede consultar y registrar decisiones, pero no crea usuarios ni llama 
   con separación entre autoría, aprobación y publicación.
 - Webhook de Telegram autenticado, deduplicación de `update_id` y callbacks de un solo uso ligados
   a persona, chat, revisión y snapshot.
-- MiniMax para proponer borradores e imágenes en memoria, con validación local cerrada y sin
-  capacidad de aprobar, programar o publicar.
+- Motores de IA conectables (MiniMax por defecto; Anthropic, OpenAI o Google Gemini) para
+  proponer borradores e imágenes en memoria, con validación local cerrada y sin capacidad de
+  aprobar, programar o publicar. El proveedor de texto y el de imagen pueden ser distintos.
 - Agenda diaria persistida, ejecución idempotente por slot y modos `human_review` y `direct`.
 - Workers `automation-run`, `generation-run` y `publication-run`, invocables por command jobs
   deterministas de un OpenClaw aislado en un host persistente.
@@ -79,13 +81,125 @@ colmat-x ai-draft "Cifra y fuente ya verificadas para el dato semanal" \
   --institution escuela_colombiana_de_filosofia
 ```
 
-La clave se recibe solo por `MINIMAX_API_KEY`. El texto usa por defecto
-`MINIMAX_API_STYLE=anthropic` contra el endpoint fijo oficial
-`https://api.minimax.io/anthropic/v1/messages`; `openai` queda disponible solo como compatibilidad
-explícita. La selección es una lista cerrada y no permite inyectar endpoints. La generación de
-imagen conserva su API propia. Usa `MiniMax-M2.7` para texto e `image-01` para imagen salvo que la
-documentación oficial y las pruebas justifiquen otro modelo. Nunca subas una clave a Git; si
+`ai-draft` no usa la base de plataforma: toma el motor de `COLMAT_TEXT_PROVIDER` (MiniMax si no
+se indica) y la clave de la variable propia de ese proveedor. Nunca subas una clave a Git; si
 apareció en un chat, log o captura, rótala antes de usar producción.
+
+## Motores de IA
+
+El generador es un puerto con dos capacidades, texto e imagen, y cuatro adaptadores en
+`src/colmat_x/providers/`. La lista de proveedores es cerrada y cada adaptador fija sus endpoints
+en constantes del código; ninguna variable de entorno, fila de base o formulario puede inyectar
+una URL. Los modelos admitidos también son una lista cerrada (`providers/catalog.py`): ampliarla
+es un cambio de código revisado.
+
+| Proveedor | Clave | Texto | Imagen | Endpoints fijos |
+| --- | --- | --- | --- | --- |
+| `minimax` (predeterminado) | `MINIMAX_API_KEY` | `MiniMax-M2.7` | `image-01` | `api.minimax.io/anthropic/v1/messages`, `/v1/chat/completions`, `/v1/image_generation` |
+| `anthropic` | `ANTHROPIC_API_KEY` | `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` | no genera imágenes | `api.anthropic.com/v1/messages` |
+| `openai` | `OPENAI_API_KEY` | `gpt-5`, `gpt-5-mini`, `gpt-4.1` | `gpt-image-1` | `api.openai.com/v1/chat/completions`, `/v1/images/generations` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-2.5-pro`, `gemini-2.5-flash` | `gemini-2.5-flash-image` | `generativelanguage.googleapis.com/v1beta/models/<modelo>:generateContent` |
+
+MiniMax conserva su camino actual: `MINIMAX_API_STYLE=anthropic` por defecto y `openai` solo como
+compatibilidad explícita. Anthropic declara que no produce imágenes y falla con un error claro si
+se le pide una; combina Claude para texto con MiniMax, OpenAI o Gemini para imagen. OpenAI solo
+ofrece tres tamaños: una petición apaisada se aproxima a `1536x1024` y las dimensiones reales
+quedan en la evidencia. En Gemini el único segmento variable de la URL es el nombre de modelo,
+validado por patrón sin `/`, `:` ni `?`. Ningún adaptador envía `temperature` a Anthropic u
+OpenAI, cuyos modelos vigentes rechazan parámetros de muestreo.
+
+Cambiar de proveedor no altera el control editorial: cada salida pasa por `validate_ai_draft`, el
+prompt visual por la política del manual y la imagen por límites locales de tamaño y firma
+binaria; el resultado sigue siendo `status=draft` con `publication_authorized=false`. La evidencia
+del borrador registra en `ai_engine` qué proveedor y qué modelo produjeron el texto y, si la hubo,
+la imagen; el `source` de la media persistida es el nombre del proveedor.
+
+### Selección persistida
+
+El worker no lee la elección de archivos: `automation-run` y `generation-run` consultan
+`ai_engine_settings` en la base al comenzar cada run y construyen el motor con esa fila. Cada
+workspace nace con MiniMax para texto e imagen (versión 1); las bases anteriores reciben esa fila
+por backfill. La escritura usa compare-and-swap con la versión leída, para que dos operadores no
+se pisen, y exige el permiso `ai:engine:manage`, que solo tienen `owner` y `admin`: elegir motor
+altera coste, flujo de datos y comportamiento de generación, y no es una decisión de agenda ni de
+redacción. `editor`, `scheduler`, `reviewer`, `publisher` y `auditor` ven la selección en modo
+lectura. Cada cambio deja auditoría con actor, momento y valores anterior y actual.
+
+La elección es global por workspace. No hay override por slot ni por petición de `/generar`: un
+override por slot añadiría otra lista cerrada al YAML de agenda, que no es fuente de verdad en
+runtime, y uno por petición permitiría que un editor sin permiso de motor decidiera el proveedor.
+
+```bash
+colmat-x ai-engine-status --actor-id OWNER_ID
+colmat-x ai-engine --actor-id OWNER_ID --expected-version VERSION \
+  --text-provider anthropic --text-model claude-sonnet-5 --image-provider openai
+```
+
+Al omitir el modelo tras cambiar de proveedor se toma el predeterminado del catálogo. Un modelo
+que no pertenezca al proveedor elegido, o `anthropic` como proveedor de imagen, se rechaza antes de
+escribir.
+
+### Credenciales: archivo del worker o almacén sellado
+
+Hay dos vías, y la precedencia es fija: **si existe una credencial sellada en la base para el
+proveedor, el worker la usa; si no existe, usa la variable de su archivo `0600`**. Si existe pero el
+worker no puede abrirla, el run termina en `failed` con ese detalle; nunca cae en silencio a la
+variable del entorno. El worker opera sin ninguna credencial en la base.
+
+La vía de archivos es la de siempre, extendida: cada clave vive en un archivo `0600`, regular y
+del mismo usuario, con una sola variable, declarado en el env primario como
+`COLMAT_MINIMAX_ENV_FILE`, `COLMAT_ANTHROPIC_ENV_FILE`, `COLMAT_OPENAI_ENV_FILE` o
+`COLMAT_GEMINI_ENV_FILE`.
+
+La vía del panel guarda la clave en `ai_provider_credentials` dentro de un sobre sellado: X25519
+más HKDF-SHA256 y AES-256-GCM, con el workspace y el proveedor como dato autenticado, de modo que un
+sobre copiado a otra fila no se abre. El par de claves se genera una vez:
+
+```bash
+colmat-x ai-credential-keypair
+```
+
+La clave pública (`COLMAT_CREDENTIAL_PUBLIC_KEY`) sella y puede vivir en el panel, en el webhook
+y en el worker. La clave privada (`COLMAT_CREDENTIAL_PRIVATE_KEY`) abre y vive **únicamente** en el
+worker, en su propio archivo `0600` declarado como `COLMAT_CREDENTIAL_PRIVATE_KEY_ENV_FILE`; la
+readiness web en Vercel falla si la encuentra en su entorno. Sin clave pública, el sistema arranca
+en modo degradado, lo declara en el panel y en `ai-engine-status`, y rechaza guardar claves: nunca
+las persiste en claro.
+
+La fila y la auditoría nunca contienen el valor: solo el sobre, una huella SHA-256, los últimos
+cuatro caracteres, quién la puso y cuándo. Ninguna respuesta HTTP, JSON de CLI, log ni mensaje de
+error devuelve la clave; la suite lo comprueba. Solo `owner` tiene `ai:credentials:manage` para
+crear, rotar o eliminar claves, porque son secretos con consecuencias económicas y el owner es el
+responsable último del workspace; `admin` puede elegir motor y solicitar verificaciones, no tocar
+claves. Alta, rotación, borrado, verificación y cambio de proveedor quedan auditados.
+
+La verificación consulta el endpoint de modelos del proveedor (Anthropic, OpenAI y Gemini; MiniMax
+no lo documenta y usa una llamada de un token). Al guardar desde el panel se comprueba en el acto
+con la clave recién recibida. Comprobar una clave ya sellada exige abrir el sobre: el panel solo
+registra la solicitud y el worker la ejecuta en su siguiente run, publicando válida, inválida o no
+concluyente. Desde el host del worker es inmediato:
+
+```bash
+colmat-x ai-credential-set openai --actor-id OWNER_ID --env-file /ruta/segura/generation-worker.env
+colmat-x ai-credential-verify openai --actor-id OWNER_ID --env-file /ruta/segura/generation-worker.env
+colmat-x ai-credential-delete openai --actor-id OWNER_ID
+```
+
+`ai-credential-set` lee la clave por prompt oculto o por stdin, nunca por argumentos. El worker
+publica en `ai_provider_status`, en cada run, qué proveedores tienen archivo de clave y si puede
+abrir sobres; nunca los valores. El panel muestra ese estado junto a las claves selladas.
+
+Consecuencias de seguridad de esta vía, para decidir con conocimiento: una filtración de la base
+expone sobres inútiles sin la clave privada; una filtración de la clave privada sola no expone
+nada sin la base; con ambas, todas las claves guardadas quedan expuestas y deben rotarse. Un
+proceso web comprometido no puede leer claves ya guardadas, pero sí capturar las que se peguen
+mientras dure el compromiso. La invariante de que el webhook no contiene credenciales de IA se
+mantiene para las claves en reposo y se relaja para el instante de alta.
+
+`src/colmat_x/ai_engine.py` expone `AIEngineService`, el puerto que usan el panel y la CLI y que
+puede reutilizar el bot de Telegram: `overview`, `select_engine`, `store_credential`,
+`delete_credential`, `verify_credential`, `resolve_api_key`, `build_engine`,
+`report_worker_status` y `run_pending_verifications`.
 
 ## Equipo, jerarquía y Telegram
 
@@ -142,7 +256,7 @@ Telegram autentica por `from.id`, nunca por `username`, y exige además el chat 
 | `/investigar <tema>` | Encola una síntesis sin imagen según la línea mensual; consulta solo URLs oficiales autorizadas y nunca publica. |
 | `/calendario [días]` | Consulta entre 1 y 31 días de agenda persistida. |
 | `/modo [human_review\|direct]` | Consulta o solicita un modo, según RBAC y seguros. |
-| `/generar <brief>` | Encola según la línea mensual; el webhook no llama a MiniMax. |
+| `/generar <brief>` | Encola según la línea mensual; el webhook no llama al motor de IA. |
 | `/publicar <id>` | Encola durablemente un borrador ya aprobado; el webhook no lo envía a X. |
 | `/ayuda` | Muestra la guía integrada. |
 
@@ -180,19 +294,27 @@ antepone la línea vigente con su versión y vuelve a pasar por revisión humana
 exceden 1000 caracteres, la solicitud se rechaza en vez de omitir la directriz. `/publicar` no
 reescribe nada: solo encola un snapshot publicable que ya fue aprobado por un rol publisher.
 
-`generation-run` consume la cola de `/generar`: OpenClaw asigna el command job, MiniMax propone
-texto y, opcionalmente, imagen, y Colmat crea siempre un draft `in_review`. Una outbox durable
+`generation-run` consume la cola de `/generar`: OpenClaw asigna el command job, el motor de IA
+persistido propone texto y, opcionalmente, imagen, y Colmat crea siempre un draft `in_review`. Una outbox durable
 entrega la revisión y sus botones al binding activo de un usuario con permiso de revisión; quien
 solicita puede ser editor sin recibir permiso para aprobar. Los nonces se emiten atómicamente al
 preparar la entrega y solo existen en memoria y en el mensaje de Telegram; la base conserva sus
 hashes.
 `publication-run` consume por separado la cola aprobada de `/publicar` con lease, fence,
-idempotencia y los gates de X. El webhook no contiene credenciales de MiniMax ni de X.
+idempotencia y los gates de X. El webhook no contiene credenciales de IA en reposo ni de X: solo
+recibe una clave de proveedor en el instante en que un owner la pega para sellarla.
 
 El panel web usa el mismo binding `control` para enviar un código de ocho dígitos por Telegram.
 Solo conserva HMAC de códigos, sesiones y CSRF; los códigos duran cinco minutos y las sesiones se
 revalidan contra usuario activo, membresía, rol y binding en cada solicitud. `SirHegel` puede crear
 cuentas desde `/app`; cada nueva identidad debe vincularse a su propio Telegram antes de entrar.
+
+La sección **Motor de IA** de `/app` muestra el proveedor y modelo vigentes, el estado de cada
+proveedor (clave sellada en la base, archivo presente en el worker, última verificación) y, para
+`owner` y `admin`, el formulario de selección con versión CAS. Solo `owner` ve los campos para
+pegar, rotar o eliminar claves; el campo es de tipo contraseña y la clave sale del formulario
+sellada, sin pasar por logs ni volver en ninguna respuesta. El botón «Probar» sobre una clave ya
+guardada registra la solicitud y el worker la ejecuta.
 
 ## Agenda y automatización programada
 
@@ -239,7 +361,7 @@ retroactivo nuevo. Si la agenda dejó de corresponder, retira y audita el flag e
 que no quede varado al cruzar otra medianoche. No admite runs `unknown` ni runs que ya tengan un
 draft: esos casos requieren conciliación para no duplicar snapshots o efectos externos.
 
-Antes de llamar a MiniMax, cada slot autónomo resuelve la línea editorial del mes de su fecha
+Antes de llamar al motor de IA, cada slot autónomo resuelve la línea editorial del mes de su fecha
 programada y la antepone al brief con su versión. Mes, versión y SHA-256 quedan en la evidencia del
 draft. Si la línea falta o es inválida, el run termina en `failed` antes de generar o publicar.
 
@@ -255,8 +377,10 @@ atómicamente el modo global y el de los slots persistidos. Tras el aprovisionam
 los tres jobs de OpenClaw permanecen deshabilitados; `automation-enable` es un paso operativo
 posterior y deliberado.
 
-En `human_review`, el worker genera el texto con MiniMax, puede generar la imagen cuando el slot lo
-indica, guarda ambos como borrador y los somete a aprobación. Un slot con imagen generada permanece
+En `human_review`, el worker genera el texto con el motor persistido, puede generar la imagen
+cuando el slot lo indica, guarda ambos como borrador y los somete a aprobación. Si el worker no
+tiene la clave del proveedor elegido, o no puede abrir el sobre de la base, el run termina en
+`failed` con ese detalle y nunca cambia de proveedor por su cuenta. Un slot con imagen generada permanece
 en `human_review`: requiere inspección visual y aprobación humana del snapshot exacto antes de
 entrar en `publication-run`. El modo `direct` queda reservado a piezas sin media generada y solo
 continúa si la evidencia editorial está verificada y ligada a la cifra y fuente esperadas, la
@@ -285,11 +409,15 @@ Los tres comandos worker crean el esquema únicamente cuando usan SQLite local. 
 operan sin DDL; aplica `deploy/postgres.sql` con una identidad de migración antes de arrancarlos.
 
 Usa tres archivos **distintos, modo `0600` y fuera del checkout**: `automation-worker.env` puede
-acceder a MiniMax y X; `generation-worker.env` accede a MiniMax pero rechaza cualquier variable
-`X_*`; `publication-worker.env` accede a X y nunca recibe MiniMax. Guarda la clave una sola vez en
-un archivo `0600` que contenga únicamente `MINIMAX_API_KEY=...`; los dos primeros envs declaran
-`COLMAT_MINIMAX_ENV_FILE=/ruta/absoluta/minimax.env` y el cargador la incorpora sin interpolar ni
-copiarla a la definición del job. Una ruta heredada que no figure en el env primario se ignora.
+acceder a los motores de IA y a X; `generation-worker.env` accede a los motores pero rechaza
+cualquier variable `X_*`; `publication-worker.env` accede a X y rechaza toda clave de IA y la clave
+privada de sobres. Guarda cada clave una sola vez en un archivo `0600` con una única variable
+(`MINIMAX_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` o
+`COLMAT_CREDENTIAL_PRIVATE_KEY`); los dos primeros envs declaran su ruta como
+`COLMAT_MINIMAX_ENV_FILE`, `COLMAT_ANTHROPIC_ENV_FILE`, `COLMAT_OPENAI_ENV_FILE`,
+`COLMAT_GEMINI_ENV_FILE` o `COLMAT_CREDENTIAL_PRIVATE_KEY_ENV_FILE` y el cargador las incorpora sin
+interpolar ni copiarlas a la definición del job. Una ruta heredada que no figure en el env
+primario se ignora.
 `COLMAT_AUTOMATION_MEDIA_ROOT` y
 `COLMAT_GENERATION_MEDIA_ROOT` deben apuntar ambos a `/var/lib/colmat-x/media`, para que el
 publicador lea media de las dos colas. Una imagen mayor de 5 MiB se descarta antes de crear el
@@ -371,6 +499,12 @@ colmat-x automation-sync --actor-id SCHEDULER_ID --expected-version VERSION
 colmat-x automation-mode human_review --actor-id OWNER_ID --expected-version VERSION
 colmat-x automation-enable --actor-id SCHEDULER_ID --expected-version VERSION
 colmat-x automation-disable --actor-id SCHEDULER_ID --expected-version VERSION
+colmat-x ai-engine-status --actor-id OWNER_ID
+colmat-x ai-engine --actor-id OWNER_ID --expected-version VERSION --text-provider anthropic
+colmat-x ai-credential-keypair
+colmat-x ai-credential-set openai --actor-id OWNER_ID --env-file /ruta/segura/generation-worker.env
+colmat-x ai-credential-verify openai --actor-id OWNER_ID --env-file /ruta/segura/generation-worker.env
+colmat-x ai-credential-delete openai --actor-id OWNER_ID
 colmat-x automation-run --env-file /ruta/segura/automation-worker.env
 colmat-x generation-run --env-file /var/lib/colmat-x/generation-worker.env --limit 5
 colmat-x publication-run --env-file /var/lib/colmat-x/publication-worker.env --live --limit 5
@@ -406,9 +540,10 @@ desarrollador necesita crédito disponible: una integración correcta no evita q
 publicación por saldo insuficiente.
 
 La clave MiniMax compartida previamente debe considerarse expuesta: **rótala** y configura solo la
-nueva clave en el gestor de secretos. Verifica también que la cuenta MiniMax tenga cuota para texto
-y, si hay slots con `generate_image: true`, para imagen. MiniMax es exclusivamente el generador;
-no recibe permisos de owner, reviewer, scheduler o publisher.
+nueva clave en el gestor de secretos o séllala desde el panel. Verifica también que la cuenta del
+proveedor elegido tenga cuota para texto y, si hay slots con `generate_image: true`, para imagen.
+El motor de IA es exclusivamente el generador; no recibe permisos de owner, reviewer, scheduler o
+publisher.
 
 Completa el entorno sin compartirlo ni subirlo a Git y conserva inicialmente ambos bloqueos:
 
@@ -463,9 +598,9 @@ excluidos por `.gitignore`. No fuerces su inclusión con `git add -f`.
 OpenClaw se usa como **orquestador aislado** en un host persistente: asigna periódicamente tres
 command jobs fijos, observa sus códigos de salida y alerta. No genera contenido por sí mismo, no
 decide roles o aprobaciones y no sustituye la base, el RBAC ni la máquina de estados de Colmat.
-MiniMax opera la generación exclusivamente dentro de `automation-run` y `generation-run`, donde
-quedan aplicadas la política editorial, la validación de media, la auditoría y las colas durables;
-nunca programa, aprueba ni publica en X.
+El motor de IA opera la generación exclusivamente dentro de `automation-run` y `generation-run`,
+donde quedan aplicadas la política editorial, la validación de media, la auditoría y las colas
+durables; nunca programa, aprueba ni publica en X.
 
 Mantén el gateway de OpenClaw en loopback, con un perfil dedicado a Colmat y sin exponerlo a
 Internet. Cada job debe ejecutar rutas absolutas y una identidad de sistema fija:
@@ -479,14 +614,16 @@ Internet. Cada job debe ejecutar rutas absolutas y una identidad de sistema fija
   --env-file /var/lib/colmat-x/publication-worker.env --live --limit 5
 ```
 
-`automation-run` puede recibir MiniMax y X porque cubre el pipeline diario completo.
-`generation-run` recibe MiniMax para `/generar` y rechaza cualquier credencial `X_*`;
-`publication-run` es el consumer de `/publicar`, recibe X y rechaza una clave MiniMax no vacía.
-Mantén los tres archivos `0600` fuera del checkout y los tres jobs inicialmente deshabilitados.
-`MINIMAX_API_KEY` vive en un dotenv exclusivo `0600`, regular y del mismo usuario. Declara su ruta
-como `COLMAT_MINIMAX_ENV_FILE` dentro de los envs primarios de automation y generation; el archivo
-referido admite solo esa clave y un máximo de 4 KiB. No copies la clave al repositorio, a OpenClaw
-ni al env de publication.
+`automation-run` puede recibir claves de IA y X porque cubre el pipeline diario completo.
+`generation-run` recibe claves de IA para `/generar` y rechaza cualquier credencial `X_*`;
+`publication-run` es el consumer de `/publicar`, recibe X y rechaza toda clave de IA no vacía y la
+clave privada de sobres. Mantén los tres archivos `0600` fuera del checkout y los tres jobs
+inicialmente deshabilitados. Cada clave de proveedor y la clave privada de sobres viven en un
+dotenv exclusivo `0600`, regular y del mismo usuario, con una sola variable y un máximo de 4 KiB.
+Declara sus rutas (`COLMAT_MINIMAX_ENV_FILE`, `COLMAT_ANTHROPIC_ENV_FILE`,
+`COLMAT_OPENAI_ENV_FILE`, `COLMAT_GEMINI_ENV_FILE`, `COLMAT_CREDENTIAL_PRIVATE_KEY_ENV_FILE`)
+dentro de los envs primarios de automation y generation. No copies ninguna al repositorio, a
+OpenClaw ni al env de publication.
 
 Los tres procesos comparten `/var/lib/colmat-x/media`: configura con ese mismo valor
 `COLMAT_AUTOMATION_MEDIA_ROOT` en automation/publication y `COLMAT_GENERATION_MEDIA_ROOT` en
@@ -512,10 +649,14 @@ Las unidades `deploy/systemd/` pertenecen al flujo YAML heredado `run-due`; no i
 SQLite no es almacenamiento persistente válido en Vercel. Conecta un PostgreSQL serverless (por
 ejemplo Neon) y define `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` y un
 `WEB_AUTH_PEPPER` aleatorio de al menos 32 caracteres como secretos del proyecto. No definas
-`MINIMAX_API_KEY` ni credenciales `X_*` en Vercel: `/generar`
-solo encola y los workers persistentes atienden ambas integraciones. Vercel no crea ni migra el
-esquema: aplícalo de forma explícita antes del despliegue y usa readiness para verificar que la
-versión requerida ya existe. Despliega después de ejecutar la suite:
+`MINIMAX_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`,
+`COLMAT_CREDENTIAL_PRIVATE_KEY` ni credenciales `X_*` en Vercel: `/generar` solo encola y los
+workers persistentes atienden ambas integraciones; la readiness falla si encuentra alguna. Sí
+puedes definir `COLMAT_CREDENTIAL_PUBLIC_KEY` para que el panel selle claves. Vercel no crea ni
+migra el esquema: aplícalo de forma explícita antes del despliegue (incluidas las tablas
+`ai_engine_settings`, `ai_provider_credentials` y `ai_provider_status` de `deploy/postgres.sql`) y
+usa readiness para verificar que la versión requerida ya existe. Despliega después de ejecutar la
+suite:
 
 ```bash
 pytest -q
@@ -527,13 +668,14 @@ curl -fsS https://TU_DOMINIO/api/ready
 
 La raíz redirige a `/login`; después del código de Telegram, `/app` muestra el centro de
 operaciones. Todas las mutaciones exigen cookie segura, CSRF, origen del mismo host y permisos
-RBAC; FastAPI solo encola trabajo y nunca llama a MiniMax o X durante la solicitud.
+RBAC; FastAPI solo encola trabajo y nunca llama al motor de IA o a X durante la solicitud, salvo la
+comprobación mínima de una clave recién pegada contra el endpoint de modelos de su proveedor.
 
 Solo cuando `ready` responda `200`, registra en BotFather/API de Telegram la URL HTTPS
 `https://TU_DOMINIO/api/telegram/webhook` con el mismo secreto. Vercel aloja el plano de control y
 el webhook; no ejecuta workers persistentes. OpenClaw, en el host aislado, invoca los tres
 consumers contra la misma PostgreSQL. El webhook nunca genera ni publica y no recibe credenciales
-de MiniMax o X.
+de IA en reposo ni de X.
 
 Para desarrollo local:
 

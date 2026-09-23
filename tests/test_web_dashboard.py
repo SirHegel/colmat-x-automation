@@ -489,6 +489,8 @@ def test_dashboard_queries_stay_bounded_with_many_drafts(dashboard_stack) -> Non
         event.remove(store.engine, "before_cursor_execute", record_statement)
 
     assert response.status_code == 200
-    assert len(statements) <= 10
+    # Presupuesto fijo por solicitud: sesión, principal, agenda, borradores acotados,
+    # equipo y las tres consultas acotadas del motor de IA (selección, estado, claves).
+    assert len(statements) <= 13
     assert "Dato territorial número 34" in response.text
     assert "Dato territorial número 0" not in response.text
