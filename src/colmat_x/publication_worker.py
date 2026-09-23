@@ -405,6 +405,14 @@ class QueuedPublicationWorker:
     def _require_live_gate(self) -> None:
         if self.environ.get(LIVE_PUBLISH_ENV, "").strip().casefold() != "true":
             raise AutomationError(f"Publicación bloqueada: {LIVE_PUBLISH_ENV} debe ser true")
+        # El seguro persistido se relee en cada comprobación para que un cierre desde el
+        # bot detenga la cola sin esperar a un redeploy del entorno del host.
+        safeguards = self.store.get_publication_safeguards(actor_id=self.publisher_actor_id)
+        if not safeguards.live_enabled:
+            raise AutomationError(
+                "Publicación bloqueada: el seguro persistido live está cerrado; ábrelo con "
+                "/seguro live on o safeguards-set"
+            )
 
     def _verify_x_identity(self) -> None:
         expected_user_id = _required_environment_identifier(

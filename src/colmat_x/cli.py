@@ -101,6 +101,17 @@ TELEGRAM_CONTROL_COMMANDS = (
     BotCommand("modo", "Ver o cambiar revisión humana/directo"),
     BotCommand("generar", "Crear un borrador con MiniMax"),
     BotCommand("publicar", "Encolar un borrador aprobado"),
+    BotCommand("agenda", "Estado y operación de la agenda persistida"),
+    BotCommand("seguros", "Estado de los seguros de publicación real"),
+    BotCommand("seguro", "Abrir (doble paso) o cerrar un seguro; owner/admin"),
+    BotCommand("cola", "Solicitudes de publicación y conciliación"),
+    BotCommand("revisar", "Reemitir botones de aprobación de un borrador"),
+    BotCommand("retirar", "Retirar una aprobación aún no encolada"),
+    BotCommand("baja", "Dar de baja a un integrante; solo owner"),
+    BotCommand("alta", "Reactivar a un integrante; solo owner"),
+    BotCommand("rol", "Cambiar el rol de un integrante; solo owner"),
+    BotCommand("doctor", "Diagnóstico del plano de control"),
+    BotCommand("auditoria", "Últimos eventos de auditoría"),
     BotCommand("ayuda", "Mostrar comandos y controles"),
 )
 
@@ -1055,6 +1066,84 @@ def automation_disable(
     )
 
 
+@app.command("safeguards-status")
+def safeguards_status(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Miembro autorizado que consulta los seguros."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Muestra los seguros persistidos de publicación real y su versión CAS."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            safeguards = store.get_publication_safeguards(actor_id=actor_id)
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        json.dumps(
+            {
+                "direct_enabled_at": _iso_or_none(safeguards.direct_enabled_at),
+                "direct_enabled_by": safeguards.direct_enabled_by,
+                "direct_publish_enabled": bool(safeguards.direct_publish_enabled),
+                "live_enabled": bool(safeguards.live_enabled),
+                "live_enabled_at": _iso_or_none(safeguards.live_enabled_at),
+                "live_enabled_by": safeguards.live_enabled_by,
+                "version": safeguards.version,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("safeguards-set")
+def safeguards_set(
+    gate: Annotated[str, typer.Argument(help="Seguro cerrado: live o direct.")],
+    state: Annotated[str, typer.Argument(help="Estado: on u off.")],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner o admin que abre o cierra el seguro."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option(
+            "--expected-version", help="Versión CAS leída previamente (0 si nunca se fijó)."
+        ),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Abre o cierra un seguro persistido con CAS; no publica ni ejecuta nada."""
+
+    try:
+        normalized_gate = gate.strip().casefold()
+        normalized_state = state.strip().casefold()
+        if normalized_gate not in {"live", "direct"}:
+            raise ValueError("gate debe ser live o direct")
+        if normalized_state not in {"on", "off"}:
+            raise ValueError("state debe ser on u off")
+        field_name = "live_enabled" if normalized_gate == "live" else "direct_publish_enabled"
+        with PlatformStore(database_url) as store:
+            updated = store.update_publication_safeguards(
+                actor_id=actor_id,
+                expected_version=expected_version,
+                **{field_name: normalized_state == "on"},
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Seguros actualizados: live={'sí' if updated.live_enabled else 'no'} | "
+        f"direct={'sí' if updated.direct_publish_enabled else 'no'} | "
+        f"version={updated.version}; el entorno del host sigue siendo obligatorio"
+    )
+
+
 @app.command("automation-run")
 def automation_run(
     database_url: DatabaseUrlOption = None,
@@ -1162,6 +1251,10 @@ def automation_run(
             direct_mode = settings.mode == StoredAutomationMode.DIRECT.value
             if direct_mode:
                 _require_direct_worker_preflight(live=live)
+                _require_persisted_safeguards(
+                    store.get_publication_safeguards(actor_id=scheduler_actor_id),
+                    direct=True,
+                )
 
             author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
             pending_retries = store.list_pending_automation_retries(
@@ -1688,6 +1781,21 @@ def _require_direct_worker_preflight(*, live: bool) -> None:
     for name in ("COLMAT_LIVE_ENABLED", "COLMAT_DIRECT_PUBLISH_ENABLED"):
         if os.getenv(name, "").strip().casefold() != "true":
             raise ConfigError(f"El modo direct exige {name}=true exactamente")
+
+
+def _require_persisted_safeguards(safeguards: object, *, direct: bool) -> None:
+    """Los seguros del bot se suman al entorno del host; nunca lo sustituyen."""
+
+    if not getattr(safeguards, "live_enabled", False):
+        raise ConfigError(
+            "Publicación bloqueada: el seguro persistido live está cerrado; ábrelo con "
+            "/seguro live on o safeguards-set"
+        )
+    if direct and not getattr(safeguards, "direct_publish_enabled", False):
+        raise ConfigError(
+            "El modo direct exige el seguro persistido direct abierto; ábrelo con "
+            "/seguro direct on o safeguards-set"
+        )
 
 
 def _require_settings_version(current: int, expected: int) -> None:
