@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Colmat" }]
 dependencies = [
+  "cryptography>=43,<47",
   "fastapi>=0.116,<1",
   "Jinja2>=3.1.6,<4",
   "psycopg[binary]>=3.2,<4",
@@ -39,6 +40,9 @@ packages = ["src/colmat_x"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "config/gustavo-bueno-books.yaml" = "colmat_x/data/gustavo-bueno-books.yaml"
+"config/estilo-gustavo-bueno.yaml" = "colmat_x/data/estilo-gustavo-bueno.yaml"
+"config/estilo-gustavo-bueno-evidencia.yaml" = "colmat_x/data/estilo-gustavo-bueno-evidencia.yaml"
+"config/gustavo-bueno-corpus-manifest.yaml" = "colmat_x/data/gustavo-bueno-corpus-manifest.yaml"
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"

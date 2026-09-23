@@ -126,9 +126,13 @@ def test_known_and_unknown_challenges_have_generic_public_shape_and_only_hashes(
 
 
 def test_unknown_internal_inactive_or_non_control_accounts_are_not_deliverable(store) -> None:
-    owner, _, binding = bootstrap_eligible_user(store, email="service@colmat.internal")
+    owner, _, binding = bootstrap_eligible_user(store)
     service = WebAuthService(store, pepper=PEPPER)
 
+    # El dominio reservado ya no admite vincular Telegram, así que este caso solo
+    # puede existir como fila heredada: la web tampoco le entrega un código.
+    with store.session() as session, session.begin():
+        session.get(User, owner.id).email = "service@colmat.internal"
     internal = service.request_challenge("sirhegel", "198.51.100.1", now=NOW)
     assert internal.deliverable is False
     with pytest.raises(InvalidChallengeError):

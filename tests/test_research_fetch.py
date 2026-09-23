@@ -266,3 +266,49 @@ def test_transport_exception_is_sanitized() -> None:
 def test_timeout_configuration_must_be_finite_and_positive(value: float) -> None:
     with pytest.raises(ValueError, match="número positivo"):
         ResearchFetcher(connect_timeout_seconds=value)
+
+
+def test_corpus_style_fetcher_sends_identifiable_user_agent_and_raises_byte_limit() -> None:
+    body = b"<p>" + b"x" * (MAX_RESPONSE_BYTES + 10) + b"</p>"
+    session = FakeSession([FakeResponse(headers={"Content-Type": "text/html"}, chunks=[body])])
+    fetcher = ResearchFetcher(
+        session=session,  # type: ignore[arg-type]
+        max_response_bytes=MAX_RESPONSE_BYTES * 2,
+        max_text_characters=MAX_SOURCE_TEXT_CHARACTERS * 2,
+        user_agent="colmat-x-automation/0.2 (+https://example.org; corpus)",
+    )
+
+    document = fetcher.fetch_document("https://www.fgbueno.es/hem/1992r15.htm")
+
+    assert document.body == body
+    assert document.mime_type == "text/html"
+    assert document.charset is None
+    assert document.sha256 == hashlib.sha256(body).hexdigest()
+    assert session.calls[0]["headers"] == {
+        "Accept": "text/html, text/plain;q=0.9",
+        "User-Agent": "colmat-x-automation/0.2 (+https://example.org; corpus)",
+    }
+
+
+def test_default_fetcher_keeps_previous_limits_and_sends_no_user_agent() -> None:
+    fetcher, session = make_fetcher([FakeResponse(chunks=[b"x" * (MAX_RESPONSE_BYTES + 1)])])
+
+    with pytest.raises(ResearchResponseError, match="tamaño máximo"):
+        fetcher.fetch("https://www.fgbueno.es/hem/1992r15.htm")
+    assert "User-Agent" not in session.calls[0]["headers"]
+    assert fetcher.max_text_characters == MAX_SOURCE_TEXT_CHARACTERS
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_response_bytes": 0}, "entero positivo"),
+        ({"max_text_characters": True}, "entero positivo"),
+        ({"user_agent": ""}, "ASCII"),
+        ({"user_agent": "bot\r\nX-Injected: 1"}, "ASCII"),
+        ({"user_agent": "ñandú"}, "ASCII"),
+    ],
+)
+def test_fetcher_rejects_invalid_limits_and_header_injection(kwargs: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        ResearchFetcher(**kwargs)

@@ -170,7 +170,7 @@
                 >
                 <span>
                   <strong>Revisión humana</strong>
-                  <small>MiniMax prepara; una persona revisa y aprueba.</small>
+                  <small>{{ ai_text_label|default("El motor de IA", true) }} prepara; una persona revisa y aprueba.</small>
                 </span>
               </label>
               <label class="choice-card{% if not direct_available|default(false) %} choice-card--disabled{% endif %}">
@@ -241,7 +241,7 @@
       <section class="panel panel--generate" aria-labelledby="generate-heading">
         <div class="panel__header">
           <div>
-            <p class="eyebrow">MiniMax</p>
+            <p class="eyebrow">{{ ai_text_label|default("Motor de IA", true) }}</p>
             <h2 id="generate-heading">Crear una pieza</h2>
           </div>
           <span class="ai-badge">IA asistida</span>
@@ -276,7 +276,7 @@
               </span>
             </label>
             <button class="button button--accent button--wide" type="submit">
-              Encargar a MiniMax
+              Encargar a {{ ai_text_label|default("la IA", true) }}
               <span aria-hidden="true">↗</span>
             </button>
           </form>
@@ -288,6 +288,178 @@
         {% endif %}
       </section>
     </div>
+
+    {% set engine = ai_engine|default({}) %}
+    {% set engine_selection = engine.get("selection", {}) %}
+    {% set engine_providers = engine.get("providers", []) %}
+    {% set engine_encryption = engine.get("encryption", {}) %}
+    <section class="panel panel--full" id="motor-ia" aria-labelledby="engine-heading">
+      <div class="panel__header">
+        <div>
+          <p class="eyebrow">Motor de IA</p>
+          <h2 id="engine-heading">Proveedores y credenciales</h2>
+        </div>
+        <span class="panel__meta">v{{ engine_selection.get("version", 1) }}</span>
+      </div>
+      <p class="panel__lead">
+        Texto: <strong>{{ engine.get("text_label", "—") }}</strong> · {{ engine_selection.get("text_model", "—") }}.
+        Imagen: <strong>{{ engine.get("image_label", "—") }}</strong> · {{ engine_selection.get("image_model", "—") }}.
+        La elección se aplica en el próximo run del worker; toda salida sigue siendo un borrador con revisión humana.
+      </p>
+
+      {% if not engine_encryption.get("can_encrypt", false) %}
+        <div class="read-only-state">
+          <span aria-hidden="true">◎</span>
+          <p><strong>Almacén cifrado no disponible.</strong> Falta la clave pública de sobres ({{ engine_encryption.get("public_key_variable", "COLMAT_CREDENTIAL_PUBLIC_KEY") }}); las claves solo pueden configurarse en el archivo 0600 del worker.</p>
+        </div>
+      {% elif not engine_encryption.get("can_decrypt", false) %}
+        <p class="field__hint">Este panel sella claves con la clave pública y no puede leerlas. Comprobar una clave ya guardada la ejecuta el worker en su próximo run.</p>
+      {% endif %}
+
+      {% if can_manage_ai_engine|default(false) %}
+        <form class="settings-form engine-form" method="post" action="/app/ai-engine" data-engine-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="expected_version" value="{{ engine_selection.get("version", 1) }}">
+          <div class="engine-grid">
+            <div class="field field--compact">
+              <label for="engine-text-provider">Proveedor de texto</label>
+              <select id="engine-text-provider" name="text_provider" data-engine-provider="text">
+                {% for item in engine_providers if item.text_models %}
+                  <option value="{{ item.name }}" {% if item.name == engine_selection.get("text_provider") %}selected{% endif %}>{{ item.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field field--compact">
+              <label for="engine-text-model">Modelo de texto</label>
+              <select id="engine-text-model" name="text_model" data-engine-model="text">
+                {% for item in engine_providers %}
+                  {% for model in item.text_models %}
+                    <option value="{{ model }}" data-provider="{{ item.name }}" {% if model == engine_selection.get("text_model") and item.name == engine_selection.get("text_provider") %}selected{% endif %}>{{ model }}</option>
+                  {% endfor %}
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field field--compact">
+              <label for="engine-image-provider">Proveedor de imagen</label>
+              <select id="engine-image-provider" name="image_provider" data-engine-provider="image">
+                {% for item in engine_providers if item.image_models %}
+                  <option value="{{ item.name }}" {% if item.name == engine_selection.get("image_provider") %}selected{% endif %}>{{ item.label }}</option>
+                {% endfor %}
+              </select>
+              <span class="field__hint">Anthropic (Claude) no genera imágenes; combina con MiniMax, OpenAI o Gemini.</span>
+            </div>
+            <div class="field field--compact">
+              <label for="engine-image-model">Modelo de imagen</label>
+              <select id="engine-image-model" name="image_model" data-engine-model="image">
+                {% for item in engine_providers %}
+                  {% for model in item.image_models %}
+                    <option value="{{ model }}" data-provider="{{ item.name }}" {% if model == engine_selection.get("image_model") and item.name == engine_selection.get("image_provider") %}selected{% endif %}>{{ model }}</option>
+                  {% endfor %}
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+          <button class="button button--primary" type="submit">Guardar motor de IA</button>
+        </form>
+      {% else %}
+        <div class="read-only-state">
+          <span aria-hidden="true">◎</span>
+          <p><strong>Selección de solo lectura.</strong> Un owner o administrador puede cambiar el proveedor y el modelo.</p>
+        </div>
+      {% endif %}
+
+      {% if can_manage_ai_engine|default(false) %}
+        <div class="table-wrap">
+          <table class="data-table engine-table">
+            <thead>
+              <tr>
+                <th scope="col">Proveedor</th>
+                <th scope="col">Clave sellada en la base</th>
+                <th scope="col">Clave en el worker</th>
+                <th scope="col">Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in engine_providers %}
+                {% set stored = item.stored %}
+                {% set worker = item.worker_status %}
+                <tr>
+                  <th scope="row">
+                    {{ item.label }}
+                    <small class="field__hint">{{ item.api_key_variable }}</small>
+                  </th>
+                  <td>
+                    {% if stored %}
+                      <span class="status-badge status-badge--ok">Configurada</span>
+                      <small class="field__hint">…{{ stored.last_four }} · huella {{ stored.fingerprint_prefix }}</small>
+                      <small class="field__hint">Por {{ stored.updated_by }} el {{ stored.updated_at }}</small>
+                      {% if stored.last_verified_status == "valid" %}
+                        <small class="field__hint">Verificada: el proveedor la aceptó ({{ stored.last_verified_at }}).</small>
+                      {% elif stored.last_verified_status == "invalid" %}
+                        <small class="field__hint engine-warn">Verificada: el proveedor la rechazó ({{ stored.last_verified_at }}).</small>
+                      {% elif stored.last_verified_status == "error" %}
+                        <small class="field__hint">Verificación no concluyente ({{ stored.last_verified_at }}).</small>
+                      {% endif %}
+                      {% if stored.verification_pending %}
+                        <small class="field__hint">Verificación solicitada; pendiente del worker.</small>
+                      {% endif %}
+                    {% else %}
+                      <span class="status-badge status-badge--muted">Sin clave</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if worker %}
+                      {% if worker.credential_in_environment %}
+                        <span class="status-badge status-badge--ok">Archivo 0600 presente</span>
+                      {% else %}
+                        <span class="status-badge status-badge--muted">Sin archivo</span>
+                      {% endif %}
+                      <small class="field__hint">Reportado {{ worker.reported_at }}{% if worker.can_decrypt_credentials %} · puede abrir sobres{% else %} · no puede abrir sobres{% endif %}</small>
+                    {% else %}
+                      <span class="status-badge status-badge--muted">Sin reporte</span>
+                    {% endif %}
+                  </td>
+                  <td class="engine-actions">
+                    {% if can_manage_ai_credentials|default(false) and engine_encryption.get("can_encrypt", false) %}
+                      <form class="credential-form" method="post" action="/app/ai-credentials" autocomplete="off">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="provider" value="{{ item.name }}">
+                        <label class="visually-hidden" for="credential-{{ item.name }}">Clave de {{ item.label }}</label>
+                        <input
+                          id="credential-{{ item.name }}"
+                          name="api_key"
+                          type="password"
+                          autocomplete="new-password"
+                          spellcheck="false"
+                          minlength="8"
+                          maxlength="4096"
+                          required
+                          placeholder="{% if stored %}Rotar clave{% else %}Pegar clave{% endif %}"
+                        >
+                        <button class="button button--secondary" type="submit">{% if stored %}Rotar{% else %}Guardar{% endif %}</button>
+                      </form>
+                    {% endif %}
+                    {% if stored %}
+                      <form method="post" action="/app/ai-credentials/{{ item.name }}/verify">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button class="button button--secondary" type="submit">Probar</button>
+                      </form>
+                      {% if can_manage_ai_credentials|default(false) %}
+                        <form method="post" action="/app/ai-credentials/{{ item.name }}/delete" data-confirm="¿Eliminar la clave de {{ item.label }} guardada en la base?">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <button class="button button--secondary" type="submit">Eliminar</button>
+                        </form>
+                      {% endif %}
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="field__hint">Precedencia: si hay clave sellada en la base, el worker la usa; si no, usa su archivo 0600. Solo el owner guarda, rota o elimina claves; nunca se muestran completas.</p>
+      {% endif %}
+    </section>
 
     <section class="panel panel--full" id="borradores" aria-labelledby="drafts-heading">
       <div class="panel__header panel__header--split">

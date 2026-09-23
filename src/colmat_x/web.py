@@ -8,7 +8,7 @@ import secrets
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from json import JSONDecodeError
@@ -24,6 +24,8 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import inspect, text
 from starlette.concurrency import run_in_threadpool
 
+from colmat_x.ai_engine import AICredentialError, AIEngineService
+from colmat_x.credential_cipher import PRIVATE_KEY_ENV, CredentialCipherError
 from colmat_x.platform_store import (
     CANONICAL_AUTOMATION_WEEKDAYS,
     AutomationMode,
@@ -34,10 +36,9 @@ from colmat_x.platform_store import (
     PlatformStore,
     StaleSnapshotError,
 )
+from colmat_x.providers import PROVIDER_CATALOG, PROVIDER_NAMES
 from colmat_x.rbac import AuthorizationError, Permission, Role, can_assign_role, has_permission
 from colmat_x.research_registry import (
-    RESEARCH_ONLY_BRIEF_PREFIX,
-    ResearchRegistry,
     load_gustavo_bueno_registry,
 )
 from colmat_x.telegram_api import (
@@ -46,16 +47,17 @@ from colmat_x.telegram_api import (
     TelegramCredentials,
 )
 from colmat_x.telegram_bot import (
-    RESEARCH_PATTERN_STEPS,
-    BotAutomationMode,
     ClaimedTelegramUpdateError,
-    CommandResult,
-    DecisionResult,
     MalformedTelegramUpdate,
     TelegramWebhookProcessor,
     TelegramWebhookSecret,
     WebhookAuthenticationError,
     execute_bot_actions,
+)
+from colmat_x.telegram_operations import (
+    PlatformTelegramOperations,
+    editorial_month,
+    guided_brief,
 )
 from colmat_x.web_auth import (
     CsrfError,
@@ -78,9 +80,14 @@ SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 READINESS_CACHE_SECONDS = 5.0
 PRIVILEGED_WORKER_ENVIRONMENT = frozenset(
     {
+        "ANTHROPIC_API_KEY",
+        # La clave privada abre las credenciales selladas: solo el worker la tiene.
+        PRIVATE_KEY_ENV,
         "EXPECTED_X_USER_ID",
         "EXPECTED_X_USERNAME",
+        "GEMINI_API_KEY",
         "MINIMAX_API_KEY",
+        "OPENAI_API_KEY",
         "X_ACCESS_TOKEN",
         "X_ACCESS_TOKEN_SECRET",
         "X_CONSUMER_KEY",
@@ -95,543 +102,6 @@ REQUIRED_DATABASE_COLUMNS: dict[str, frozenset[str]] = {
 
 class WebConfigurationError(RuntimeError):
     """La función web no tiene una configuración de producción utilizable."""
-
-
-class PlatformTelegramOperations:
-    """Operaciones editoriales permitidas desde Telegram; nunca publica contenido."""
-
-    def __init__(
-        self,
-        store: PlatformStore,
-        *,
-        generate_images: bool = True,
-        research_registry: ResearchRegistry | None = None,
-        now: Callable[[], datetime] | None = None,
-    ) -> None:
-        self.store = store
-        if not isinstance(generate_images, bool):
-            raise TypeError("generate_images debe ser booleano")
-        self._generate_images = generate_images
-        if research_registry is not None and not isinstance(research_registry, ResearchRegistry):
-            raise TypeError("research_registry debe ser ResearchRegistry")
-        self._research_registry = research_registry
-        self._now = now or (lambda: datetime.now(UTC))
-
-    def get_status(self, *, telegram_user_id: int, chat_id: int) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        drafts = self.store.list_drafts(actor_id=actor.id)
-        counts = Counter(draft.status for draft in drafts)
-        labels = (
-            (DraftStatus.DRAFT.value, "borradores"),
-            (DraftStatus.IN_REVIEW.value, "en revisión"),
-            (DraftStatus.APPROVED.value, "aprobados"),
-            (DraftStatus.REJECTED.value, "rechazados"),
-            (DraftStatus.PUBLISHED.value, "publicados"),
-        )
-        summary = "; ".join(f"{counts[key]} {label}" for key, label in labels)
-        return f"Estado editorial: {summary}. Total: {len(drafts)}."
-
-    def get_team(self, *, telegram_user_id: int, chat_id: int) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        memberships = self.store.list_memberships(actor_id=actor.id)
-        lines = ["Equipo Colmat:"]
-        for membership in memberships:
-            user = self.store.get_user(membership.user_id)
-            state = "activo" if user.is_active else "inactivo"
-            lines.append(f"• {user.display_name} — {membership.role} ({state})")
-        return "\n".join(lines)
-
-    def list_telegram_users(self, *, telegram_user_id: int, chat_id: int) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            memberships = self.store.list_memberships(actor_id=actor.id)
-            bindings = self.store.list_telegram_bindings(actor_id=actor.id)
-        except (AuthorizationError, NotFoundError, ValueError):
-            return "No se pudieron consultar los vínculos; la operación requiere al owner."
-        bindings_by_user: dict[str, list[str]] = {}
-        for binding in bindings:
-            if binding.purpose != "control":
-                continue
-            state = "activo" if binding.is_active else "inactivo"
-            private = "privado" if binding.chat_id == binding.telegram_user_id else "otro chat"
-            bindings_by_user.setdefault(binding.user_id, []).append(
-                f"{binding.telegram_user_id} ({state}, {private})"
-            )
-        lines = ["Usuarios y acceso Telegram (IDs numéricos; no @username):"]
-        for index, membership in enumerate(memberships):
-            user = self.store.get_user(membership.user_id)
-            telegram_ids = ", ".join(bindings_by_user.get(user.id, ())) or "sin vínculo"
-            state = "activo" if user.is_active else "inactivo"
-            entry = (
-                f"• {user.display_name} — {membership.role}, {state}\n"
-                f"  user_id={user.id}; Telegram={telegram_ids}"
-            )
-            if len("\n".join((*lines, entry))) > 3_800:
-                lines.append(
-                    f"… {len(memberships) - index} usuario(s) omitidos; consulta la auditoría "
-                    "o el panel para el listado completo."
-                )
-                break
-            lines.append(entry)
-        return "\n".join(lines)
-
-    def invite_telegram_user(
-        self,
-        target_telegram_user_id: int,
-        role: str,
-        email: str,
-        display_name: str,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        del request_id  # El ID privado + los datos exactos hacen el alta idempotente.
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            user, membership, _binding = self.store.provision_telegram_team_member(
-                actor_id=actor.id,
-                telegram_user_id=target_telegram_user_id,
-                email=email,
-                display_name=display_name,
-                role=Role(role),
-            )
-        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
-            return CommandResult(
-                "No se completó el alta: debe ejecutarla el owner con un ID numérico no "
-                "vinculado, un correo nuevo y un rol delegable.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Alta lista: {user.display_name} ({membership.role}), user_id={user.id}, "
-            f"Telegram={target_telegram_user_id}. Debe abrir el bot en privado y usar /start."
-        )
-
-    def bind_telegram_user(
-        self,
-        target_telegram_user_id: int,
-        user_id: str,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        del request_id  # bind_telegram_chat es un upsert auditado por identidad exacta.
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            actor_membership = next(
-                membership
-                for membership in self.store.list_memberships(actor_id=actor.id)
-                if membership.user_id == actor.id
-            )
-            if Role(actor_membership.role) is not Role.OWNER:
-                raise AuthorizationError("Solo el owner puede vincular otras identidades")
-            self.store.bind_telegram_chat(
-                target_telegram_user_id,
-                telegram_user_id=target_telegram_user_id,
-                actor_id=actor.id,
-                user_id=user_id,
-                purpose="control",
-            )
-        except (AuthorizationError, ConflictError, NotFoundError, StopIteration, ValueError):
-            return CommandResult(
-                "No se creó el vínculo: comprueba el user_id, el ID numérico y que la "
-                "identidad no pertenezca a otra cuenta.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Telegram {target_telegram_user_id} quedó vinculado a user_id={user_id} en chat "
-            "privado. El rol de la membresía limita sus comandos."
-        )
-
-    def get_editorial_line(
-        self,
-        month: str | None,
-        *,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        selected_month = month or self._editorial_month()
-        line = self.store.get_editorial_line(selected_month, actor_id=actor.id)
-        if line is None:
-            return f"No hay línea editorial fijada para {selected_month}."
-        return f"Línea editorial {line.month} (v{line.version}): {line.line_text}"
-
-    def set_editorial_line(
-        self,
-        month: str,
-        text: str,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        del request_id  # El upsert idéntico no crea una versión adicional.
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            line = self.store.set_editorial_line(month, text, actor_id=actor.id)
-        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
-            return CommandResult(
-                "No se fijó la línea: solo el owner puede modificar un mes AAAA-MM válido.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Línea editorial {line.month} fijada en versión {line.version}. "
-            "No se generó ni publicó contenido."
-        )
-
-    def research_topic(
-        self,
-        topic: str,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        month = self._editorial_month()
-        try:
-            line = self.store.get_editorial_line(month, actor_id=actor.id)
-            if line is None:
-                raise ConflictError("No hay línea editorial mensual")
-            registry = self._research_registry or load_gustavo_bueno_registry()
-            # La directriz mensual contextualiza la síntesis, pero no debe contaminar
-            # la selección bibliográfica por título del tema solicitado.
-            selected_references = registry.select(topic)
-            pattern = " ".join(
-                f"{index}) {step}" for index, step in enumerate(RESEARCH_PATTERN_STEPS, start=1)
-            )
-            brief_prefix = (
-                f"{RESEARCH_ONLY_BRIEF_PREFIX} Tema: {topic}. Línea {line.month} "
-                f"v{line.version}: {line.line_text} Patrón obligatorio: {pattern}"
-            )
-            if selected_references:
-                suffix = (
-                    " Catálogo por título, no cita: "
-                    + " | ".join(
-                        _research_reference_text(reference) for reference in selected_references
-                    )
-                    + ". URLs acotadas; verifica pertinencia y hechos."
-                )
-            else:
-                suffix = (
-                    " Sin obra pertinente: no inventes. URLs maestras autorizadas: "
-                    + " ".join(registry.canonical_urls[:2])
-                    + ". El worker recuperará solo esas fuentes; inferencias POR VERIFICAR."
-                )
-            brief = brief_prefix + suffix
-            while len(brief) > 1_000 and len(selected_references) > 1:
-                selected_references = selected_references[:-1]
-                suffix = (
-                    " Catálogo por título, no cita: "
-                    + " | ".join(
-                        _research_reference_text(reference) for reference in selected_references
-                    )
-                    + ". URLs acotadas; verifica pertinencia y hechos."
-                )
-                brief = brief_prefix + suffix
-            if len(brief) > 1_000:
-                raise ValueError("Tema, línea y referencias superan el brief permitido")
-            generation_request = self.store.enqueue_generation_request(
-                brief,
-                actor_id=actor.id,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                idempotency_key=request_id,
-                generate_image=False,
-                category="dato_semana",
-                institution="colmat",
-            )
-        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
-            return CommandResult(
-                "No se encoló la investigación: se requiere owner/editor, línea del mes y "
-                "capacidad disponible.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Síntesis exploratoria encolada como {generation_request.id} con la línea "
-            f"{line.month} v{line.version} y {len(selected_references)} coincidencia(s) de "
-            "catálogo por título. OpenClaw recuperará solo las URLs oficiales autorizadas y "
-            "asignará la síntesis a MiniMax; no es navegación web abierta ni es publicable. "
-            "Tras verificarla, copia sus hallazgos manualmente a /generar para crear una pieza "
-            "nueva sujeta a revisión humana."
-        )
-
-    def get_research_patterns(self, *, telegram_user_id: int, chat_id: int) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        # Revalida owner/editor en el store; no depende solo del permiso del procesador.
-        self.store.get_editorial_line(self._editorial_month(), actor_id=actor.id)
-        registry = self._research_registry or load_gustavo_bueno_registry()
-        documented_count = sum(not reference.disputed for reference in registry.entries)
-        disputed_count = sum(reference.disputed for reference in registry.entries)
-        lines = [
-            "Patrón de investigación Colmat:",
-            f"Registro canónico cargado: {documented_count} títulos o series documentados + "
-            f"{disputed_count} atribución "
-            "disputada; se envían como máximo 3 coincidencias por título, nunca el catálogo "
-            "completo, y siempre se verifica su pertinencia.",
-        ]
-        lines.extend(
-            f"{index}. {step}" for index, step in enumerate(RESEARCH_PATTERN_STEPS, start=1)
-        )
-        lines.append(
-            "MiniMax solo sintetiza las fuentes del encargo o del registro canónico. La "
-            "verificación externa sigue siendo humana; sin fuente identificable, todo queda "
-            "POR VERIFICAR y nunca pasa a publicación automática."
-        )
-        return "\n".join(lines)
-
-    def _editorial_month(self) -> str:
-        return self._now().astimezone(ZoneInfo("America/Bogota")).strftime("%Y-%m")
-
-    def get_calendar(
-        self,
-        *,
-        days: int,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        settings = self.store.get_automation_settings(actor_id=actor.id)
-        zone = ZoneInfo(settings.timezone)
-        first_day = self._now().astimezone(zone).date()
-        lines = [
-            "Agenda Colmat "
-            f"({settings.timezone}; {'activa' if settings.enabled else 'pausada'}; "
-            f"modo {settings.mode}):"
-        ]
-        slots = tuple(settings.slots or ())
-        if not slots:
-            lines.append("• No hay slots diarios configurados.")
-            return "\n".join(lines)
-        for offset in range(days):
-            local_day = first_day + timedelta(days=offset)
-            for raw_slot in slots:
-                if not isinstance(raw_slot, Mapping):
-                    continue
-                weekdays = raw_slot.get("weekdays")
-                if weekdays is not None and (
-                    not isinstance(weekdays, list)
-                    or CANONICAL_AUTOMATION_WEEKDAYS[local_day.weekday()] not in weekdays
-                ):
-                    continue
-                slot_id = str(raw_slot.get("id") or "slot")
-                at = str(raw_slot.get("at") or "--:--")
-                mode = str(raw_slot.get("mode") or settings.mode)
-                lines.append(f"• {local_day.isoformat()} {at} — {slot_id} [{mode}]")
-        return "\n".join(lines)
-
-    def get_mode(self, *, telegram_user_id: int, chat_id: int) -> str:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        settings = self.store.get_automation_settings(actor_id=actor.id)
-        state = "activa" if settings.enabled else "pausada"
-        return f"Modo actual: {settings.mode}; automatización {state}; versión {settings.version}."
-
-    def set_mode(
-        self,
-        mode: BotAutomationMode,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        del request_id  # La CAS persistida y el update_id deduplicado protegen este cambio.
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            current = self.store.get_automation_settings(actor_id=actor.id)
-            requested_mode = AutomationMode(mode.value)
-            slots = _automation_slots_for_mode(current.slots, requested_mode)
-            updated = self.store.update_automation_settings(
-                actor_id=actor.id,
-                expected_version=current.version,
-                mode=requested_mode,
-                slots=slots,
-            )
-        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
-            return CommandResult(
-                "No se cambió el modo: faltan permisos, la versión cambió o el kill switch "
-                "direct sigue cerrado.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Modo configurado: {updated.mode}; versión {updated.version}. "
-            "Este cambio no publica contenido por sí solo."
-        )
-
-    def generate_draft(
-        self,
-        brief: str,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            month = self._editorial_month()
-            line = self.store.get_editorial_line(month, actor_id=actor.id)
-            if line is None:
-                raise ConflictError("No hay línea editorial mensual")
-            guided_brief = (
-                f"Línea editorial {line.month} v{line.version}: {line.line_text} Encargo: {brief}"
-            )
-            if len(guided_brief) > 1_000:
-                raise ValueError("La línea y el encargo superan el brief permitido")
-            generation_request = self.store.enqueue_generation_request(
-                guided_brief,
-                actor_id=actor.id,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                idempotency_key=request_id,
-                generate_image=self._generate_images,
-            )
-        except (
-            AuthorizationError,
-            ConflictError,
-            NotFoundError,
-            ValueError,
-        ):
-            return CommandResult(
-                "No se encoló la generación. Se requiere owner/editor, una línea editorial "
-                "del mes y un encargo que junto con ella no supere 1000 caracteres; no se "
-                "llamó a MiniMax ni se realizó ninguna publicación.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Generación encolada como {generation_request.id}. OpenClaw la asignará a "
-            f"MiniMax con la línea {line.month} v{line.version} fuera del webhook; el resultado "
-            "siempre exigirá revisión humana"
-            f"{' e incluirá imagen' if generation_request.generate_image else ''}."
-        )
-
-    def request_publication(
-        self,
-        post_id: str,
-        *,
-        request_id: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> CommandResult:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            revision = self.store.get_current_revision(post_id, actor_id=actor.id)
-            publication_request = self.store.enqueue_publication_request(
-                post_id,
-                actor_id=actor.id,
-                expected_snapshot_hash=revision.snapshot_hash,
-                idempotency_key=request_id,
-            )
-        except (
-            AuthorizationError,
-            ConflictError,
-            NotFoundError,
-            StaleSnapshotError,
-            ValueError,
-        ):
-            return CommandResult(
-                "No se encoló: el borrador debe estar aprobado, conservar el snapshot y ser "
-                "solicitado por un publisher autorizado.",
-                accepted=False,
-            )
-        return CommandResult(
-            f"Solicitud encolada como {publication_request.id}; no se publicó durante el webhook."
-        )
-
-    def approve_post(
-        self,
-        *,
-        post_id: str,
-        snapshot_hash: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> DecisionResult:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            self.store.approve_draft(
-                post_id,
-                actor_id=actor.id,
-                expected_snapshot_hash=snapshot_hash,
-            )
-        except (AuthorizationError, ConflictError, NotFoundError, StaleSnapshotError):
-            return DecisionResult(
-                "No se registró la aprobación: el contenido o sus permisos cambiaron.",
-                accepted=False,
-            )
-        return DecisionResult(
-            f"El borrador {post_id} fue aprobado; todavía no se ha publicado.",
-        )
-
-    def reject_post(
-        self,
-        *,
-        post_id: str,
-        snapshot_hash: str,
-        telegram_user_id: int,
-        chat_id: int,
-    ) -> DecisionResult:
-        actor = self.store.resolve_telegram_actor(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-        )
-        try:
-            self.store.reject_draft(
-                post_id,
-                actor_id=actor.id,
-                expected_snapshot_hash=snapshot_hash,
-                reason="Rechazado mediante el control editorial de Telegram.",
-            )
-        except (AuthorizationError, ConflictError, NotFoundError, StaleSnapshotError):
-            return DecisionResult(
-                "No se registró el rechazo: el contenido o sus permisos cambiaron.",
-                accepted=False,
-            )
-        return DecisionResult(f"El borrador {post_id} fue rechazado.")
 
 
 def _automation_slots_for_mode(
@@ -704,16 +174,32 @@ class RuntimeProvider:
         processor: Any | None = None,
         telegram_client: Any | None = None,
         web_auth: Any | None = None,
+        ai_engine_service: Any | None = None,
     ) -> None:
         self.environ = os.environ if environ is None else environ
         self._injected = WebRuntime(store, processor, telegram_client)
         self._injected_web_auth = web_auth
+        self._injected_ai_engine_service = ai_engine_service
         self._runtime: WebRuntime | None = None
         self._web_auth: Any | None = None
+        self._ai_engine_service: Any | None = None
         self._lock = threading.Lock()
         self._web_auth_lock = threading.Lock()
+        self._ai_engine_lock = threading.Lock()
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, bool, dict[str, str]] | None = None
+
+    def get_ai_engine_service(self) -> Any:
+        """Servicio de motor y credenciales; sella con la clave pública, nunca abre."""
+
+        if self._injected_ai_engine_service is not None:
+            return self._injected_ai_engine_service
+        if self._ai_engine_service is not None:
+            return self._ai_engine_service
+        with self._ai_engine_lock:
+            if self._ai_engine_service is None:
+                self._ai_engine_service = AIEngineService(self.get().store, environ=self.environ)
+        return self._ai_engine_service
 
     def get(self) -> WebRuntime:
         if self._runtime is not None:
@@ -846,16 +332,6 @@ class RuntimeProvider:
         return WebRuntime(store=store, processor=processor, telegram_client=telegram_client)
 
 
-def _research_reference_text(reference: Any) -> str:
-    if reference.disputed:
-        return (
-            f"{reference.title} ({reference.year}) {reference.url}; atribución editorial "
-            "disputada; Bueno negó participación: "
-            f"{reference.status_url}"
-        )
-    return f"{reference.title} ({reference.year}) {reference.url}"
-
-
 def create_app(
     *,
     environ: Mapping[str, str] | None = None,
@@ -863,6 +339,7 @@ def create_app(
     processor: Any | None = None,
     telegram_client: Any | None = None,
     web_auth: Any | None = None,
+    ai_engine_service: Any | None = None,
     max_update_bytes: int = MAX_TELEGRAM_UPDATE_BYTES,
 ) -> FastAPI:
     if isinstance(max_update_bytes, bool) or not isinstance(max_update_bytes, int):
@@ -876,6 +353,7 @@ def create_app(
         processor=processor,
         telegram_client=telegram_client,
         web_auth=web_auth,
+        ai_engine_service=ai_engine_service,
     )
     app = FastAPI(
         title="Colmat X Automation",
@@ -1118,9 +596,17 @@ def create_app(
             if not _valid_request_nonce(request_nonce):
                 raise ValueError("request_id inválido")
             runtime = await run_in_threadpool(provider.get)
+            # El panel es otra puerta a la misma cola: antepone la línea editorial
+            # del mes igual que `/generar`, en vez de encolar el brief crudo.
+            month = editorial_month(datetime.now(UTC))
+            line = await run_in_threadpool(
+                runtime.store.get_editorial_line,
+                month,
+                actor_id=principal.user_id,
+            )
             await run_in_threadpool(
                 runtime.store.enqueue_generation_request,
-                form.get("brief", ""),
+                guided_brief(line, form.get("brief", "")),
                 actor_id=principal.user_id,
                 telegram_user_id=principal.telegram_user_id,
                 chat_id=principal.chat_id,
@@ -1152,6 +638,93 @@ def create_app(
         except (AuthorizationError, ConflictError, NotFoundError, ValueError):
             return _app_redirect(error="automation_failed")
         return _app_redirect(notice="automation_updated")
+
+    @app.post("/app/ai-engine")
+    async def update_ai_engine_from_dashboard(request: Request) -> Any:
+        try:
+            form, principal, _session_token = await _authenticated_web_post(provider, request)
+            await run_in_threadpool(_update_web_ai_engine, provider, principal, form)
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return _app_redirect(error="ai_engine_failed")
+        return _app_redirect(notice="ai_engine_updated")
+
+    @app.post("/app/ai-credentials")
+    async def store_ai_credential_from_dashboard(request: Request) -> Any:
+        # La clave solo existe en el formulario y en esta llamada: se sella y se
+        # descarta. Ningún error la refleja y ninguna respuesta la devuelve.
+        try:
+            form, principal, _session_token = await _authenticated_web_post(provider, request)
+            result = await run_in_threadpool(_store_web_ai_credential, provider, principal, form)
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except CredentialCipherError:
+            return _app_redirect(error="ai_credential_unavailable")
+        except (
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            ValueError,
+            AICredentialError,
+        ):
+            return _app_redirect(error="ai_credential_failed")
+        if result.check is None:
+            return _app_redirect(notice="ai_credential_stored_unverified")
+        if result.check.status == "valid":
+            return _app_redirect(notice="ai_credential_stored_valid")
+        if result.check.status == "invalid":
+            return _app_redirect(notice="ai_credential_stored_invalid")
+        return _app_redirect(notice="ai_credential_stored_unverified")
+
+    @app.post("/app/ai-credentials/{provider_name}/delete")
+    async def delete_ai_credential_from_dashboard(request: Request, provider_name: str) -> Any:
+        try:
+            _require_known_provider(provider_name)
+            _form, principal, _session_token = await _authenticated_web_post(provider, request)
+            service = await run_in_threadpool(provider.get_ai_engine_service)
+            deleted = await run_in_threadpool(
+                service.delete_credential, principal.user_id, provider_name
+            )
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except (AuthorizationError, ConflictError, NotFoundError, ValueError):
+            return _app_redirect(error="ai_credential_failed")
+        if not deleted:
+            return _app_redirect(error="ai_credential_failed")
+        return _app_redirect(notice="ai_credential_deleted")
+
+    @app.post("/app/ai-credentials/{provider_name}/verify")
+    async def verify_ai_credential_from_dashboard(request: Request, provider_name: str) -> Any:
+        try:
+            _require_known_provider(provider_name)
+            _form, principal, _session_token = await _authenticated_web_post(provider, request)
+            service = await run_in_threadpool(provider.get_ai_engine_service)
+            verification = await run_in_threadpool(
+                service.verify_credential, principal.user_id, provider_name
+            )
+        except InvalidSessionError:
+            return _redirect_to_login()
+        except (CsrfError, HTTPException):
+            return _app_redirect(error="request_rejected")
+        except (
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            ValueError,
+            AICredentialError,
+            CredentialCipherError,
+        ):
+            return _app_redirect(error="ai_credential_failed")
+        if verification.outcome == "requested" or verification.check is None:
+            return _app_redirect(notice="ai_credential_verification_requested")
+        return _app_redirect(notice=f"ai_credential_verified_{verification.check.status}")
 
     @app.post("/app/team")
     async def create_team_member(request: Request) -> Any:
@@ -1329,10 +902,27 @@ def create_app(
 
 
 _NOTICE_MESSAGES = {
+    "ai_credential_deleted": "La clave fue eliminada de la base; el worker dejará de usarla.",
+    "ai_credential_stored_invalid": (
+        "La clave quedó sellada en la base, pero el proveedor la rechazó. Revísala o rótala."
+    ),
+    "ai_credential_stored_unverified": (
+        "La clave quedó sellada en la base; la comprobación con el proveedor no fue concluyente."
+    ),
+    "ai_credential_stored_valid": "La clave quedó sellada en la base y el proveedor la aceptó.",
+    "ai_credential_verification_requested": (
+        "La verificación quedó solicitada; el worker la ejecutará y publicará el resultado."
+    ),
+    "ai_credential_verified_error": "La comprobación con el proveedor no fue concluyente.",
+    "ai_credential_verified_invalid": "El proveedor rechazó la clave guardada. Rótala.",
+    "ai_credential_verified_valid": "El proveedor aceptó la clave guardada.",
+    "ai_engine_updated": "El motor de IA quedó actualizado; el worker lo usará en su próximo run.",
     "automation_updated": "La agenda y el modo editorial quedaron actualizados.",
     "draft_approved": "La revisión exacta quedó aprobada; aún no se publicó.",
     "draft_rejected": "La revisión exacta quedó rechazada.",
-    "generation_queued": "OpenClaw recibió la pieza y MiniMax la preparará para revisión.",
+    "generation_queued": (
+        "OpenClaw recibió la pieza y el motor de IA configurado la preparará para revisión."
+    ),
     "publication_queued": "La publicación aprobada quedó en la cola; el worker decide cuándo sale.",
     "team_created": (
         "La cuenta quedó creada. Para ingresar, un administrador debe vincular su Telegram "
@@ -1340,6 +930,14 @@ _NOTICE_MESSAGES = {
     ),
 }
 _ERROR_MESSAGES = {
+    "ai_credential_failed": (
+        "No se guardó ni cambió la clave. Revisa permisos, formato y que el proveedor exista."
+    ),
+    "ai_credential_unavailable": (
+        "El almacén cifrado no está disponible en este despliegue; configura la clave pública "
+        "de sobres o usa el archivo 0600 del worker."
+    ),
+    "ai_engine_failed": "No se cambió el motor de IA. Recarga el panel y revisa tus permisos.",
     "automation_failed": "No se cambió la agenda. Recarga el panel y revisa tus permisos.",
     "generation_failed": "No se pudo encargar la pieza. Revisa la instrucción y vuelve a intentar.",
     "publication_failed": "No se encoló: el borrador debe seguir aprobado y sin cambios.",
@@ -1458,7 +1056,9 @@ def _update_web_automation(
     if (
         can_manage_mode
         and mode is AutomationMode.DIRECT
-        and not _direct_mode_available(provider.environ)
+        and not _direct_mode_available(
+            runtime.store.get_publication_safeguards(actor_id=principal.user_id)
+        )
     ):
         raise ValueError("direct no está habilitado")
     expected_version = int(form.get("expected_version", ""))
@@ -1474,6 +1074,44 @@ def _update_web_automation(
     if can_manage_mode:
         changes["mode"] = mode
     runtime.store.update_automation_settings(**changes)
+
+
+def _update_web_ai_engine(
+    provider: RuntimeProvider,
+    principal: Any,
+    form: Mapping[str, str],
+) -> None:
+    service = provider.get_ai_engine_service()
+    expected_version = int(form.get("expected_version", ""))
+    service.select_engine(
+        principal.user_id,
+        expected_version=expected_version,
+        text_provider=form.get("text_provider", ""),
+        text_model=form.get("text_model", ""),
+        image_provider=form.get("image_provider", ""),
+        image_model=form.get("image_model", ""),
+    )
+
+
+def _store_web_ai_credential(
+    provider: RuntimeProvider,
+    principal: Any,
+    form: Mapping[str, str],
+) -> Any:
+    service = provider.get_ai_engine_service()
+    provider_name = form.get("provider", "")
+    _require_known_provider(provider_name)
+    return service.store_credential(
+        principal.user_id,
+        provider_name,
+        form.get("api_key", ""),
+        verify=form.get("verify", "true") != "false",
+    )
+
+
+def _require_known_provider(provider_name: str) -> None:
+    if provider_name not in PROVIDER_NAMES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown provider")
 
 
 def _approve_web_draft(
@@ -1664,6 +1302,7 @@ def _render_dashboard(
         for role in Role
         if can_assign_role(principal.role, role)
     ]
+    ai_engine = _dashboard_ai_engine(provider, snapshot, principal)
     context = {
         "principal": {
             "display_name": principal.display_name,
@@ -1699,8 +1338,14 @@ def _render_dashboard(
         "can_manage_automation": can_manage_automation,
         "can_manage_automation_mode": can_manage_automation_mode,
         "can_generate": has_permission(principal.role, Permission.CREATE_DRAFTS),
+        "ai_engine": ai_engine,
+        "ai_text_label": ai_engine["text_label"],
+        "can_manage_ai_engine": ai_engine["can_manage_engine"],
+        "can_manage_ai_credentials": ai_engine["can_manage_credentials"],
         "assignable_roles": assignable_roles,
-        "direct_available": _direct_mode_available(provider.environ),
+        "direct_available": _direct_mode_available(
+            runtime.store.get_publication_safeguards(actor_id=principal.user_id)
+        ),
         "flash": _NOTICE_MESSAGES.get(notice or ""),
         "error": _ERROR_MESSAGES.get(error or ""),
     }
@@ -1709,6 +1354,28 @@ def _render_dashboard(
         name="dashboard.html",
         context=context,
     )
+
+
+def _dashboard_ai_engine(
+    provider: RuntimeProvider, snapshot: Any, principal: Any
+) -> dict[str, Any]:
+    """Contexto del motor de IA a partir del snapshot; nunca incluye sobres ni claves."""
+
+    service = provider.get_ai_engine_service()
+    overview = service.overview_from_rows(
+        snapshot.ai_engine,
+        snapshot.ai_provider_status,
+        snapshot.ai_credentials,
+        role=principal.role,
+    )
+    selection = overview.selection
+    text_entry = PROVIDER_CATALOG.get(selection.get("text_provider", ""))
+    image_entry = PROVIDER_CATALOG.get(selection.get("image_provider", ""))
+    return {
+        **overview.to_mapping(),
+        "text_label": text_entry.label if text_entry else "el motor de IA",
+        "image_label": image_entry.label if image_entry else "el motor de IA",
+    }
 
 
 def _dashboard_calendar(settings: Any, *, days: int = 7) -> list[dict[str, str]]:
@@ -1874,10 +1541,17 @@ async def _uniform_login_delay(started_at: float) -> None:
         await asyncio.sleep(remaining)
 
 
-def _direct_mode_available(environ: Mapping[str, str]) -> bool:
-    return all(
-        environ.get(name, "").strip().casefold() == "true"
-        for name in ("COLMAT_DIRECT_PUBLISH_ENABLED", "COLMAT_LIVE_ENABLED")
+def _direct_mode_available(safeguards: object) -> bool:
+    """El modo direct depende del seguro persistido, no del entorno del panel.
+
+    El proceso web corre en Vercel y nunca tuvo las variables del worker, así que
+    leerlas aquí declaraba `direct` como no disponible aunque el owner lo hubiera
+    abierto desde Telegram.
+    """
+
+    return bool(
+        getattr(safeguards, "live_enabled", False)
+        and getattr(safeguards, "direct_publish_enabled", False)
     )
 
 

@@ -403,8 +403,16 @@ class QueuedPublicationWorker:
         )
 
     def _require_live_gate(self) -> None:
-        if self.environ.get(LIVE_PUBLISH_ENV, "").strip().casefold() != "true":
-            raise AutomationError(f"Publicación bloqueada: {LIVE_PUBLISH_ENV} debe ser true")
+        # El seguro persistido es la autoridad única y se relee en cada comprobación:
+        # el owner lo abre y lo cierra desde Telegram o desde el host, sin redeploy.
+        # La antigua exigencia de COLMAT_LIVE_ENABLED se retiró deliberadamente para
+        # que operar la publicación no requiera acceso al servidor.
+        safeguards = self.store.get_publication_safeguards(actor_id=self.publisher_actor_id)
+        if not safeguards.live_enabled:
+            raise AutomationError(
+                "Publicación bloqueada: el seguro persistido live está cerrado; ábrelo con "
+                "/seguro live on o safeguards-set"
+            )
 
     def _verify_x_identity(self) -> None:
         expected_user_id = _required_environment_identifier(

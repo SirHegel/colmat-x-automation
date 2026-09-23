@@ -1,0 +1,84 @@
+version: 1
+
+metadata:
+  nombre: "Fuentes del corpus de estilo de Gustavo Bueno"
+  finalidad: >-
+    Análisis estilométrico local para derivar una guía de registro. Los textos se
+    descargan a un directorio fuera de Git, no se redistribuyen ni se copian en la
+    guía; solo se versionan el manifiesto de procedencia y las métricas derivadas.
+    La obra de Gustavo Bueno (1924-2016) está protegida por derechos de autor; solo
+    se usan páginas que la Fundación Gustavo Bueno y su escuela publican en abierto.
+  condiciones_de_uso:
+    - host: www.fgbueno.es
+      robots_url: https://www.fgbueno.es/robots.txt
+      aviso_url: https://www.fgbueno.es/pyr.htm
+      resumen: >-
+        robots.txt permite el rastreo salvo /cgi-bin/sources, /logs, /031/ y /legal/.
+        La Fundación declara para sus materiales: «Se autoriza la libre utilización de
+        estos materiales al servicio de la docencia y de la investigación, pero no su
+        copia o forma alguna de explotación comercial». Solo se toman los artículos de
+        prensa firmados por Bueno que la hemeroteca lista bajo «Artículos»; se excluyen
+        entrevistas, noticias y textos de terceros.
+      verificado: "2026-09-23"
+    - host: www.filosofia.org
+      robots_url: https://www.filosofia.org/robots.txt
+      aviso_url: https://www.filosofia.org/derechos.htm
+      resumen: >-
+        «Derechos y limitaciones de uso»: Filosofía en español (Fundación Gustavo Bueno)
+        autoriza «consulta, impresión y duplicación para usos particulares, docentes y de
+        investigación» citando la procedencia. robots.txt exige Crawl-delay: 60, que se
+        respeta con una petición por minuto.
+      verificado: "2026-09-23"
+    - host: nodulo.org
+      robots_url: https://nodulo.org/robots.txt
+      aviso_url: null
+      resumen: >-
+        robots.txt permite el rastreo salvo /cgi-bin/sources y /log. El Catoblepas
+        (ISSN 1579-3974) se publica en abierto por Nódulo Materialista, red del
+        materialismo filosófico; se toman solo los artículos firmados por Gustavo Bueno
+        según su página de autor (columna «aut» = gbm).
+      verificado: "2026-09-23"
+
+sources:
+  - id: nodulo-catoblepas
+    nombre: "El Catoblepas (nodulo.org): artículos firmados por Gustavo Bueno, 2002-2016"
+    index_url: https://nodulo.org/ec/aut/gbm.htm
+    link_pattern: '^https://nodulo\.org/ec/\d{4}/n\d{3}p\d{2}\.htm$'
+    index_format: tabla
+    tabla:
+      columna_autor: 0
+      autor: gbm
+      columna_fecha: 1
+    seccion: null
+    min_delay_seconds: 2
+    boilerplate_patterns:
+      - '^el catoblepas\b'
+      - '^n[óo]dulo materialista'
+
+  - id: filosofia-textos
+    nombre: "Filosofía en español (filosofia.org): textos de Gustavo Bueno en formato digital"
+    index_url: https://www.filosofia.org/aut/gbm/index.htm
+    link_pattern: '^https://www\.filosofia\.org/(?!bol/)[a-z0-9/]+\.htm$'
+    index_format: tabla
+    tabla:
+      columna_autor: null
+      autor: null
+      columna_fecha: 0
+    seccion: null
+    min_delay_seconds: 60
+    boilerplate_patterns:
+      - '^textos de gustavo bueno'
+      - '^esta relaci[oó]n se reordena'
+
+  - id: fgbueno-articulos-prensa
+    nombre: "Fundación Gustavo Bueno: artículos de prensa firmados por Gustavo Bueno"
+    index_url: https://www.fgbueno.es/fgb80.htm
+    link_pattern: '^https://www\.fgbueno\.es/hem/\d{4}[a-z0-9]+\.htm$'
+    index_format: seccion
+    tabla: null
+    seccion:
+      inicio: "Artículos"
+      fin: "Entrevistas"
+    min_delay_seconds: 2
+    boilerplate_patterns:
+      - '^(diario 16|el pa[ií]s|el mundo|abc|la nueva espa[ñn]a|la clave|el independiente)\b'

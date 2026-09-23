@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from io import StringIO
@@ -14,6 +15,7 @@ from dotenv import dotenv_values
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from colmat_x.ai_engine import AICredentialError, AIEngineService
 from colmat_x.automation import (
     DEFAULT_AUTOMATION_CONFIG_PATH,
     AutomationConfigurationError,
@@ -27,8 +29,8 @@ from colmat_x.automation import (
     slot_idempotency_key,
 )
 from colmat_x.automation_adapters import (
+    AIAutomationGenerator,
     AutomationReviewNotificationWorker,
-    MiniMaxAutomationGenerator,
     PlatformAutomationRepository,
     PlatformXPublisher,
     ReviewNotificationDeliveryResult,
@@ -37,6 +39,12 @@ from colmat_x.automation_adapters import (
 )
 from colmat_x.config import ConfigError, XCredentials, live_enabled, load_settings
 from colmat_x.content import ContentCollectionError, load_rendered_posts
+from colmat_x.credential_cipher import (
+    PRIVATE_KEY_ENV,
+    PUBLIC_KEY_ENV,
+    CredentialCipher,
+    CredentialCipherError,
+)
 from colmat_x.domain import ContentError, PostStatus, weighted_length
 from colmat_x.editorial import (
     DEFAULT_POLICY_PATH,
@@ -54,7 +62,6 @@ from colmat_x.generation_worker import (
     QueueGenerationStatus,
 )
 from colmat_x.media_paths import configured_worker_media_root
-from colmat_x.minimax import MiniMaxClient, MiniMaxError
 from colmat_x.platform_store import AutomationMode as StoredAutomationMode
 from colmat_x.platform_store import (
     ConflictError,
@@ -64,10 +71,31 @@ from colmat_x.platform_store import (
     User,
     resolve_database_url,
 )
+from colmat_x.providers import PROVIDER_CATALOG, ProviderError, build_ai_engine
 from colmat_x.publication_worker import QueuedPublicationWorker, QueuePublicationStatus
 from colmat_x.rbac import AuthorizationError, Role, require_role_assignment
 from colmat_x.service import Outcome, run_due_posts
 from colmat_x.state import StateError, StateStore
+from colmat_x.style_analysis import (
+    DEFAULT_EVIDENCE_PATH,
+    StyleAnalysisError,
+    compute_evidence_from_corpus,
+    load_style_evidence,
+    write_style_evidence,
+)
+from colmat_x.style_corpus import (
+    DEFAULT_CORPUS_DIR,
+    DEFAULT_MANIFEST_PATH,
+    DEFAULT_SOURCES_PATH,
+    CorpusError,
+    PoliteFetcher,
+    build_corpus,
+    load_corpus_manifest,
+    load_corpus_sources,
+    verify_corpus,
+    write_corpus_manifest,
+)
+from colmat_x.style_guide import DEFAULT_STYLE_GUIDE_PATH, StyleGuideError, load_style_guide
 from colmat_x.telegram_api import (
     BotCommand,
     TelegramApiClient,
@@ -88,6 +116,16 @@ AUTOMATION_RUN_RECONCILIATION_GRACE = timedelta(minutes=30)
 MINIMAX_ENV_FILE_VARIABLE = "COLMAT_MINIMAX_ENV_FILE"
 MINIMAX_SECRET_VARIABLE = "MINIMAX_API_KEY"
 MINIMAX_ENV_FILE_MAX_BYTES = 4096
+CREDENTIAL_PRIVATE_KEY_ENV_FILE_VARIABLE = "COLMAT_CREDENTIAL_PRIVATE_KEY_ENV_FILE"
+# Cada secreto del worker llega por su propio archivo 0600 con una sola variable:
+# (variable que declara la ruta, variable que contiene el secreto, etiqueta).
+SECRET_ENV_FILES: tuple[tuple[str, str, str], ...] = (
+    *(
+        (entry.env_file_variable, entry.api_key_variable, entry.label)
+        for entry in PROVIDER_CATALOG.values()
+    ),
+    (CREDENTIAL_PRIVATE_KEY_ENV_FILE_VARIABLE, PRIVATE_KEY_ENV, "de sobres de IA"),
+)
 TELEGRAM_CONTROL_COMMANDS = (
     BotCommand("estado", "Consultar estado editorial y automatización"),
     BotCommand("equipo", "Ver usuarios y roles del equipo"),
@@ -101,6 +139,17 @@ TELEGRAM_CONTROL_COMMANDS = (
     BotCommand("modo", "Ver o cambiar revisión humana/directo"),
     BotCommand("generar", "Crear un borrador con MiniMax"),
     BotCommand("publicar", "Encolar un borrador aprobado"),
+    BotCommand("agenda", "Estado y operación de la agenda persistida"),
+    BotCommand("seguros", "Estado de los seguros de publicación real"),
+    BotCommand("seguro", "Abrir (doble paso) o cerrar un seguro; owner/admin"),
+    BotCommand("cola", "Solicitudes de publicación y conciliación"),
+    BotCommand("revisar", "Reemitir botones de aprobación de un borrador"),
+    BotCommand("retirar", "Retirar una aprobación aún no encolada"),
+    BotCommand("baja", "Dar de baja a un integrante; solo owner"),
+    BotCommand("alta", "Reactivar a un integrante; solo owner"),
+    BotCommand("rol", "Cambiar el rol de un integrante; solo owner"),
+    BotCommand("doctor", "Diagnóstico del plano de control"),
+    BotCommand("auditoria", "Últimos eventos de auditoría"),
     BotCommand("ayuda", "Mostrar comandos y controles"),
 )
 
@@ -700,7 +749,8 @@ def ai_draft(
         policy = load_editorial_policy(resolved_policy)
         requested_category = EditorialCategory(category) if category is not None else None
         requested_institution = Institution(institution) if institution is not None else None
-        generated = MiniMaxClient().generate_draft(
+        # Sin base de plataforma, el motor sale del entorno (MiniMax por defecto).
+        generated = build_ai_engine().generate_draft(
             brief,
             policy,
             category=requested_category,
@@ -712,7 +762,7 @@ def ai_draft(
         ConfigError,
         EditorialPolicyError,
         EditorialValidationError,
-        MiniMaxError,
+        ProviderError,
         ValueError,
     ) as exc:
         _abort(exc)
@@ -728,6 +778,172 @@ def ai_draft(
         }
     )
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+CorpusDirOption = Annotated[
+    Path,
+    typer.Option(
+        "--corpus-dir",
+        help="Directorio local, fuera de Git, donde viven los textos del corpus.",
+    ),
+]
+CorpusManifestOption = Annotated[
+    Path,
+    typer.Option(
+        "--manifest",
+        help="Manifiesto versionado con procedencia y SHA-256 de cada texto.",
+    ),
+]
+
+
+@app.command("bueno-corpus-build")
+def bueno_corpus_build(
+    sources_path: Annotated[
+        Path,
+        typer.Option("--sources", help="Lista blanca de índices y condiciones de uso."),
+    ] = DEFAULT_SOURCES_PATH,
+    corpus_dir: CorpusDirOption = DEFAULT_CORPUS_DIR,
+    manifest_path: CorpusManifestOption = DEFAULT_MANIFEST_PATH,
+    only_source: Annotated[
+        list[str] | None,
+        typer.Option("--source", help="Limita la descarga a una fuente por id; repetible."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Máximo de documentos por fuente (para pruebas)."),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume/--no-resume",
+            help="Reutiliza textos ya descargados cuyo SHA-256 coincide con el manifiesto.",
+        ),
+    ] = True,
+) -> None:
+    """Descarga el corpus de Gustavo Bueno desde sitios autorizados y escribe el manifiesto."""
+
+    try:
+        if limit is not None and limit < 1:
+            raise ValueError("limit debe ser un entero positivo")
+        sources = load_corpus_sources(sources_path)
+        previous = None
+        if resume and manifest_path.is_file():
+            previous = load_corpus_manifest(manifest_path)
+        manifest = build_corpus(
+            sources,
+            corpus_dir=corpus_dir,
+            fetcher=PoliteFetcher(),
+            only_sources=only_source or None,
+            limit_per_source=limit,
+            previous=previous,
+            progress=lambda message: typer.echo(message, err=True),
+        )
+        write_corpus_manifest(manifest, manifest_path)
+    except (CorpusError, OSError, ValueError) as exc:
+        _abort(exc)
+    totals = manifest.to_mapping()["totales"]
+    typer.echo(
+        json.dumps(
+            {
+                "manifest": str(manifest_path),
+                "corpus_dir": str(corpus_dir),
+                "documentos": totals["documentos"],
+                "palabras": totals["palabras"],
+                "caracteres": totals["caracteres"],
+                "omitidos": len(manifest.skipped),
+                "por_fuente": totals["por_fuente"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("bueno-corpus-verify")
+def bueno_corpus_verify(
+    corpus_dir: CorpusDirOption = DEFAULT_CORPUS_DIR,
+    manifest_path: CorpusManifestOption = DEFAULT_MANIFEST_PATH,
+) -> None:
+    """Comprueba que los textos locales coinciden con el manifiesto versionado."""
+
+    try:
+        manifest = load_corpus_manifest(manifest_path)
+    except CorpusError as exc:
+        _abort(exc)
+    verification = verify_corpus(manifest, corpus_dir)
+    typer.echo(
+        json.dumps(
+            {
+                "verificados": verification.verified,
+                "faltantes": list(verification.missing),
+                "alterados": list(verification.mismatched),
+                "ok": verification.ok,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if not verification.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("bueno-style-derive")
+def bueno_style_derive(
+    corpus_dir: CorpusDirOption = DEFAULT_CORPUS_DIR,
+    manifest_path: CorpusManifestOption = DEFAULT_MANIFEST_PATH,
+    evidence_path: Annotated[
+        Path,
+        typer.Option("--evidence", help="Evidencia estilométrica versionada que se regenera."),
+    ] = DEFAULT_EVIDENCE_PATH,
+    guide_path: Annotated[
+        Path,
+        typer.Option("--guide", help="Guía de estilo que debe seguir validando tras derivar."),
+    ] = DEFAULT_STYLE_GUIDE_PATH,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="No escribe: falla si la evidencia versionada difiere de la recalculada.",
+        ),
+    ] = False,
+) -> None:
+    """Recalcula la evidencia de estilo desde el corpus verificado y valida la guía."""
+
+    try:
+        manifest = load_corpus_manifest(manifest_path)
+        evidence = compute_evidence_from_corpus(manifest, corpus_dir, manifest_path=manifest_path)
+        if check:
+            stored = load_style_evidence(evidence_path)
+            normalized_stored = json.loads(json.dumps(stored, sort_keys=True))
+            normalized_computed = json.loads(json.dumps(evidence, sort_keys=True))
+            if normalized_stored != normalized_computed:
+                raise StyleAnalysisError(
+                    "La evidencia versionada no coincide con el corpus; ejecuta bueno-style-derive"
+                )
+        else:
+            write_style_evidence(evidence, evidence_path)
+        guide = load_style_guide(guide_path)
+    except (CorpusError, StyleAnalysisError, StyleGuideError, OSError) as exc:
+        _abort(exc)
+    typer.echo(
+        json.dumps(
+            {
+                "documentos": guide.corpus_documents,
+                "palabras": guide.corpus_words,
+                "directivas": len(guide.directives),
+                "lexico": len(guide.lexicon),
+                "manifiesto_sha256": guide.manifest_sha256,
+                "evidencia": str(evidence_path),
+                "modo": "check" if check else "write",
+                "prompt_caracteres": len(guide.generation_prompt()),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("automation-validate")
@@ -989,6 +1205,228 @@ def automation_mode(
     )
 
 
+@app.command("ai-engine-status")
+def ai_engine_status(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Miembro autorizado que consulta el motor de IA."),
+    ],
+    database_url: DatabaseUrlOption = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option("--env-file", help="Archivo 0600 opcional con las claves de sobres."),
+    ] = None,
+) -> None:
+    """Muestra proveedor y modelo persistidos, claves selladas y estado del worker."""
+
+    try:
+        _load_trusted_worker_environment(env_file)
+        with PlatformStore(database_url) as store:
+            role = store.actor_role(actor_id=actor_id)
+            overview = AIEngineService(store).overview(actor_id, role=role)
+    except (
+        PlatformStoreError,
+        AuthorizationError,
+        ConfigError,
+        CredentialCipherError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(json.dumps(overview.to_mapping(), ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@app.command("ai-engine")
+def ai_engine(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner o admin que autoriza el cambio."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option("--expected-version", help="Versión CAS leída previamente."),
+    ],
+    text_provider: Annotated[
+        str | None,
+        typer.Option("--text-provider", help="minimax, anthropic, openai o gemini."),
+    ] = None,
+    text_model: Annotated[
+        str | None,
+        typer.Option("--text-model", help="Modelo de texto del catálogo cerrado."),
+    ] = None,
+    image_provider: Annotated[
+        str | None,
+        typer.Option("--image-provider", help="minimax, openai o gemini."),
+    ] = None,
+    image_model: Annotated[
+        str | None,
+        typer.Option("--image-model", help="Modelo de imagen del catálogo cerrado."),
+    ] = None,
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Cambia proveedor o modelo con CAS; nombres y modelos salen de una lista cerrada."""
+
+    changes = {
+        name: value
+        for name, value in (
+            ("text_provider", text_provider),
+            ("text_model", text_model),
+            ("image_provider", image_provider),
+            ("image_model", image_model),
+        )
+        if value is not None
+    }
+    if not changes:
+        _abort(
+            "Indica al menos un cambio: --text-provider, --text-model, --image-provider "
+            "o --image-model"
+        )
+    try:
+        with PlatformStore(database_url) as store:
+            current = store.get_ai_engine_settings(actor_id=actor_id)
+            _require_settings_version(current.version, expected_version)
+            updated = AIEngineService(store).select_engine(
+                actor_id, expected_version=expected_version, **changes
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Motor actualizado: texto={updated.text_provider}/{updated.text_model} | "
+        f"imagen={updated.image_provider}/{updated.image_model} | version={updated.version}"
+    )
+
+
+@app.command("ai-credential-set")
+def ai_credential_set(
+    provider: Annotated[str, typer.Argument(help="Proveedor de la lista cerrada.")],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner que sella la clave."),
+    ],
+    database_url: DatabaseUrlOption = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option("--env-file", help="Archivo 0600 con la clave pública de sobres."),
+    ] = None,
+    verify: Annotated[
+        bool,
+        typer.Option("--verify/--no-verify", help="Comprobar la clave con el proveedor."),
+    ] = True,
+) -> None:
+    """Sella una clave leída por stdin o prompt oculto; nunca por argumentos."""
+
+    try:
+        _load_trusted_worker_environment(env_file)
+        api_key = _read_secret_input("Clave de API")
+        with PlatformStore(database_url) as store:
+            result = AIEngineService(store).store_credential(
+                actor_id, provider, api_key, verify=verify
+            )
+    except (
+        PlatformStoreError,
+        AuthorizationError,
+        ConfigError,
+        CredentialCipherError,
+        AICredentialError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    check = result.check
+    typer.echo(
+        f"Clave sellada: proveedor={result.provider} | final=…{result.view['last_four']} | "
+        f"huella={result.view['fingerprint_prefix']} | "
+        f"{'rotada' if result.replaced else 'nueva'} | "
+        f"comprobación={check.status if check is not None else 'omitida'}"
+    )
+
+
+@app.command("ai-credential-delete")
+def ai_credential_delete(
+    provider: Annotated[str, typer.Argument(help="Proveedor de la lista cerrada.")],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner que elimina la clave."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Elimina la clave sellada de un proveedor; queda auditado."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            deleted = AIEngineService(store).delete_credential(actor_id, provider)
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Clave eliminada: proveedor={provider}"
+        if deleted
+        else f"No había clave sellada para {provider}"
+    )
+
+
+@app.command("ai-credential-verify")
+def ai_credential_verify(
+    provider: Annotated[str, typer.Argument(help="Proveedor de la lista cerrada.")],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner, admin o scheduler que verifica."),
+    ],
+    database_url: DatabaseUrlOption = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option("--env-file", help="Archivo 0600 con la clave privada de sobres."),
+    ] = None,
+) -> None:
+    """Comprueba la clave sellada con el proveedor; sin clave privada solo la solicita."""
+
+    try:
+        _load_trusted_worker_environment(env_file)
+        with PlatformStore(database_url) as store:
+            verification = AIEngineService(store).verify_credential(actor_id, provider)
+    except (
+        PlatformStoreError,
+        AuthorizationError,
+        ConfigError,
+        CredentialCipherError,
+        AICredentialError,
+        ValueError,
+    ) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    if verification.check is None:
+        typer.echo(
+            f"Verificación solicitada: proveedor={verification.provider}; "
+            "el worker la ejecutará en su próximo run"
+        )
+        return
+    typer.echo(
+        f"Verificación: proveedor={verification.provider} | "
+        f"estado={verification.check.status} | {verification.check.detail}"
+    )
+
+
+@app.command("ai-credential-keypair")
+def ai_credential_keypair() -> None:
+    """Genera un par X25519; la privada va solo al worker en un archivo 0600."""
+
+    private_key, public_key = CredentialCipher.generate_keypair()
+    typer.echo(f"{PRIVATE_KEY_ENV}={private_key}")
+    typer.echo(f"{PUBLIC_KEY_ENV}={public_key}")
+    typer.echo(
+        "Guarda la privada en un archivo 0600 del worker declarado como "
+        f"{CREDENTIAL_PRIVATE_KEY_ENV_FILE_VARIABLE}; la pública puede ir en el panel y en "
+        "el worker. No la copies a Vercel ni al repositorio.",
+        err=True,
+    )
+
+
 @app.command("automation-enable")
 def automation_enable(
     actor_id: Annotated[
@@ -1055,6 +1493,84 @@ def automation_disable(
     )
 
 
+@app.command("safeguards-status")
+def safeguards_status(
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Miembro autorizado que consulta los seguros."),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Muestra los seguros persistidos de publicación real y su versión CAS."""
+
+    try:
+        with PlatformStore(database_url) as store:
+            safeguards = store.get_publication_safeguards(actor_id=actor_id)
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        json.dumps(
+            {
+                "direct_enabled_at": _iso_or_none(safeguards.direct_enabled_at),
+                "direct_enabled_by": safeguards.direct_enabled_by,
+                "direct_publish_enabled": bool(safeguards.direct_publish_enabled),
+                "live_enabled": bool(safeguards.live_enabled),
+                "live_enabled_at": _iso_or_none(safeguards.live_enabled_at),
+                "live_enabled_by": safeguards.live_enabled_by,
+                "version": safeguards.version,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("safeguards-set")
+def safeguards_set(
+    gate: Annotated[str, typer.Argument(help="Seguro cerrado: live o direct.")],
+    state: Annotated[str, typer.Argument(help="Estado: on u off.")],
+    actor_id: Annotated[
+        str,
+        typer.Option("--actor-id", help="Owner o admin que abre o cierra el seguro."),
+    ],
+    expected_version: Annotated[
+        int,
+        typer.Option(
+            "--expected-version", help="Versión CAS leída previamente (0 si nunca se fijó)."
+        ),
+    ],
+    database_url: DatabaseUrlOption = None,
+) -> None:
+    """Abre o cierra un seguro persistido con CAS; no publica ni ejecuta nada."""
+
+    try:
+        normalized_gate = gate.strip().casefold()
+        normalized_state = state.strip().casefold()
+        if normalized_gate not in {"live", "direct"}:
+            raise ValueError("gate debe ser live o direct")
+        if normalized_state not in {"on", "off"}:
+            raise ValueError("state debe ser on u off")
+        field_name = "live_enabled" if normalized_gate == "live" else "direct_publish_enabled"
+        with PlatformStore(database_url) as store:
+            updated = store.update_publication_safeguards(
+                actor_id=actor_id,
+                expected_version=expected_version,
+                **{field_name: normalized_state == "on"},
+            )
+    except (PlatformStoreError, AuthorizationError, ValueError) as exc:
+        _abort(exc)
+    except (SQLAlchemyError, ImportError, OSError):
+        _abort_database()
+    typer.echo(
+        f"Seguros actualizados: live={'sí' if updated.live_enabled else 'no'} | "
+        f"direct={'sí' if updated.direct_publish_enabled else 'no'} | "
+        f"version={updated.version}; el entorno del host sigue siendo obligatorio"
+    )
+
+
 @app.command("automation-run")
 def automation_run(
     database_url: DatabaseUrlOption = None,
@@ -1088,6 +1604,11 @@ def automation_run(
                 stale_before=reconciliation_now - AUTOMATION_RUN_RECONCILIATION_GRACE,
                 now=reconciliation_now,
             )
+            # El worker publica qué claves tiene (nunca sus valores) y atiende las
+            # verificaciones solicitadas desde el panel, incluso con la agenda pausada.
+            ai_service = AIEngineService(store, environ=os.environ)
+            ai_service.report_worker_status(scheduler_actor_id)
+            ai_service.run_pending_verifications(scheduler_actor_id)
             review_notifications = [
                 ReviewNotificationDeliveryResult(
                     notification_id=item.id,
@@ -1162,6 +1683,10 @@ def automation_run(
             direct_mode = settings.mode == StoredAutomationMode.DIRECT.value
             if direct_mode:
                 _require_direct_worker_preflight(live=live)
+                _require_persisted_safeguards(
+                    store.get_publication_safeguards(actor_id=scheduler_actor_id),
+                    direct=True,
+                )
 
             author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
             pending_retries = store.list_pending_automation_retries(
@@ -1195,8 +1720,8 @@ def automation_run(
                     return None
                 return editorial_line.line_text, editorial_line.version
 
-            generator = MiniMaxAutomationGenerator(
-                MiniMaxClient(),
+            generator = AIAutomationGenerator(
+                ai_service.build_engine(scheduler_actor_id),
                 policy=policy,
                 editorial_line_resolver=resolve_editorial_line,
             )
@@ -1283,8 +1808,9 @@ def automation_run(
         AutomationConfigurationError,
         AuthorizationError,
         ConfigError,
+        CredentialCipherError,
         EditorialPolicyError,
-        MiniMaxError,
+        ProviderError,
         PlatformStoreError,
         SQLAlchemyError,
         TelegramApiError,
@@ -1402,11 +1928,9 @@ def publication_run(
 
     try:
         _load_trusted_worker_environment(env_file)
-        _reject_publication_minimax_credentials()
+        _reject_publication_ai_credentials()
         if not live:
             raise ConfigError("publication-run exige la opción --live")
-        if os.getenv("COLMAT_LIVE_ENABLED", "").strip().casefold() != "true":
-            raise ConfigError("publication-run exige COLMAT_LIVE_ENABLED=true exactamente")
         scheduler_actor_id = _required_worker_environment("COLMAT_AUTOMATION_SCHEDULER_ID")
         publisher_actor_id = _required_worker_environment("COLMAT_AUTOMATION_PUBLISHER_ID")
         x_client = XApiClient(XCredentials.from_environment())
@@ -1481,9 +2005,12 @@ def generation_run(
         author_actor_id = _required_worker_environment("COLMAT_AUTOMATION_AUTHOR_ID")
         policy = load_editorial_policy(policy_path)
         with _worker_platform_store(database_url) as store:
+            ai_service = AIEngineService(store, environ=os.environ)
+            ai_service.report_worker_status(worker_actor_id)
+            ai_service.run_pending_verifications(worker_actor_id)
             results = QueuedGenerationWorker(
                 store=store,
-                minimax_client=MiniMaxClient(),
+                ai_client=ai_service.build_engine(worker_actor_id),
                 telegram_client=TelegramApiClient(TelegramCredentials.from_environment()),
                 policy=policy,
                 worker_actor_id=worker_actor_id,
@@ -1495,8 +2022,9 @@ def generation_run(
         AutomationError,
         AuthorizationError,
         ConfigError,
+        CredentialCipherError,
         EditorialPolicyError,
-        MiniMaxError,
+        ProviderError,
         PlatformStoreError,
         SQLAlchemyError,
         TelegramApiError,
@@ -1587,69 +2115,71 @@ def _load_trusted_worker_environment(path: Path | None) -> None:
     for name, value in assignments.items():
         os.environ[name] = value
 
-    # La ruta se toma del mapping recién leído, nunca de os.environ: así un proceso
-    # padre no puede hacer que el worker siga una ruta que su env primario no declaró.
-    minimax_env_file = primary_values.get(MINIMAX_ENV_FILE_VARIABLE)
-    if minimax_env_file is None:
-        return
-    normalized_path = minimax_env_file.strip()
-    if not normalized_path:
-        raise ConfigError(f"{MINIMAX_ENV_FILE_VARIABLE} no puede estar vacío")
-    _load_trusted_minimax_environment(Path(normalized_path))
+    # Las rutas se toman del mapping recién leído, nunca de os.environ: así un
+    # proceso padre no puede hacer que el worker siga una ruta que su env primario
+    # no declaró. Cada archivo admite exactamente una variable.
+    for file_variable, secret_variable, label in SECRET_ENV_FILES:
+        configured_path = primary_values.get(file_variable)
+        if configured_path is None:
+            continue
+        normalized_path = configured_path.strip()
+        if not normalized_path:
+            raise ConfigError(f"{file_variable} no puede estar vacío")
+        _load_trusted_secret_file(Path(normalized_path), variable=secret_variable, label=label)
 
 
-def _load_trusted_minimax_environment(path: Path) -> None:
+def _load_trusted_secret_file(path: Path, *, variable: str, label: str) -> None:
     candidate = path.expanduser()
     try:
         metadata = candidate.lstat()
     except OSError as exc:
-        raise ConfigError("No se pudo abrir el archivo de credencial MiniMax") from exc
-    _validate_minimax_environment_metadata(metadata)
+        raise ConfigError(f"No se pudo abrir el archivo de credencial {label}") from exc
+    _validate_secret_file_metadata(metadata, label)
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(candidate, flags)
     except OSError as exc:
-        raise ConfigError("No se pudo abrir el archivo de credencial MiniMax") from exc
+        raise ConfigError(f"No se pudo abrir el archivo de credencial {label}") from exc
     try:
         opened_metadata = os.fstat(descriptor)
-        _validate_minimax_environment_metadata(opened_metadata)
+        _validate_secret_file_metadata(opened_metadata, label)
         if (metadata.st_dev, metadata.st_ino) != (
             opened_metadata.st_dev,
             opened_metadata.st_ino,
         ):
-            raise ConfigError("El archivo de credencial MiniMax cambió durante la lectura")
+            raise ConfigError(f"El archivo de credencial {label} cambió durante la lectura")
         payload = os.read(descriptor, MINIMAX_ENV_FILE_MAX_BYTES + 1)
     finally:
         os.close(descriptor)
 
     if len(payload) != opened_metadata.st_size:
-        raise ConfigError("El archivo de credencial MiniMax cambió durante la lectura")
+        raise ConfigError(f"El archivo de credencial {label} cambió durante la lectura")
     try:
         content = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ConfigError("El archivo de credencial MiniMax no es UTF-8 válido") from exc
+        raise ConfigError(f"El archivo de credencial {label} no es UTF-8 válido") from exc
     significant_lines = [
         line for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")
     ]
     values = dotenv_values(stream=StringIO(content), interpolate=False)
-    if len(significant_lines) != 1 or set(values) != {MINIMAX_SECRET_VARIABLE}:
-        raise ConfigError("El archivo de credencial MiniMax debe contener solo MINIMAX_API_KEY")
-    secret = values[MINIMAX_SECRET_VARIABLE]
+    if len(significant_lines) != 1 or set(values) != {variable}:
+        raise ConfigError(f"El archivo de credencial {label} debe contener solo {variable}")
+    secret = values[variable]
     if secret is None or not secret.strip():
-        raise ConfigError("MINIMAX_API_KEY no puede estar vacía")
-    os.environ[MINIMAX_SECRET_VARIABLE] = secret
+        raise ConfigError(f"{variable} no puede estar vacía")
+    os.environ[variable] = secret
 
 
-def _validate_minimax_environment_metadata(metadata: os.stat_result) -> None:
+def _validate_secret_file_metadata(metadata: os.stat_result, label: str) -> None:
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ConfigError("El archivo de credencial MiniMax debe ser regular, no un enlace")
+        raise ConfigError(f"El archivo de credencial {label} debe ser regular, no un enlace")
     if not hasattr(os, "getuid") or metadata.st_uid != os.getuid():
-        raise ConfigError("El archivo de credencial MiniMax pertenece a otro usuario")
+        raise ConfigError(f"El archivo de credencial {label} pertenece a otro usuario")
     if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise ConfigError("El archivo de credencial MiniMax debe tener permisos 0600 exactos")
+        raise ConfigError(f"El archivo de credencial {label} debe tener permisos 0600 exactos")
     if metadata.st_size < 1 or metadata.st_size > MINIMAX_ENV_FILE_MAX_BYTES:
-        raise ConfigError("El archivo de credencial MiniMax tiene un tamaño no permitido")
+        raise ConfigError(f"El archivo de credencial {label} tiene un tamaño no permitido")
 
 
 def _required_worker_environment(name: str) -> str:
@@ -1675,19 +2205,46 @@ def _reject_generation_x_credentials() -> None:
         )
 
 
-def _reject_publication_minimax_credentials() -> None:
-    if os.getenv("MINIMAX_API_KEY", "").strip():
+def _reject_publication_ai_credentials() -> None:
+    for entry in PROVIDER_CATALOG.values():
+        if os.getenv(entry.api_key_variable, "").strip():
+            raise ConfigError(
+                f"publication-run rechaza credenciales de {entry.label}; "
+                "usa un entorno OpenClaw separado"
+            )
+    if os.getenv(PRIVATE_KEY_ENV, "").strip():
         raise ConfigError(
-            "publication-run rechaza credenciales de MiniMax; usa un entorno OpenClaw separado"
+            "publication-run rechaza la clave privada de sobres de IA; "
+            "usa un entorno OpenClaw separado"
         )
+
+
+def _read_secret_input(label: str) -> str:
+    """Lee un secreto por prompt oculto o por stdin; nunca por argumentos ni historial."""
+
+    if sys.stdin.isatty():
+        return str(typer.prompt(label, hide_input=True))
+    return sys.stdin.readline().rstrip("\r\n")
 
 
 def _require_direct_worker_preflight(*, live: bool) -> None:
     if not live:
         raise ConfigError("El modo direct exige además la opción --live del worker fijo")
-    for name in ("COLMAT_LIVE_ENABLED", "COLMAT_DIRECT_PUBLISH_ENABLED"):
-        if os.getenv(name, "").strip().casefold() != "true":
-            raise ConfigError(f"El modo direct exige {name}=true exactamente")
+
+
+def _require_persisted_safeguards(safeguards: object, *, direct: bool) -> None:
+    """Los seguros del bot se suman al entorno del host; nunca lo sustituyen."""
+
+    if not getattr(safeguards, "live_enabled", False):
+        raise ConfigError(
+            "Publicación bloqueada: el seguro persistido live está cerrado; ábrelo con "
+            "/seguro live on o safeguards-set"
+        )
+    if direct and not getattr(safeguards, "direct_publish_enabled", False):
+        raise ConfigError(
+            "El modo direct exige el seguro persistido direct abierto; ábrelo con "
+            "/seguro direct on o safeguards-set"
+        )
 
 
 def _require_settings_version(current: int, expected: int) -> None:

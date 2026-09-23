@@ -12,14 +12,17 @@ from colmat_x.telegram_bot import (
     CallbackDecision,
     CallbackIntent,
     CommandResult,
+    ControlAction,
     DecisionResult,
     EditMessageText,
+    InlineButton,
     MalformedTelegramUpdate,
     SendMessage,
     TelegramWebhookProcessor,
     TelegramWebhookSecret,
     WebhookAuthenticationError,
     approval_callback_data,
+    confirmation_keyboard,
     execute_bot_actions,
     rejection_callback_data,
 )
@@ -265,6 +268,196 @@ class FakeOperations:
         return DecisionResult(
             f"{post_id} fue rechazado.",
             accepted=self.decision_accepted,
+        )
+
+    # --- Control operativo: cada método solo registra la llamada ---------------
+
+    def get_automation_status(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("automation_status", telegram_user_id, chat_id))
+        return "Agenda persistida: pausada"
+
+    def list_automation_runs(self, *, limit: int, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("automation_runs", limit, telegram_user_id, chat_id))
+        return f"Runs: {limit}"
+
+    def validate_automation_config(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("automation_validate", telegram_user_id, chat_id))
+        return "Agenda YAML válida"
+
+    def sync_automation_config(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("automation_sync", request_id, telegram_user_id, chat_id))
+        return CommandResult("Agenda sincronizada", accepted=self.command_accepted)
+
+    def enable_automation(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("automation_enable", request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            "Confirma activar la agenda",
+            accepted=self.command_accepted,
+            keyboard=confirmation_keyboard(ControlAction.AGENDA_ENABLE, NONCE),
+        )
+
+    def disable_automation(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("automation_disable", request_id, telegram_user_id, chat_id))
+        return CommandResult("Agenda pausada", accepted=self.command_accepted)
+
+    def retry_automation_run(
+        self, run_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("automation_retry", run_id, request_id, telegram_user_id, chat_id))
+        return CommandResult("Reintento solicitado", accepted=self.command_accepted)
+
+    def get_safeguards(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("safeguards", telegram_user_id, chat_id))
+        return "Seguros: live cerrado; direct cerrado"
+
+    def request_safeguard_change(
+        self,
+        gate,
+        enabled: bool,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("safeguard", gate, enabled, request_id, telegram_user_id, chat_id))
+        if not enabled:
+            return CommandResult("Seguro cerrado", accepted=self.command_accepted)
+        action = (
+            ControlAction.SAFEGUARD_LIVE_ON
+            if gate.value == "live"
+            else ControlAction.SAFEGUARD_DIRECT_ON
+        )
+        return CommandResult(
+            "Confirma abrir el seguro",
+            accepted=self.command_accepted,
+            keyboard=confirmation_keyboard(action, NONCE),
+        )
+
+    def request_direct_mode(
+        self, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("direct_mode", request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            "Confirma el modo direct",
+            accepted=self.command_accepted,
+            keyboard=confirmation_keyboard(ControlAction.MODE_DIRECT, NONCE),
+        )
+
+    def list_queue(self, *, limit: int, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("queue", limit, telegram_user_id, chat_id))
+        return f"Cola: {limit}"
+
+    def request_reconciliation(
+        self,
+        publication_request_id: str,
+        *,
+        published: bool,
+        provider_post_id: str | None,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(
+            (
+                "reconcile",
+                publication_request_id,
+                published,
+                provider_post_id,
+                request_id,
+                telegram_user_id,
+                chat_id,
+            )
+        )
+        action = (
+            ControlAction.RECONCILE_PUBLISHED
+            if published
+            else ControlAction.RECONCILE_NOT_PUBLISHED
+        )
+        return CommandResult(
+            "Confirma la conciliación",
+            accepted=self.command_accepted,
+            keyboard=confirmation_keyboard(action, NONCE),
+        )
+
+    def withdraw_approval(
+        self, post_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("withdraw", post_id, request_id, telegram_user_id, chat_id))
+        return CommandResult("Aprobación retirada", accepted=self.command_accepted)
+
+    def request_review(
+        self, post_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("review", post_id, request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            "Revisa el borrador",
+            accepted=self.command_accepted,
+            keyboard=(
+                (
+                    InlineButton("Aprobar", approval_callback_data(NONCE)),
+                    InlineButton("Rechazar", rejection_callback_data(NONCE)),
+                ),
+            ),
+        )
+
+    def request_user_deactivation(
+        self, user_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("deactivate", user_id, request_id, telegram_user_id, chat_id))
+        return CommandResult(
+            "Confirma la baja",
+            accepted=self.command_accepted,
+            keyboard=confirmation_keyboard(ControlAction.USER_DEACTIVATE, NONCE),
+        )
+
+    def reactivate_user(
+        self, user_id: str, *, request_id: str, telegram_user_id: int, chat_id: int
+    ) -> CommandResult:
+        self.calls.append(("reactivate", user_id, request_id, telegram_user_id, chat_id))
+        return CommandResult("Integrante reactivado", accepted=self.command_accepted)
+
+    def change_user_role(
+        self,
+        user_id: str,
+        role: str,
+        *,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(("role", user_id, role, request_id, telegram_user_id, chat_id))
+        return CommandResult("Rol cambiado", accepted=self.command_accepted)
+
+    def run_diagnostics(self, *, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("doctor", telegram_user_id, chat_id))
+        return "Diagnóstico ok"
+
+    def list_audit(self, *, limit: int, telegram_user_id: int, chat_id: int) -> str:
+        self.calls.append(("audit", limit, telegram_user_id, chat_id))
+        return f"Auditoría: {limit}"
+
+    def resolve_confirmation(
+        self,
+        nonce: str,
+        *,
+        action: ControlAction,
+        confirm: bool,
+        request_id: str,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> CommandResult:
+        self.calls.append(
+            ("confirmation", nonce, action, confirm, request_id, telegram_user_id, chat_id)
+        )
+        return CommandResult(
+            "Orden aplicada" if confirm else "Orden cancelada",
+            accepted=self.command_accepted,
         )
 
 
@@ -808,20 +1001,29 @@ def test_mode_can_only_be_forced_to_human_review_from_telegram() -> None:
     assert action.text == "Modo configurado: human_review"
 
 
-def test_direct_mode_is_delegated_only_after_permission_with_risk_warning() -> None:
-    processor, _, authorizer, _, operations = make_processor()
+def test_direct_mode_requires_private_chat_and_two_step_confirmation() -> None:
+    group_processor, _, authorizer, _, group_operations = make_processor()
+    private_processor, _, _, _, operations = make_processor(user_id=101, chat_id=101)
 
-    result = processor.process_update(message_update(92, "/modo direct"), secret_token=SECRET)
+    grouped = group_processor.process_update(
+        message_update(92, "/modo direct"), secret_token=SECRET
+    )
+    result = private_processor.process_update(
+        message_update(93, "/modo direct", user_id=101, chat_id=101),
+        secret_token=SECRET,
+    )
 
     assert (101, -202, BotPermission.MANAGE_MODE) in authorizer.calls
-    assert operations.calls == [
-        ("set_mode", BotAutomationMode.DIRECT, "telegram:92:modo", 101, -202)
-    ]
+    assert "chat privado" in grouped.actions[0].text
+    assert group_operations.calls == []
+    assert operations.calls == [("direct_mode", "telegram:93:modo", 101, 101)]
     action = result.actions[0]
     assert isinstance(action, SendMessage)
     assert "advertencia" in action.text.casefold()
     assert "kill switch" in action.text.casefold()
     assert "doble compuerta" in action.text.casefold()
+    assert action.keyboard == confirmation_keyboard(ControlAction.MODE_DIRECT, NONCE)
+    assert all(call[0] != "set_mode" for call in operations.calls)
 
 
 @pytest.mark.parametrize("argument", ["automatico", "human_review extra", "direct now"])

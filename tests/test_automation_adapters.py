@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -183,6 +183,10 @@ def make_prepared(
 
 
 class FakeMiniMax:
+    provider_name = "minimax"
+    model = "MiniMax-M2.7"
+    image_model = "image-01"
+
     def __init__(self, draft, *, mime_type: str = "image/png") -> None:
         self.draft = draft
         self.mime_type = mime_type
@@ -654,7 +658,15 @@ def test_repository_maps_block_failure_and_unknown_without_leaking_secret(
 
 def setup_direct_publisher(store, policy, tmp_path, monkeypatch, *, x_client=None, media=True):
     services = bootstrap_services(store, direct=True, monkeypatch=monkeypatch)
-    _owner, _scheduler, _author, reviewer, publisher = services
+    owner, _scheduler, _author, reviewer, publisher = services
+    # Los seguros persistidos nacen cerrados; el publisher directo exige ambos abiertos.
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=0,
+        live_enabled=True,
+        direct_publish_enabled=True,
+        now=NOW,
+    )
     repository = make_repository(store, services, tmp_path)
     slot = make_slot(
         mode=AutomationMode.DIRECT,
@@ -730,19 +742,23 @@ def test_direct_publisher_without_media_does_not_mark_ai_flag(
     assert x_client.post_calls[0][1] == {"media_ids": [], "made_with_ai": False}
 
 
-@pytest.mark.parametrize("missing_gate", [LIVE_PUBLISH_ENV, "COLMAT_DIRECT_PUBLISH_ENABLED"])
+@pytest.mark.parametrize("closed_gate", ["live_enabled", "direct_publish_enabled"])
 def test_direct_publisher_rechecks_both_kill_switches(
-    store, policy, tmp_path, monkeypatch, missing_gate
+    store, policy, tmp_path, monkeypatch, closed_gate
 ) -> None:
-    _services, _repository, prepared, x_client, publisher = setup_direct_publisher(
+    """Los seguros persistidos son la autoridad única; cerrar uno detiene el envío."""
+
+    services, _repository, prepared, x_client, publisher = setup_direct_publisher(
         store, policy, tmp_path, monkeypatch
     )
-    publisher._environ = {
-        LIVE_PUBLISH_ENV: "true",
-        "COLMAT_DIRECT_PUBLISH_ENABLED": "true",
-    }
-    del publisher._environ[missing_gate]
-    with pytest.raises(AutomationError, match=missing_gate):
+    owner = services[0]
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=1,
+        **{closed_gate: False},
+        now=NOW,
+    )
+    with pytest.raises(AutomationError, match="seguro persistido"):
         publisher.publish(prepared)
     assert x_client.post_calls == []
 
@@ -806,10 +822,17 @@ def test_direct_publisher_revalidates_claim_after_upload_before_post(
 def test_direct_publisher_revalidates_runtime_gate_after_upload(
     store, policy, tmp_path, monkeypatch
 ) -> None:
-    _services, _repository, prepared, x_client, publisher = setup_direct_publisher(
+    services, _repository, prepared, x_client, publisher = setup_direct_publisher(
         store, policy, tmp_path, monkeypatch
     )
-    x_client.after_upload = lambda: publisher._environ.pop(LIVE_PUBLISH_ENV)
+    owner = services[0]
+    # El owner cierra el seguro desde Telegram justo entre la subida y el envío.
+    x_client.after_upload = lambda: store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW,
+    )
 
     with pytest.raises(AutomationError, match="después de preparar la media"):
         publisher.publish(prepared)
@@ -1073,3 +1096,25 @@ def test_review_outbox_never_retries_ambiguous_telegram_delivery(
         actor_id=owner.id,
     )
     assert persisted.status_value is expected_persisted
+
+
+def test_direct_publisher_blocks_when_persisted_safeguard_closes_after_claim(
+    store, policy, tmp_path, monkeypatch
+) -> None:
+    services, _repository, prepared, x_client, publisher = setup_direct_publisher(
+        store, policy, tmp_path, monkeypatch
+    )
+    owner, *_ = services
+    # El entorno del host sigue armado; el cierre desde el bot debe ganar igualmente.
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(AutomationError, match="seguro persistido live"):
+        publisher.publish(prepared)
+
+    assert x_client.upload_calls == []
+    assert x_client.post_calls == []

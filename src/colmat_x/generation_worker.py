@@ -16,13 +16,20 @@ from colmat_x.automation import AutomationError
 from colmat_x.editorial import EditorialPolicy, assess_engagement
 from colmat_x.image_validation import sniff_supported_image_mime
 from colmat_x.media_paths import configured_worker_media_root, require_trusted_media_root
-from colmat_x.minimax import GeneratedImage, MiniMaxClient, MiniMaxError
 from colmat_x.platform_store import (
     GenerationClaim,
     GenerationNotificationClaim,
     GenerationNotificationStatus,
     GenerationRequestStatus,
     PlatformStore,
+)
+from colmat_x.providers import (
+    GeneratedImage,
+    ProviderConfigurationError,
+    ProviderError,
+    engine_evidence,
+    image_provenance,
+    text_provenance,
 )
 from colmat_x.research_fetch import (
     FetchedResearchSource,
@@ -82,13 +89,13 @@ class QueueGenerationResult:
 
 
 class QueuedGenerationWorker:
-    """MiniMax redacta; el worker persiste revisión y entrega su outbox Telegram."""
+    """El motor de IA redacta; el worker persiste revisión y entrega su outbox Telegram."""
 
     def __init__(
         self,
         *,
         store: PlatformStore,
-        minimax_client: MiniMaxClient,
+        ai_client: Any | None = None,
         telegram_client: TelegramApiClient,
         policy: EditorialPolicy,
         worker_actor_id: str,
@@ -97,9 +104,16 @@ class QueuedGenerationWorker:
         environ: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
         research_fetcher: ResearchFetcher | None = None,
+        minimax_client: Any | None = None,
     ) -> None:
+        if (ai_client is None) == (minimax_client is None):
+            raise TypeError("Indica exactamente un cliente de IA (ai_client)")
+        client = ai_client if ai_client is not None else minimax_client
+        if not callable(getattr(client, "generate_draft", None)):
+            raise TypeError("ai_client debe implementar generate_draft")
+        text_provenance(client)
         self.store = store
-        self.minimax_client = minimax_client
+        self.ai_client = client
         self.telegram_client = telegram_client
         if not isinstance(policy, EditorialPolicy):
             raise TypeError("policy debe ser una EditorialPolicy validada")
@@ -112,6 +126,12 @@ class QueuedGenerationWorker:
         self.environ = os.environ if environ is None else environ
         self.clock = clock or (lambda: datetime.now(UTC))
         self.research_fetcher = research_fetcher
+
+    @property
+    def minimax_client(self) -> Any:
+        """Nombre histórico del cliente; hoy puede ser cualquier motor de la lista cerrada."""
+
+        return self.ai_client
 
     def run(self, *, limit: int = DEFAULT_QUEUE_LIMIT) -> tuple[QueueGenerationResult, ...]:
         if (
@@ -159,7 +179,7 @@ class QueuedGenerationWorker:
                 generation_brief = _enriched_research_brief(request.brief, research_sources)
                 self._validate_generation_claim(claim)
                 self._require_generation_gate()
-            draft = self.minimax_client.generate_draft(
+            draft = self.ai_client.generate_draft(
                 generation_brief,
                 self.policy,
                 category=request.category,
@@ -171,7 +191,7 @@ class QueuedGenerationWorker:
             if request.generate_image:
                 self._require_generation_gate()
                 alt_text = _image_alt_text(draft)
-                image = self.minimax_client.generate_image(
+                image = self.ai_client.generate_image(
                     draft.visual.descripcion,
                     self.policy,
                     aspect_ratio="16:9",
@@ -180,6 +200,7 @@ class QueuedGenerationWorker:
                 image_path = self._persist_image(image)
                 extension = _MIME_EXTENSIONS[image.mime_type]
                 filename = f"colmat-{request.id[:8]}-{image.sha256[:12]}{extension}"
+                image_source = image_provenance(self.ai_client) or {}
                 image_payload = {
                     "url": image_path.as_uri(),
                     "sha256": image.sha256,
@@ -190,11 +211,12 @@ class QueuedGenerationWorker:
                         "filename": filename,
                         "model": image.model,
                         "request_id": image.request_id,
-                        "source": "minimax",
+                        "source": getattr(image, "provider", None)
+                        or image_source.get("provider", "minimax"),
                     },
                 }
             self._validate_generation_claim(claim)
-        except (MiniMaxError, ResearchFetchError, AutomationError, OSError, ValueError) as exc:
+        except (ProviderError, ResearchFetchError, AutomationError, OSError, ValueError) as exc:
             return self._finish_generation_failure(claim, cause=exc)
         except Exception:
             # No se serializa la excepción: puede retener respuestas o credenciales.
@@ -215,6 +237,7 @@ class QueuedGenerationWorker:
                 "institution": draft.institution.value,
                 "visual": draft.visual.to_mapping(),
                 "engagement": assessment.to_mapping(),
+                "ai_engine": _engine_evidence(self.ai_client, image),
             }
             if research_only:
                 evidence["research_sources"] = [
@@ -279,7 +302,13 @@ class QueuedGenerationWorker:
         *,
         cause: Exception,
     ) -> QueueGenerationResult:
-        del cause
+        # Un fallo de configuración del motor es local, no contiene respuestas ni
+        # secretos y debe quedar como detalle claro. Cualquier otra causa se
+        # resume sin serializarla: podría retener contenido remoto o credenciales.
+        if isinstance(cause, ProviderConfigurationError):
+            error = f"El motor de IA no está disponible para este worker: {cause}"[:1_000]
+        else:
+            error = "El motor de IA o el almacén local no produjo un borrador válido."
         try:
             self.store.finish_generation_request(
                 claim.request.id,
@@ -287,7 +316,7 @@ class QueuedGenerationWorker:
                 actor_id=self.worker_actor_id,
                 claim_token=claim.claim_token,
                 claim_fence=claim.claim_fence,
-                error="MiniMax o el almacén local no produjo un borrador válido.",
+                error=error,
                 now=self._now(),
             )
         except Exception:
@@ -486,16 +515,16 @@ class QueuedGenerationWorker:
 
     def _persist_image(self, image: GeneratedImage) -> Path:
         if image.mime_type not in _MIME_EXTENSIONS:
-            raise AutomationError("MiniMax devolvió un MIME de imagen no permitido")
+            raise AutomationError("El proveedor devolvió un MIME de imagen no permitido")
         if not image.content or len(image.content) > MAX_GENERATED_IMAGE_BYTES:
             raise AutomationError("La imagen generada supera el máximo seguro de 5 MiB")
         _require_matching_image_signature(
             image.content,
             image.mime_type,
-            source="La imagen generada por MiniMax",
+            source="La imagen generada por el proveedor",
         )
         if hashlib.sha256(image.content).hexdigest() != image.sha256:
-            raise AutomationError("La imagen de MiniMax no coincide con su hash")
+            raise AutomationError("La imagen generada no coincide con su hash")
         self.media_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.media_root, 0o700)
         destination = self.media_root / f"{image.sha256}{_MIME_EXTENSIONS[image.mime_type]}"
@@ -625,6 +654,19 @@ def _escape_research_delimiters(text: str) -> str:
 def _image_alt_text(draft: Any) -> str:
     description = " ".join(draft.visual.descripcion.split())
     return f"{draft.figure}. {description} Fuente: {draft.source}."[:1_000].rstrip()
+
+
+def _engine_evidence(client: Any, image: GeneratedImage | None) -> dict[str, Any]:
+    """Proveedor y modelo reales de texto e imagen; la imagen solo si se generó."""
+
+    evidence = engine_evidence(client)
+    if image is None:
+        evidence["image"] = None
+    else:
+        provider = getattr(image, "provider", None)
+        if isinstance(provider, str) and provider:
+            evidence["image"] = {"provider": provider, "model": image.model}
+    return evidence
 
 
 def _require_matching_image_signature(content: bytes, mime_type: str, *, source: str) -> None:

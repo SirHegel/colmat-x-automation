@@ -59,5 +59,12 @@ def test_packaged_resource_fallback_and_wheel_mapping(monkeypatch, tmp_path: Pat
     force_include = build_config["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
     assert len(packaged.entries) == 45
     assert force_include == {
-        "config/gustavo-bueno-books.yaml": "colmat_x/data/gustavo-bueno-books.yaml"
+        "config/gustavo-bueno-books.yaml": "colmat_x/data/gustavo-bueno-books.yaml",
+        "config/estilo-gustavo-bueno.yaml": "colmat_x/data/estilo-gustavo-bueno.yaml",
+        "config/estilo-gustavo-bueno-evidencia.yaml": (
+            "colmat_x/data/estilo-gustavo-bueno-evidencia.yaml"
+        ),
+        "config/gustavo-bueno-corpus-manifest.yaml": (
+            "colmat_x/data/gustavo-bueno-corpus-manifest.yaml"
+        ),
     }

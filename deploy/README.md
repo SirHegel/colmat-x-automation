@@ -8,11 +8,11 @@ La automatización se divide deliberadamente en componentes con autoridad distin
 | --- | --- | --- |
 | FastAPI y webhook de Telegram | Vercel | Plano de control: autenticación, comandos, callbacks y mutaciones auditadas. Nunca llama a X. |
 | PostgreSQL | Proveedor persistente | Fuente de verdad de usuarios, roles, revisiones, agenda, versión y runs. |
-| `automation-run` | Host persistente | Worker auditado de slots diarios: MiniMax genera propuestas; Colmat valida, persiste, notifica y solo publica texto en `direct` con todos los gates. |
-| `generation-run` | Host persistente | Consumer de `/generar`: MiniMax propone texto/imagen y siempre crea revisión humana. Nunca recibe X. |
-| `publication-run` | Host persistente | Consumer de `/publicar`: procesa solo snapshots aprobados con gates de X. No recibe MiniMax. |
+| `automation-run` | Host persistente | Worker auditado de slots diarios: el motor de IA persistido genera propuestas; Colmat valida, persiste, notifica y solo publica texto en `direct` con todos los gates. |
+| `generation-run` | Host persistente | Consumer de `/generar`: el motor de IA propone texto/imagen y siempre crea revisión humana. Nunca recibe X. |
+| `publication-run` | Host persistente | Consumer de `/publicar`: procesa solo snapshots aprobados con gates de X. No recibe claves de IA ni la clave privada de sobres. |
 | OpenClaw | Perfil aislado en el mismo host | Orquesta el comando fijo del worker y alerta por su resultado; no decide contenido, permisos ni aprobaciones. |
-| MiniMax | API externa | Solo genera propuestas de texto e imagen; no programa, aprueba ni publica. |
+| Motor de IA (MiniMax por defecto; Anthropic, OpenAI o Gemini) | API externa | Solo genera propuestas de texto e imagen; no programa, aprueba ni publica. La selección vive en `ai_engine_settings`. |
 | X | API oficial | Recibe snapshots aprobados desde `publication-run` o texto desde `automation-run` en `direct`, siempre bajo gates explícitos. |
 
 Vercel Cron, GitHub Actions, el timer heredado y OpenClaw no deben invocar simultáneamente el
@@ -21,14 +21,16 @@ operación clara ni la conciliación de resultados ambiguos.
 
 Antes de desplegar:
 
-- Rota cualquier clave MiniMax que haya aparecido en chats, logs o capturas. Usa exclusivamente la
-  clave nueva desde un gestor de secretos.
-- Confirma cuota de MiniMax para texto e imagen.
+- Rota cualquier clave de IA que haya aparecido en chats, logs o capturas. Usa exclusivamente la
+  clave nueva, desde el archivo `0600` del worker o sellada desde el panel.
+- Confirma cuota del proveedor elegido para texto e imagen.
+- Genera el par de sobres con `colmat-x ai-credential-keypair`; la clave privada solo va al
+  worker y la pública al panel y al worker.
 - Configura OAuth 1.0a de usuario para la cuenta institucional de X y verifica su identidad.
 - Añade crédito y límites de gasto en X Developer Console. Tener credenciales válidas no implica
   tener saldo para publicar.
-- Mantén `COLMAT_LIVE_ENABLED=false` y `COLMAT_DIRECT_PUBLISH_ENABLED=false` durante todo el
-  aprovisionamiento.
+- No abras los seguros `live` ni `direct` durante el aprovisionamiento: nacen cerrados y ahí
+  deben quedarse hasta la puesta en marcha deliberada.
 
 La puntuación editorial y las plantillas ayudan a evaluar una pieza, pero no garantizan viralidad,
 impresiones ni crecimiento.
@@ -45,7 +47,9 @@ de esquema cuando la DSN es PostgreSQL; solo SQLite local conserva auto-iniciali
 `DATABASE_URL_UNPOOLED` únicamente fuera de Vercel y úsala solo para aplicar el DDL.
 
 Aplica el esquema fuera de Vercel, antes del primer despliegue, y vuelve a aplicar el archivo antes
-de actualizar una instalación existente. El script es repetible y conserva los registros:
+de actualizar una instalación existente (esta versión añade `publication_safeguards` y
+`control_confirmations`; readiness falla hasta que existan). El script es repetible y conserva
+los registros:
 
 ```bash
 : "${DATABASE_URL_UNPOOLED:?DATABASE_URL_UNPOOLED es obligatoria}"
@@ -67,15 +71,16 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_WEBHOOK_SECRET=
 COLMAT_WEB_TELEGRAM_TIMEOUT_SECONDS=3
 WEB_AUTH_PEPPER=
-COLMAT_LIVE_ENABLED=false
-COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```
 
 `WEB_AUTH_PEPPER` debe ser aleatorio y contener al menos 32 caracteres. Solo protege HMAC de
 códigos y sesiones del panel; no se copia a OpenClaw ni a los workers.
 
-No cargues `MINIMAX_API_KEY` ni credenciales de X en Vercel. `/generar` solo inserta una solicitud
-durable; el worker persistente llama a MiniMax. El webhook no genera ni publica.
+No cargues claves de IA (`MINIMAX_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`), la clave privada de sobres ni credenciales de X en Vercel; la readiness falla si
+las encuentra. Sí puedes cargar `COLMAT_CREDENTIAL_PUBLIC_KEY` para que el panel selle claves.
+`/generar` solo inserta una solicitud durable; el worker persistente llama al motor de IA. El
+webhook no genera ni publica.
 
 Despliega y comprueba salud y readiness:
 
@@ -195,16 +200,21 @@ workers rechaza enlaces, propietarios distintos y permisos más amplios. No guar
 del checkout. El command job de OpenClaw debe ejecutar el worker con ese mismo usuario fijo, o
 mediante un mecanismo de privilegios limitado que cambie exactamente a ese usuario.
 
-Crea tres archivos separados. `/var/lib/colmat-x/automation-worker.env` puede usar MiniMax y X
-porque ejecuta el pipeline diario completo:
+Crea tres archivos separados. `/var/lib/colmat-x/automation-worker.env` puede usar los motores de
+IA y X porque ejecuta el pipeline diario completo. Cada clave de IA vive en su propio archivo
+`0600` con una sola variable; declara únicamente los proveedores que uses y, si el panel sella
+claves, la clave privada de sobres:
 
 ```dotenv
 DATABASE_URL=
 TELEGRAM_BOT_TOKEN=
 MINIMAX_API_STYLE=anthropic
-MINIMAX_MODEL=MiniMax-M2.7
-MINIMAX_IMAGE_MODEL=image-01
 COLMAT_MINIMAX_ENV_FILE=/var/lib/colmat-x/minimax.env
+# COLMAT_ANTHROPIC_ENV_FILE=/var/lib/colmat-x/anthropic.env
+# COLMAT_OPENAI_ENV_FILE=/var/lib/colmat-x/openai.env
+# COLMAT_GEMINI_ENV_FILE=/var/lib/colmat-x/gemini.env
+# COLMAT_CREDENTIAL_PRIVATE_KEY_ENV_FILE=/var/lib/colmat-x/sobres.env
+# COLMAT_CREDENTIAL_PUBLIC_KEY=
 COLMAT_TELEGRAM_ALERT_CHAT_ID=
 COLMAT_TELEGRAM_REVIEWER_USER_ID=
 COLMAT_AUTOMATION_SCHEDULER_ID=
@@ -218,8 +228,6 @@ X_CONSUMER_KEY=
 X_CONSUMER_SECRET=
 X_ACCESS_TOKEN=
 X_ACCESS_TOKEN_SECRET=
-COLMAT_LIVE_ENABLED=false
-COLMAT_DIRECT_PUBLISH_ENABLED=false
 ```
 
 `/var/lib/colmat-x/generation-worker.env` opera MiniMax y Telegram, pero nunca X:
@@ -259,7 +267,6 @@ X_CONSUMER_KEY=
 X_CONSUMER_SECRET=
 X_ACCESS_TOKEN=
 X_ACCESS_TOKEN_SECRET=
-COLMAT_LIVE_ENABLED=false
 MINIMAX_API_KEY=
 ```
 
@@ -300,6 +307,12 @@ Prueba con el mismo usuario del worker:
 Con la agenda desactivada, automation debe devolver `status=paused`. Generation y publication
 deben seguir bloqueados mientras sus gates estén en `false`. No abras esos gates durante el
 aprovisionamiento.
+
+Los gates del archivo no bastan por sí solos: publication y automation en `direct` también exigen
+los seguros persistidos `live` y `direct`, que nacen cerrados y se abren con doble paso desde
+Telegram (`/seguro live on`, `/seguro direct on`) o desde el host (`safeguards-set`). Cerrarlos
+(`/seguro live off`, desde cualquier chat autorizado) es la parada de emergencia que no requiere
+tocar el host: el worker los relee antes de cada envío.
 
 ## OpenClaw aislado como orquestador
 
@@ -378,11 +391,14 @@ Antes de activarlo:
 3. Sincroniza slots con evidencia real y auditable mientras el sistema sigue en `human_review`.
 4. Verifica que scheduler, autor, reviewer y publisher sean cuentas activas con los roles correctos
    y que autor y reviewer sean distintos.
-5. Detén el job, pausa la agenda con CAS y cambia a `direct` con owner o admin. La operación exige
-   que `COLMAT_DIRECT_PUBLISH_ENABLED=true` esté presente en ese entorno.
+5. Detén el job, pausa la agenda con CAS y cambia a `direct` con owner o admin. Exige el seguro
+   persistido `direct` abierto (`/seguro direct on` o `safeguards-set direct on`) y la
+   confirmación con botón de `/modo direct`.
 6. Activa de nuevo la agenda con owner o admin: un scheduler puede activar `human_review`, pero no
-   puede autorizar ni reautorizar `direct`.
-7. Habilita ambos gates en el archivo privado del worker y añade `--live` al job fijo.
+   puede autorizar ni reautorizar `direct`. Desde Telegram, `/agenda activar` en `direct` pide
+   confirmación.
+7. Habilita ambos gates en el archivo privado del worker, añade `--live` al job fijo y abre el
+   seguro persistido `live` (`/seguro live on` o `safeguards-set live on`).
 8. Ejecuta manualmente un solo slot controlado antes de habilitar el job recurrente.
 
 Usa la versión que devuelva cada consulta:
@@ -391,10 +407,11 @@ Usa la versión que devuelva cada consulta:
 colmat-x automation-status --actor-id OWNER_ID
 colmat-x automation-disable --actor-id SCHEDULER_ID --expected-version VERSION_1
 colmat-x automation-status --actor-id OWNER_ID
-COLMAT_DIRECT_PUBLISH_ENABLED=true colmat-x automation-mode direct \
+colmat-x safeguards-set direct on --actor-id OWNER_ID --expected-version VERSION_S
+colmat-x automation-mode direct \
   --actor-id OWNER_ID --expected-version VERSION_2
 colmat-x automation-status --actor-id OWNER_ID
-COLMAT_DIRECT_PUBLISH_ENABLED=true colmat-x automation-enable \
+colmat-x automation-enable \
   --actor-id OWNER_ID --expected-version VERSION_3
 ```
 
@@ -415,10 +432,10 @@ La invocación directa es:
   --env-file /var/lib/colmat-x/automation-worker.env --live
 ```
 
-Son tres confirmaciones independientes en ejecución: `COLMAT_LIVE_ENABLED=true`,
-`COLMAT_DIRECT_PUBLISH_ENABLED=true` y `--live`. Además, la base debe seguir habilitada, en modo
-`direct`, con la misma versión y el mismo hash de slot autorizados. El publisher revalida esos
-datos y ambos gates antes de crear el post.
+Son tres confirmaciones independientes en ejecución: los seguros persistidos `live` y `direct`
+abiertos, y `--live` en la invocación. Además, la base debe seguir habilitada, en modo `direct`,
+con la misma versión y el mismo hash de slot autorizados. El publisher revalida esos datos y
+relee ambos seguros antes de crear el post.
 
 ## Parada de emergencia y observabilidad
 

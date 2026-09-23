@@ -106,7 +106,25 @@ def _bootstrap_team(store: PlatformStore) -> Team:
     editor = _add_member(store, owner.id, Role.EDITOR, 1)
     reviewer = _add_member(store, owner.id, Role.REVIEWER, 1)
     publisher = _add_member(store, owner.id, Role.PUBLISHER, 1)
+    # El seguro persistido live nace cerrado; los tests de publicación lo abren a propósito.
+    store.update_publication_safeguards(
+        actor_id=owner.id,
+        expected_version=0,
+        live_enabled=True,
+        now=NOW,
+    )
     return Team(owner.id, scheduler.id, editor.id, reviewer.id, publisher.id)
+
+
+def _close_live_safeguard(store, team) -> None:
+    """Cierra el seguro persistido, como haría el owner desde Telegram."""
+
+    store.update_publication_safeguards(
+        actor_id=team.owner_id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW,
+    )
 
 
 def _slot(*, generate_image: bool) -> dict[str, object]:
@@ -260,28 +278,6 @@ def test_worker_requires_distinct_scheduler_and_publisher(store, tmp_path: Path)
         )
 
 
-def test_live_gate_is_checked_before_claiming_any_request(store, tmp_path: Path) -> None:
-    team = _bootstrap_team(store)
-    _draft, _revision, request, _run_id = _prepare_request(store, team)
-    x_client = FakeX()
-
-    with pytest.raises(AutomationError, match=LIVE_PUBLISH_ENV):
-        _worker(
-            store,
-            team,
-            x_client,
-            tmp_path,
-            environ={LIVE_PUBLISH_ENV: "false"},
-        ).run()
-
-    persisted = store.get_publication_request(request.id, actor_id=team.publisher_id)
-    assert persisted.status_value is PublicationRequestStatus.QUEUED
-    assert x_client.upload_calls == []
-    assert x_client.post_calls == []
-    with store.session() as session:
-        assert list(session.scalars(select(PublishAttempt))) == []
-
-
 def test_empty_queue_returns_before_verifying_x_identity(store, tmp_path: Path) -> None:
     team = _bootstrap_team(store)
     x_client = FakeX()
@@ -402,10 +398,9 @@ def test_worker_rechecks_gate_after_upload_and_never_contacts_post_endpoint(
         path=image_path,
         byte_size=len(content),
     )
-    environ = {LIVE_PUBLISH_ENV: "true"}
-    x_client = FakeX(after_upload=lambda: environ.pop(LIVE_PUBLISH_ENV))
+    x_client = FakeX(after_upload=lambda: _close_live_safeguard(store, team))
 
-    results = _worker(store, team, x_client, media_root, environ=environ).run()
+    results = _worker(store, team, x_client, media_root).run()
 
     assert results[0].status is QueuePublicationStatus.FAILED
     assert len(x_client.upload_calls) == 1
@@ -447,15 +442,13 @@ def test_gate_revocation_does_not_claim_the_next_queued_request(store, tmp_path:
         team,
         enqueue_now=NOW + timedelta(seconds=1),
     )
-    environ = {LIVE_PUBLISH_ENV: "true"}
-    x_client = FakeX(after_upload=lambda: environ.pop(LIVE_PUBLISH_ENV))
+    x_client = FakeX(after_upload=lambda: _close_live_safeguard(store, team))
 
     results = _worker(
         store,
         team,
         x_client,
         media_root,
-        environ=environ,
         now=NOW + timedelta(seconds=2),
     ).run()
 
@@ -571,17 +564,16 @@ def test_successful_request_advances_linked_automation_run_to_succeeded(
     assert after.finished_by == team.scheduler_id
 
 
-def test_publication_run_cli_requires_both_explicit_live_controls(monkeypatch) -> None:
+def test_publication_run_cli_requires_the_explicit_live_option(monkeypatch) -> None:
+    """`--live` declara que esta invocación puede publicar; la autorización es del seguro."""
+
     runner = CliRunner()
-    monkeypatch.setenv(LIVE_PUBLISH_ENV, "false")
+    monkeypatch.delenv(LIVE_PUBLISH_ENV, raising=False)
 
     missing_option = runner.invoke(app, ["publication-run"])
-    missing_environment = runner.invoke(app, ["publication-run", "--live"])
 
     assert missing_option.exit_code == 1
     assert "exige la opción --live" in missing_option.output
-    assert missing_environment.exit_code == 1
-    assert f"{LIVE_PUBLISH_ENV}=true" in missing_environment.output
 
 
 def test_publication_run_cli_defers_identity_verification_to_worker(
@@ -642,3 +634,27 @@ def test_publication_run_cli_defers_identity_verification_to_worker(
     assert worker_kwargs["x_client"] is not None
     assert worker_kwargs["scheduler_actor_id"] == "scheduler-service"
     assert worker_kwargs["publisher_actor_id"] == "publisher-service"
+
+
+def test_closed_persisted_live_safeguard_blocks_queue_without_claiming(
+    store, tmp_path: Path
+) -> None:
+    team = _bootstrap_team(store)
+    _draft, _revision, request, _run_id = _prepare_request(store, team)
+    store.update_publication_safeguards(
+        actor_id=team.owner_id,
+        expected_version=1,
+        live_enabled=False,
+        now=NOW,
+    )
+    x_client = FakeX()
+
+    with pytest.raises(AutomationError, match="seguro persistido live"):
+        _worker(store, team, x_client, tmp_path).run()
+
+    persisted = store.get_publication_request(request.id, actor_id=team.publisher_id)
+    assert persisted.status_value is PublicationRequestStatus.QUEUED
+    assert x_client.identity_calls == []
+    assert x_client.post_calls == []
+    with store.session() as session:
+        assert list(session.scalars(select(PublishAttempt))) == []

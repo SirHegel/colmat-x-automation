@@ -1,0 +1,892 @@
+# Generado por `colmat-x bueno-style-derive`; no editar a mano.
+version: 1
+manifiesto_sha256: aae05b3ba2c5becbe71f9966d8ffaca1d93229297bb4a2033d408ae93f6b5ae6
+corpus:
+  documentos: 244
+  palabras: 1916475
+  oraciones: 50327
+  parrafos: 14888
+  caracteres: 12189062
+  palabras_largas_pct: 12.55
+oracion:
+  media_palabras: 38.08
+  mediana_palabras: 33
+  p90_palabras: 71
+  distribucion_pct:
+    1-15: 15.9
+    16-30: 29.2
+    31-50: 30.1
+    51+: 24.8
+  interrogativas_pct: 4.84
+  exclamativas_pct: 0.12
+parrafo:
+  media_palabras: 128.73
+  mediana_palabras: 101.0
+  media_oraciones: 3.38
+  numerados_pct: 14.39
+conectores_por_10k:
+  es decir:
+    por_10k: 12.56
+    ocurrencias: 2407
+    documentos_pct: 89.3
+  por ejemplo:
+    por_10k: 12.22
+    ocurrencias: 2341
+    documentos_pct: 93.9
+  por tanto:
+    por_10k: 9.27
+    ocurrencias: 1776
+    documentos_pct: 86.1
+  sin embargo:
+    por_10k: 8.9
+    ocurrencias: 1706
+    documentos_pct: 89.3
+  acaso:
+    por_10k: 8.81
+    ocurrencias: 1688
+    documentos_pct: 91.0
+  precisamente:
+    por_10k: 8.0
+    ocurrencias: 1534
+    documentos_pct: 85.7
+  cabría / cabe:
+    por_10k: 7.15
+    ocurrencias: 1370
+    documentos_pct: 82.4
+  '&c.':
+    por_10k: 6.81
+    ocurrencias: 1306
+    documentos_pct: 76.6
+  sin duda:
+    por_10k: 5.95
+    ocurrencias: 1140
+    documentos_pct: 83.6
+  ahora bien:
+    por_10k: 3.97
+    ocurrencias: 760
+    documentos_pct: 75.8
+  en efecto:
+    por_10k: 3.68
+    ocurrencias: 705
+    documentos_pct: 70.1
+  de hecho:
+    por_10k: 3.61
+    ocurrencias: 691
+    documentos_pct: 69.7
+  ante todo:
+    por_10k: 3.37
+    ocurrencias: 646
+    documentos_pct: 73.4
+  desde luego:
+    por_10k: 2.96
+    ocurrencias: 568
+    documentos_pct: 68.9
+  sin perjuicio de:
+    por_10k: 2.95
+    ocurrencias: 565
+    documentos_pct: 68.0
+  en todo caso:
+    por_10k: 2.92
+    ocurrencias: 559
+    documentos_pct: 65.2
+  ni siquiera:
+    por_10k: 2.84
+    ocurrencias: 545
+    documentos_pct: 71.3
+  en cualquier caso:
+    por_10k: 2.79
+    ocurrencias: 535
+    documentos_pct: 68.4
+  a saber:
+    por_10k: 2.47
+    ocurrencias: 474
+    documentos_pct: 64.3
+  en realidad:
+    por_10k: 2.24
+    ocurrencias: 429
+    documentos_pct: 62.7
+  según esto:
+    por_10k: 1.9
+    ocurrencias: 365
+    documentos_pct: 54.5
+  por lo demás:
+    por_10k: 1.38
+    ocurrencias: 265
+    documentos_pct: 44.3
+  dicho de otro modo:
+    por_10k: 1.35
+    ocurrencias: 259
+    documentos_pct: 46.7
+  a lo sumo:
+    por_10k: 1.31
+    ocurrencias: 252
+    documentos_pct: 43.9
+  esto es:
+    por_10k: 1.12
+    ocurrencias: 215
+    documentos_pct: 43.9
+  es cierto que:
+    por_10k: 1.11
+    ocurrencias: 212
+    documentos_pct: 44.7
+  en consecuencia:
+    por_10k: 0.95
+    ocurrencias: 183
+    documentos_pct: 43.4
+  en este sentido:
+    por_10k: 0.93
+    ocurrencias: 178
+    documentos_pct: 36.1
+  en modo alguno:
+    por_10k: 0.82
+    ocurrencias: 157
+    documentos_pct: 36.1
+  tan solo:
+    por_10k: 0.82
+    ocurrencias: 157
+    documentos_pct: 35.2
+  por consiguiente:
+    por_10k: 0.8
+    ocurrencias: 154
+    documentos_pct: 29.9
+  en resolución:
+    por_10k: 0.65
+    ocurrencias: 125
+    documentos_pct: 31.1
+  en rigor:
+    por_10k: 0.59
+    ocurrencias: 113
+    documentos_pct: 29.5
+  en cuanto tal:
+    por_10k: 0.54
+    ocurrencias: 104
+    documentos_pct: 25.8
+  hasta el punto de:
+    por_10k: 0.44
+    ocurrencias: 85
+    documentos_pct: 24.2
+  por decirlo así:
+    por_10k: 0.34
+    ocurrencias: 65
+    documentos_pct: 19.7
+  en suma:
+    por_10k: 0.28
+    ocurrencias: 53
+    documentos_pct: 15.2
+  lo que quiere decir:
+    por_10k: 0.14
+    ocurrencias: 27
+    documentos_pct: 9.4
+  en resumen:
+    por_10k: 0.14
+    ocurrencias: 26
+    documentos_pct: 8.6
+  así pues:
+    por_10k: 0.07
+    ocurrencias: 13
+    documentos_pct: 4.9
+  o sea:
+    por_10k: 0.04
+    ocurrencias: 8
+    documentos_pct: 2.9
+  pues bien:
+    por_10k: 0.02
+    ocurrencias: 3
+    documentos_pct: 1.2
+lexico_tecnico:
+  idea (minúscula):
+    ocurrencias: 3692
+    por_10k: 19.26
+    documentos_pct: 81.6
+  concepto:
+    ocurrencias: 3417
+    por_10k: 17.83
+    documentos_pct: 82.8
+  Estado:
+    ocurrencias: 2317
+    por_10k: 12.09
+    documentos_pct: 74.2
+  partes:
+    ocurrencias: 1179
+    por_10k: 6.15
+    documentos_pct: 58.2
+  Idea (mayúscula):
+    ocurrencias: 1177
+    por_10k: 6.14
+    documentos_pct: 43.4
+  Historia (mayúscula):
+    ocurrencias: 947
+    por_10k: 4.94
+    documentos_pct: 48.8
+  ceremonia:
+    ocurrencias: 911
+    por_10k: 4.75
+    documentos_pct: 20.5
+  institución:
+    ocurrencias: 840
+    por_10k: 4.38
+    documentos_pct: 56.1
+  norma / normas:
+    ocurrencias: 811
+    por_10k: 4.23
+    documentos_pct: 46.3
+  dialéctica:
+    ocurrencias: 742
+    por_10k: 3.87
+    documentos_pct: 49.6
+  categoría:
+    ocurrencias: 738
+    por_10k: 3.85
+    documentos_pct: 56.6
+  sociedad política:
+    ocurrencias: 715
+    por_10k: 3.73
+    documentos_pct: 37.7
+  gnoseología:
+    ocurrencias: 695
+    por_10k: 3.63
+    documentos_pct: 26.6
+  todo atributivo / distributivo:
+    ocurrencias: 668
+    por_10k: 3.49
+    documentos_pct: 36.5
+  Imperio:
+    ocurrencias: 655
+    por_10k: 3.42
+    documentos_pct: 35.2
+  operatorio:
+    ocurrencias: 646
+    por_10k: 3.37
+    documentos_pct: 34.4
+  ontología:
+    ocurrencias: 634
+    por_10k: 3.31
+    documentos_pct: 34.4
+  totalidad:
+    ocurrencias: 613
+    por_10k: 3.2
+    documentos_pct: 47.1
+  ejercicio / representación:
+    ocurrencias: 574
+    por_10k: 3.0
+    documentos_pct: 59.8
+  Nación (mayúscula):
+    ocurrencias: 497
+    por_10k: 2.59
+    documentos_pct: 32.4
+  emic / etic:
+    ocurrencias: 493
+    por_10k: 2.57
+    documentos_pct: 31.6
+  ideología:
+    ocurrencias: 488
+    por_10k: 2.55
+    documentos_pct: 48.8
+  cultura (mayúscula):
+    ocurrencias: 487
+    por_10k: 2.54
+    documentos_pct: 31.1
+  morfología:
+    ocurrencias: 409
+    por_10k: 2.13
+    documentos_pct: 28.3
+  mito:
+    ocurrencias: 343
+    por_10k: 1.79
+    documentos_pct: 38.1
+  ejes circular / radial / angular:
+    ocurrencias: 264
+    por_10k: 1.38
+    documentos_pct: 11.9
+  materialismo filosófico:
+    ocurrencias: 263
+    por_10k: 1.37
+    documentos_pct: 31.1
+  sociedad civil:
+    ocurrencias: 243
+    por_10k: 1.27
+    documentos_pct: 11.5
+  espacio antropológico:
+    ocurrencias: 222
+    por_10k: 1.16
+    documentos_pct: 15.6
+  lisológico:
+    ocurrencias: 209
+    por_10k: 1.09
+    documentos_pct: 9.4
+  fundamentalismo democrático:
+    ocurrencias: 199
+    por_10k: 1.04
+    documentos_pct: 9.4
+  regressus / progressus:
+    ocurrencias: 167
+    por_10k: 0.87
+    documentos_pct: 18.4
+  filosofía mundana / académica:
+    ocurrencias: 159
+    por_10k: 0.83
+    documentos_pct: 16.0
+  numen / númenes:
+    ocurrencias: 159
+    por_10k: 0.83
+    documentos_pct: 9.4
+  monismo / pluralismo:
+    ocurrencias: 156
+    por_10k: 0.81
+    documentos_pct: 19.3
+  nación política:
+    ocurrencias: 151
+    por_10k: 0.79
+    documentos_pct: 13.1
+  cierre categorial:
+    ocurrencias: 144
+    por_10k: 0.75
+    documentos_pct: 14.8
+  nematología:
+    ocurrencias: 143
+    por_10k: 0.75
+    documentos_pct: 10.2
+  realmente existente:
+    ocurrencias: 114
+    por_10k: 0.59
+    documentos_pct: 18.4
+  diamérico:
+    ocurrencias: 99
+    por_10k: 0.52
+    documentos_pct: 11.9
+  holótico:
+    ocurrencias: 96
+    por_10k: 0.5
+    documentos_pct: 7.8
+  primogenérico / segundogenérico / terciogenérico:
+    ocurrencias: 94
+    por_10k: 0.49
+    documentos_pct: 9.0
+  apotético / paratético:
+    ocurrencias: 83
+    por_10k: 0.43
+    documentos_pct: 5.3
+  sustancialismo:
+    ocurrencias: 82
+    por_10k: 0.43
+    documentos_pct: 12.7
+  ciencias categoriales:
+    ocurrencias: 69
+    por_10k: 0.36
+    documentos_pct: 9.0
+  M1/M2/M3:
+    ocurrencias: 65
+    por_10k: 0.34
+    documentos_pct: 4.9
+  symploké:
+    ocurrencias: 62
+    por_10k: 0.32
+    documentos_pct: 11.9
+  Pensamiento Alicia:
+    ocurrencias: 61
+    por_10k: 0.32
+    documentos_pct: 5.3
+  metamérico:
+    ocurrencias: 49
+    por_10k: 0.26
+    documentos_pct: 7.8
+  trituración:
+    ocurrencias: 49
+    por_10k: 0.26
+    documentos_pct: 12.3
+  anamnesis:
+    ocurrencias: 46
+    por_10k: 0.24
+    documentos_pct: 7.0
+  holización:
+    ocurrencias: 45
+    por_10k: 0.23
+    documentos_pct: 6.1
+  eutaxia:
+    ocurrencias: 39
+    por_10k: 0.2
+    documentos_pct: 6.1
+  saber de segundo grado:
+    ocurrencias: 38
+    por_10k: 0.2
+    documentos_pct: 5.7
+  conceptos conjugados:
+    ocurrencias: 36
+    por_10k: 0.19
+    documentos_pct: 5.7
+  ortograma:
+    ocurrencias: 36
+    por_10k: 0.19
+    documentos_pct: 2.9
+  Ego trascendental:
+    ocurrencias: 25
+    por_10k: 0.13
+    documentos_pct: 4.9
+  materia ontológico-general:
+    ocurrencias: 17
+    por_10k: 0.09
+    documentos_pct: 4.5
+  hiperrealismo:
+    ocurrencias: 3
+    por_10k: 0.02
+    documentos_pct: 0.4
+figuras_por_10k:
+  comillas irónicas de una palabra:
+    por_10k: 56.84
+    ocurrencias: 10894
+    documentos_pct: 98.0
+  sólo con tilde (ortografía anterior a 2010):
+    por_10k: 21.11
+    ocurrencias: 4045
+    documentos_pct: 98.4
+  no X sino Y:
+    por_10k: 19.08
+    ocurrencias: 3656
+    documentos_pct: 98.0
+  distinguir / distinción:
+    por_10k: 8.51
+    ocurrencias: 1630
+    documentos_pct: 71.3
+  supuesto / pretendido / presunto:
+    por_10k: 8.1
+    ocurrencias: 1553
+    documentos_pct: 87.3
+  enumeración numerada (1) (2):
+    por_10k: 4.12
+    ocurrencias: 789
+    documentos_pct: 40.2
+  confusión / oscuridad (crítica):
+    por_10k: 3.11
+    ocurrencias: 596
+    documentos_pct: 55.7
+  clasificación / clasificar:
+    por_10k: 2.94
+    ocurrencias: 564
+    documentos_pct: 44.7
+  los llamados / la llamada:
+    por_10k: 2.78
+    ocurrencias: 533
+    documentos_pct: 67.2
+  latinismos:
+    por_10k: 2.41
+    ocurrencias: 461
+    documentos_pct: 56.1
+  no ya X sino Y:
+    por_10k: 2.13
+    ocurrencias: 408
+    documentos_pct: 61.9
+  sencillamente:
+    por_10k: 1.22
+    ocurrencias: 234
+    documentos_pct: 44.7
+  en primer / segundo / tercer lugar:
+    por_10k: 0.9
+    ocurrencias: 173
+    documentos_pct: 32.8
+  reconstrucción / reconstruir:
+    por_10k: 0.89
+    ocurrencias: 170
+    documentos_pct: 29.9
+  absurdo / disparate:
+    por_10k: 0.82
+    ocurrencias: 158
+    documentos_pct: 32.4
+  no tanto X cuanto Y:
+    por_10k: 0.29
+    ocurrencias: 56
+    documentos_pct: 16.8
+  dialelo:
+    por_10k: 0.06
+    ocurrencias: 11
+    documentos_pct: 2.5
+  ni más ni menos:
+    por_10k: 0.01
+    ocurrencias: 2
+    documentos_pct: 0.8
+puntuacion_por_10k:
+  paréntesis (: 144.62
+  comillas angulares «»: 116.89
+  comillas inglesas “”: 45.13
+  'dos puntos :': 42.81
+  punto y coma ;: 36.91
+  semirraya –: 34.19
+  interrogación de apertura ¿: 16.69
+  etcétera &c.: 6.81
+  puntos suspensivos: 5.88
+  exclamación de apertura ¡: 1.27
+  comillas rectas ": 0.41
+  raya —: 0.19
+  etcétera abreviado etc.: 0.05
+aperturas:
+  pregunta_inicial_pct: 5.7
+  primeras_palabras:
+    el: 35
+    la: 20
+    en: 18
+    se: 12
+    qué: 10
+    las: 7
+    sobre: 6
+    un: 5
+    de: 4
+    los: 4
+    'no': 4
+    ante: 3
+    conferencia: 3
+    este: 3
+    identidad: 3
+  primeros_bigramas:
+    qué es: 7
+    la idea: 5
+    en la: 4
+    en las: 4
+    el filósofo: 3
+    identidad y: 3
+    morfológico lisológico: 3
+    reconstrucción de: 3
+    ante todo: 2
+    conferencia pronunciada: 2
+    de la: 2
+    el concepto: 2
+    el enunciado: 2
+    el libro: 2
+    el objetivo: 2
+cierres:
+  pregunta_final_pct: 6.6
+  primeras_palabras_ultima_oracion:
+    pero: 23
+    la: 19
+    en: 15
+    y: 13
+    'no': 11
+    el: 8
+    desde: 5
+    es: 5
+    lo: 5
+    por: 5
+    porque: 5
+    una: 5
+    a: 4
+    los: 4
+    un: 4
+  primeros_bigramas_ultima_oracion:
+    en cualquier: 5
+    lo que: 4
+    no dudamos: 4
+    este es: 3
+    gustavo bueno: 3
+    pero la: 3
+    pero si: 3
+    desde el: 2
+    en todo: 2
+    estados lisológicos: 2
+    gonzalo puente: 2
+    la filosofía: 2
+    no es: 2
+    también es: 2
+    y por: 2
+vocabulario:
+  contenido_top:
+  - palabra: son
+    ocurrencias: 4249
+    por_10k: 22.17
+  - palabra: decir
+    ocurrencias: 3867
+    por_10k: 20.18
+  - palabra: filosofía
+    ocurrencias: 3778
+    por_10k: 19.71
+  - palabra: idea
+    ocurrencias: 3358
+    por_10k: 17.52
+  - palabra: modo
+    ocurrencias: 3196
+    por_10k: 16.68
+  - palabra: sentido
+    ocurrencias: 2845
+    por_10k: 14.84
+  - palabra: caso
+    ocurrencias: 2835
+    por_10k: 14.79
+  - palabra: ejemplo
+    ocurrencias: 2597
+    por_10k: 13.55
+  - palabra: historia
+    ocurrencias: 2540
+    por_10k: 13.25
+  - palabra: concepto
+    ocurrencias: 2430
+    por_10k: 12.68
+  - palabra: estado
+    ocurrencias: 2396
+    por_10k: 12.5
+  - palabra: política
+    ocurrencias: 2372
+    por_10k: 12.38
+  - palabra: cultura
+    ocurrencias: 2121
+    por_10k: 11.07
+  - palabra: hombre
+    ocurrencias: 2078
+    por_10k: 10.84
+  - palabra: menos
+    ocurrencias: 2068
+    por_10k: 10.79
+  - palabra: sociedad
+    ocurrencias: 2045
+    por_10k: 10.67
+  - palabra: parte
+    ocurrencias: 1999
+    por_10k: 10.43
+  - palabra: lugar
+    ocurrencias: 1803
+    por_10k: 9.41
+  - palabra: españa
+    ocurrencias: 1749
+    por_10k: 9.13
+  - palabra: mundo
+    ocurrencias: 1731
+    por_10k: 9.03
+  - palabra: podría
+    ocurrencias: 1720
+    por_10k: 8.97
+  - palabra: embargo
+    ocurrencias: 1708
+    por_10k: 8.91
+  - palabra: acaso
+    ocurrencias: 1688
+    por_10k: 8.81
+  - palabra: perspectiva
+    ocurrencias: 1688
+    por_10k: 8.81
+  - palabra: democracia
+    ocurrencias: 1665
+    por_10k: 8.69
+  - palabra: ciencia
+    ocurrencias: 1638
+    por_10k: 8.55
+  - palabra: incluso
+    ocurrencias: 1583
+    por_10k: 8.26
+  - palabra: general
+    ocurrencias: 1579
+    por_10k: 8.24
+  - palabra: relaciones
+    ocurrencias: 1567
+    por_10k: 8.18
+  - palabra: sistema
+    ocurrencias: 1541
+    por_10k: 8.04
+  - palabra: precisamente
+    ocurrencias: 1534
+    por_10k: 8.0
+  - palabra: identidad
+    ocurrencias: 1477
+    por_10k: 7.71
+  - palabra: ideas
+    ocurrencias: 1473
+    por_10k: 7.69
+  - palabra: forma
+    ocurrencias: 1472
+    por_10k: 7.68
+  - palabra: punto
+    ocurrencias: 1463
+    por_10k: 7.63
+  - palabra: principio
+    ocurrencias: 1430
+    por_10k: 7.46
+  - palabra: hecho
+    ocurrencias: 1426
+    por_10k: 7.44
+  - palabra: aún
+    ocurrencias: 1402
+    por_10k: 7.32
+  - palabra: teoría
+    ocurrencias: 1389
+    por_10k: 7.25
+  - palabra: ahora
+    ocurrencias: 1356
+    por_10k: 7.08
+  - palabra: realidad
+    ocurrencias: 1355
+    por_10k: 7.07
+  - palabra: ciencias
+    ocurrencias: 1334
+    por_10k: 6.96
+  - palabra: términos
+    ocurrencias: 1327
+    por_10k: 6.92
+  - palabra: cualquier
+    ocurrencias: 1325
+    por_10k: 6.91
+  - palabra: naturaleza
+    ocurrencias: 1312
+    por_10k: 6.85
+  - palabra: hombres
+    ocurrencias: 1305
+    por_10k: 6.81
+  - palabra: dios
+    ocurrencias: 1300
+    por_10k: 6.78
+  - palabra: propia
+    ocurrencias: 1268
+    por_10k: 6.62
+  - palabra: duda
+    ocurrencias: 1266
+    por_10k: 6.61
+  - palabra: izquierda
+    ocurrencias: 1251
+    por_10k: 6.53
+  - palabra: proceso
+    ocurrencias: 1241
+    por_10k: 6.48
+  - palabra: puesto
+    ocurrencias: 1239
+    por_10k: 6.46
+  - palabra: veces
+    ocurrencias: 1221
+    por_10k: 6.37
+  - palabra: ver
+    ocurrencias: 1220
+    por_10k: 6.37
+  - palabra: valores
+    ocurrencias: 1202
+    por_10k: 6.27
+  - palabra: universal
+    ocurrencias: 1186
+    por_10k: 6.19
+  - palabra: momento
+    ocurrencias: 1185
+    por_10k: 6.18
+  - palabra: distinción
+    ocurrencias: 1183
+    por_10k: 6.17
+  - palabra: través
+    ocurrencias: 1172
+    por_10k: 6.12
+  - palabra: partes
+    ocurrencias: 1170
+    por_10k: 6.1
+ngramas:
+  bigramas_top:
+  - texto: de la
+    ocurrencias: 27480
+  - texto: en el
+    ocurrencias: 10601
+  - texto: de los
+    ocurrencias: 10526
+  - texto: a la
+    ocurrencias: 8777
+  - texto: de las
+    ocurrencias: 8186
+  - texto: en la
+    ocurrencias: 8001
+  - texto: de una
+    ocurrencias: 4643
+  - texto: de un
+    ocurrencias: 4621
+  - texto: que se
+    ocurrencias: 4339
+  - texto: a los
+    ocurrencias: 3862
+  - texto: lo que
+    ocurrencias: 3855
+  - texto: que la
+    ocurrencias: 3717
+  - texto: que el
+    ocurrencias: 2968
+  - texto: de su
+    ocurrencias: 2869
+  - texto: a las
+    ocurrencias: 2584
+  - texto: no es
+    ocurrencias: 2513
+  - texto: en su
+    ocurrencias: 2411
+  - texto: es decir
+    ocurrencias: 2407
+  - texto: que no
+    ocurrencias: 2353
+  - texto: con la
+    ocurrencias: 2345
+  - texto: por ejemplo
+    ocurrencias: 2341
+  - texto: la idea
+    ocurrencias: 2340
+  - texto: la filosofía
+    ocurrencias: 2319
+  - texto: por la
+    ocurrencias: 2304
+  - texto: o de
+    ocurrencias: 2238
+  - texto: en los
+    ocurrencias: 2162
+  - texto: y la
+    ocurrencias: 2054
+  - texto: la que
+    ocurrencias: 1946
+  - texto: y de
+    ocurrencias: 1936
+  - texto: de que
+    ocurrencias: 1919
+  trigramas_contenido_top:
+  - texto: la idea de
+    ocurrencias: 1632
+  - texto: de la filosofía
+    ocurrencias: 1052
+  - texto: de la historia
+    ocurrencias: 967
+  - texto: a través de
+    ocurrencias: 906
+  - texto: en el sentido
+    ocurrencias: 869
+  - texto: a partir de
+    ocurrencias: 698
+  - texto: punto de vista
+    ocurrencias: 696
+  - texto: de la cultura
+    ocurrencias: 641
+  - texto: que ver con
+    ocurrencias: 617
+  - texto: el concepto de
+    ocurrencias: 606
+  - texto: de la idea
+    ocurrencias: 578
+  - texto: sin perjuicio de
+    ocurrencias: 566
+  - texto: en todo caso
+    ocurrencias: 559
+  - texto: el punto de
+    ocurrencias: 539
+  - texto: la posibilidad de
+    ocurrencias: 539
+  - texto: en cualquier caso
+    ocurrencias: 535
+  - texto: en el terreno
+    ocurrencias: 510
+  - texto: en función de
+    ocurrencias: 510
+  - texto: de la sociedad
+    ocurrencias: 501
+  - texto: de la ciencia
+    ocurrencias: 496
+  - texto: de las ciencias
+    ocurrencias: 494
+  - texto: de un modo
+    ocurrencias: 491
+  - texto: en el momento
+    ocurrencias: 490
+  - texto: de la democracia
+    ocurrencias: 483
+  - texto: el sentido de
+    ocurrencias: 477
+  - texto: la historia de
+    ocurrencias: 471
+  - texto: en la medida
+    ocurrencias: 445
+  - texto: de este modo
+    ocurrencias: 433
+  - texto: el caso de
+    ocurrencias: 430
+  - texto: la medida en
+    ocurrencias: 425

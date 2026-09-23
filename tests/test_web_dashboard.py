@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,7 +11,19 @@ from sqlalchemy import event
 import colmat_x.platform_store as platform_store_module
 from colmat_x.platform_store import PlatformStore
 from colmat_x.rbac import Role
+from colmat_x.telegram_operations import editorial_month
 from colmat_x.web import CSRF_COOKIE, LOGIN_CSRF_COOKIE, SESSION_COOKIE, create_app
+
+
+def set_current_editorial_line(store: PlatformStore, owner_id: str) -> None:
+    """El panel exige la directriz del mes igual que `/generar`."""
+
+    store.set_editorial_line(
+        editorial_month(datetime.now(UTC)),
+        "Territorio y persistencia: toda pieza lleva cifra y fuente verificables.",
+        actor_id=owner_id,
+    )
+
 
 ORIGIN = "https://testserver"
 PEPPER = "test-web-auth-pepper-which-is-longer-than-32-characters"
@@ -207,6 +220,7 @@ def test_owner_can_create_team_member_and_enqueue_minimax_work(dashboard_stack) 
             "role": "editor",
         },
     )
+    set_current_editorial_line(store, owner.id)
     generated = client.post(
         "/app/generate",
         headers={"Origin": ORIGIN},
@@ -445,6 +459,7 @@ def test_generation_endpoint_enforces_durable_daily_quota(
     csrf_token = client.cookies.get(CSRF_COOKIE)
     assert csrf_token
 
+    set_current_editorial_line(store, owner.id)
     responses = [
         client.post(
             "/app/generate",
@@ -489,6 +504,52 @@ def test_dashboard_queries_stay_bounded_with_many_drafts(dashboard_stack) -> Non
         event.remove(store.engine, "before_cursor_execute", record_statement)
 
     assert response.status_code == 200
-    assert len(statements) <= 10
+    # Presupuesto fijo por solicitud: sesión, principal, agenda, borradores acotados,
+    # equipo y las tres consultas acotadas del motor de IA (selección, estado, claves).
+    # 15 y no 13: el panel resuelve el seguro persistido de publicación para
+    # saber si `direct` está disponible, y esa consulta autoriza y lee. Es un
+    # coste constante; el límite sigue cazando cualquier N+1 por borrador.
+    assert len(statements) <= 15
     assert "Dato territorial número 34" in response.text
     assert "Dato territorial número 0" not in response.text
+
+
+def test_panel_refuses_to_enqueue_without_the_monthly_editorial_line(dashboard_stack) -> None:
+    """El panel no puede saltarse la directriz que `/generar` exige.
+
+    Regresión: `/app/generate` encolaba el brief crudo, así que el contenido
+    generado desde la web nunca veía la línea del mes.
+    """
+
+    client, store, owner, telegram = dashboard_stack
+    _login(client, telegram)
+    csrf_token = client.cookies.get(CSRF_COOKIE)
+    panel = client.get("/app")
+
+    sin_linea = client.post(
+        "/app/generate",
+        headers={"Origin": ORIGIN},
+        data={
+            "csrf_token": csrf_token,
+            "request_id": _hidden(panel, "request_id"),
+            "brief": "9 poderes en 3 capas. Fuente: TIERRA FIRME, capítulo 1.",
+        },
+    )
+    assert sin_linea.headers["location"] == "/app?error=generation_failed"
+    assert store.list_generation_requests(actor_id=owner.id) == []
+
+    set_current_editorial_line(store, owner.id)
+    panel = client.get("/app")
+    con_linea = client.post(
+        "/app/generate",
+        headers={"Origin": ORIGIN},
+        data={
+            "csrf_token": csrf_token,
+            "request_id": _hidden(panel, "request_id"),
+            "brief": "9 poderes en 3 capas. Fuente: TIERRA FIRME, capítulo 1.",
+        },
+    )
+    assert con_linea.headers["location"] == "/app?notice=generation_queued"
+    encolada = store.list_generation_requests(actor_id=owner.id)[0]
+    assert encolada.brief.startswith("Línea editorial ")
+    assert "Encargo: 9 poderes en 3 capas." in encolada.brief

@@ -193,20 +193,25 @@ def automation_slot(
 
 def test_schema_contains_all_platform_tables() -> None:
     assert set(table_names()) == {
+        "ai_engine_settings",
+        "ai_provider_credentials",
+        "ai_provider_status",
         "approvals",
         "audit_events",
         "automation_review_notifications",
         "automation_runs",
         "automation_settings",
         "callback_intents",
+        "control_confirmations",
         "drafts",
         "editorial_lines",
         "generation_notifications",
         "generation_requests",
         "media_assets",
         "memberships",
-        "publish_attempts",
         "publication_requests",
+        "publication_safeguards",
+        "publish_attempts",
         "revisions",
         "telegram_bindings",
         "telegram_updates",
@@ -4216,3 +4221,161 @@ def test_postgres_ddl_is_repeatable_and_migrates_existing_user_and_role_schema()
 
 def json_text(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def test_ambiguous_attempt_blocks_a_second_publication_of_the_same_snapshot(store) -> None:
+    """Un `unknown` del camino direct no puede publicarse otra vez por la cola humana.
+
+    Regresión: `revise_draft` ya bloqueaba editar con un intento ambiguo en vuelo,
+    pero publicar seguía abierto y duplicaba el post en X.
+    """
+
+    _owner, editor, reviewer, publisher, _auditor = bootstrap_team(store)
+    draft, revision = new_draft(store, editor.id)
+    store.submit_for_review(
+        draft.id,
+        actor_id=editor.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        now=NOW,
+    )
+    store.approve_draft(
+        draft.id,
+        actor_id=reviewer.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        now=NOW,
+    )
+    ambiguous = store.create_publish_attempt(
+        draft.id,
+        actor_id=publisher.id,
+        expected_snapshot_hash=revision.snapshot_hash,
+        idempotency_key=f"colmat:auto:{draft.id}:x",
+        now=NOW,
+    )
+    store.finish_publish_attempt(
+        ambiguous.id,
+        PublishStatus.UNKNOWN,
+        actor_id=publisher.id,
+        now=NOW,
+    )
+
+    # Reintentar exactamente el mismo intento sigue siendo idempotente.
+    assert (
+        store.create_publish_attempt(
+            draft.id,
+            actor_id=publisher.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            idempotency_key=f"colmat:auto:{draft.id}:x",
+            now=NOW,
+        ).id
+        == ambiguous.id
+    )
+
+    # Cualquier otra vía hacia X queda cerrada hasta conciliar.
+    with pytest.raises(ConflictError, match="pendiente, ambiguo o exitoso"):
+        store.create_publish_attempt(
+            draft.id,
+            actor_id=publisher.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            idempotency_key=f"publication-request:{draft.id}:f1",
+            now=NOW,
+        )
+    with pytest.raises(ConflictError, match="pendiente, ambiguo o exitoso"):
+        store.enqueue_publication_request(
+            draft.id,
+            actor_id=publisher.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            idempotency_key="telegram:100:publicar",
+            now=NOW,
+        )
+
+
+def test_service_principals_cannot_be_bound_or_invited_through_telegram(store) -> None:
+    """El dominio reservado no opera por Telegram, como promete el manual.
+
+    Regresión: el filtro `.internal` vivía solo en la capa web, así que el owner
+    podía vincular su Telegram a la identidad revisora de servicio y aprobar sus
+    propios borradores saltándose la separación de funciones.
+    """
+
+    owner, _editor, _reviewer, _publisher, _auditor = bootstrap_team(store)
+    service = store.create_user(
+        actor_id=owner.id,
+        email="reviewer@colmat.internal",
+        display_name="Revisor automático",
+        now=NOW,
+    )
+    store.grant_membership(service.id, Role.REVIEWER, actor_id=owner.id, now=NOW)
+
+    with pytest.raises(AuthorizationError, match="principals técnicos"):
+        store.bind_telegram_chat(
+            999,
+            telegram_user_id=999,
+            actor_id=owner.id,
+            user_id=service.id,
+            purpose="control",
+            now=NOW,
+        )
+    with pytest.raises(AuthorizationError, match="principals técnicos"):
+        store.provision_telegram_team_member(
+            telegram_user_id=4242,
+            role="reviewer",
+            email="bot@colmat.internal",
+            display_name="Bot",
+            actor_id=owner.id,
+            now=NOW,
+        )
+
+
+def test_an_unpublishable_request_is_closed_without_poisoning_the_queue(store) -> None:
+    """Una fila mala se cierra sola; las siguientes se siguen publicando.
+
+    Regresión: la excepción se lanzaba dentro de la transacción del claim, la
+    solicitud volvía a `queued` y el worker abortaba en cada ejecución, de modo
+    que una sola fila bloqueaba la cola entera de forma indefinida.
+    """
+
+    _owner, editor, reviewer, publisher, _auditor = bootstrap_team(store)
+    primero, revision_1, _ = approved_draft(store, editor.id, reviewer.id)
+    segundo, revision_2, _ = approved_draft(store, editor.id, reviewer.id)
+    for draft, revision, key in (
+        (primero, revision_1, "telegram:100:publicar-1"),
+        (segundo, revision_2, "telegram:100:publicar-2"),
+    ):
+        store.enqueue_publication_request(
+            draft.id,
+            actor_id=publisher.id,
+            expected_snapshot_hash=revision.snapshot_hash,
+            idempotency_key=key,
+            now=NOW,
+        )
+
+    # El primero se publica por el camino direct, fuera de la cola.
+    directo = store.create_publish_attempt(
+        primero.id,
+        actor_id=publisher.id,
+        expected_snapshot_hash=revision_1.snapshot_hash,
+        idempotency_key=f"colmat:auto:{primero.id}:x",
+        now=NOW,
+    )
+    store.finish_publish_attempt(
+        directo.id,
+        PublishStatus.SUCCEEDED,
+        actor_id=publisher.id,
+        provider_post_id="190000000000000001",
+        now=NOW,
+    )
+
+    # Drenar la cola no aborta. `None` significa tanto «nada que reclamar» como
+    # «cerré una fila inservible», así que se sondea un número acotado de veces.
+    reclamados = []
+    for _ in range(4):
+        claim = store.claim_publication_request(actor_id=publisher.id, now=NOW)
+        if claim is not None:
+            reclamados.append(claim.request.draft_id)
+    assert reclamados == [segundo.id]
+
+    cerradas = {
+        request.draft_id: request.status
+        for request in store.list_publication_requests(actor_id=publisher.id)
+    }
+    assert cerradas[primero.id] == PublicationRequestStatus.UNKNOWN.value

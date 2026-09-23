@@ -251,6 +251,101 @@ ORDER BY
     id
 ON CONFLICT (workspace_id) DO NOTHING;
 
+-- Motor de IA conectable: selección persistida, credenciales selladas y estado
+-- publicado por el worker. Las tres tablas son obligatorias para la readiness web.
+CREATE TABLE IF NOT EXISTS ai_engine_settings (
+    workspace_id VARCHAR(80) PRIMARY KEY,
+    text_provider VARCHAR(20) NOT NULL,
+    text_model VARCHAR(100) NOT NULL,
+    image_provider VARCHAR(20) NOT NULL,
+    image_model VARCHAR(100) NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT ck_ai_engine_settings_text_provider CHECK (
+        text_provider IN ('minimax', 'anthropic', 'openai', 'gemini')
+    ),
+    CONSTRAINT ck_ai_engine_settings_image_provider CHECK (
+        image_provider IN ('minimax', 'openai', 'gemini')
+    ),
+    CONSTRAINT ck_ai_engine_settings_version CHECK (version >= 1)
+);
+
+-- Backfill: cada workspace arranca con MiniMax, igual que la producción actual.
+INSERT INTO ai_engine_settings (
+    workspace_id,
+    text_provider,
+    text_model,
+    image_provider,
+    image_model,
+    version,
+    updated_by,
+    updated_at
+)
+SELECT DISTINCT ON (workspace_id)
+    workspace_id,
+    'minimax',
+    'MiniMax-M2.7',
+    'minimax',
+    'image-01',
+    1,
+    user_id,
+    CURRENT_TIMESTAMP
+FROM memberships
+ORDER BY
+    workspace_id,
+    CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+    created_at,
+    id
+ON CONFLICT (workspace_id) DO NOTHING;
+
+-- Claves selladas con la clave pública del worker. La fila nunca contiene el
+-- valor en claro: solo el sobre, una huella SHA-256 y los últimos caracteres.
+CREATE TABLE IF NOT EXISTS ai_provider_credentials (
+    workspace_id VARCHAR(80) NOT NULL,
+    provider VARCHAR(20) NOT NULL,
+    envelope TEXT NOT NULL,
+    key_id VARCHAR(16) NOT NULL,
+    fingerprint VARCHAR(64) NOT NULL,
+    last_four VARCHAR(4) NOT NULL,
+    byte_length INTEGER NOT NULL,
+    created_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    last_verified_at TIMESTAMPTZ,
+    last_verified_status VARCHAR(10),
+    last_verified_detail VARCHAR(300),
+    last_verified_by VARCHAR(80),
+    verification_requested_at TIMESTAMPTZ,
+    verification_requested_by VARCHAR(80),
+    PRIMARY KEY (workspace_id, provider),
+    CONSTRAINT ck_ai_credentials_provider CHECK (
+        provider IN ('minimax', 'anthropic', 'openai', 'gemini')
+    ),
+    CONSTRAINT ck_ai_credentials_fingerprint CHECK (length(fingerprint) = 64),
+    CONSTRAINT ck_ai_credentials_length CHECK (byte_length >= 1),
+    CONSTRAINT ck_ai_credentials_verified_status CHECK (
+        last_verified_status IS NULL
+        OR last_verified_status IN ('valid', 'invalid', 'error')
+    )
+);
+
+-- Disponibilidad publicada por el worker: presencia de clave en su entorno y si
+-- puede abrir sobres. Nunca contiene valores.
+CREATE TABLE IF NOT EXISTS ai_provider_status (
+    workspace_id VARCHAR(80) NOT NULL,
+    provider VARCHAR(20) NOT NULL,
+    credential_in_environment BOOLEAN NOT NULL,
+    can_decrypt_credentials BOOLEAN NOT NULL DEFAULT FALSE,
+    reported_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    reported_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (workspace_id, provider),
+    CONSTRAINT ck_ai_provider_status_name CHECK (
+        provider IN ('minimax', 'anthropic', 'openai', 'gemini')
+    )
+);
+
 CREATE TABLE IF NOT EXISTS editorial_lines (
     id VARCHAR(36) PRIMARY KEY,
     workspace_id VARCHAR(80) NOT NULL,
@@ -1143,6 +1238,69 @@ CREATE INDEX IF NOT EXISTS ix_publication_requests_queue
     ON publication_requests(workspace_id, channel, status, created_at);
 CREATE INDEX IF NOT EXISTS ix_publication_requests_lease
     ON publication_requests(workspace_id, status, lease_expires_at);
+
+-- Seguros persistidos de publicación real. Nacen cerrados: sin fila, el worker
+-- se comporta como si ambos estuvieran en false. Complementan las variables de
+-- entorno del host; nunca las sustituyen.
+CREATE TABLE IF NOT EXISTS publication_safeguards (
+    workspace_id VARCHAR(80) PRIMARY KEY,
+    live_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    direct_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    live_enabled_by VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT,
+    live_enabled_at TIMESTAMPTZ,
+    direct_enabled_by VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT,
+    direct_enabled_at TIMESTAMPTZ,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_by VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT ck_publication_safeguards_version CHECK (version >= 1),
+    CONSTRAINT ck_publication_safeguards_live_evidence CHECK (
+        (live_enabled AND live_enabled_by IS NOT NULL AND live_enabled_at IS NOT NULL)
+        OR (NOT live_enabled AND live_enabled_by IS NULL AND live_enabled_at IS NULL)
+    ),
+    CONSTRAINT ck_publication_safeguards_direct_evidence CHECK (
+        (
+            direct_publish_enabled
+            AND direct_enabled_by IS NOT NULL
+            AND direct_enabled_at IS NOT NULL
+        ) OR (
+            NOT direct_publish_enabled
+            AND direct_enabled_by IS NULL
+            AND direct_enabled_at IS NULL
+        )
+    )
+);
+
+-- Segundo paso de las órdenes sensibles del bot: un nonce por orden, ligado a
+-- persona, chat privado, acción y parámetros exactos; se consume una sola vez.
+CREATE TABLE IF NOT EXISTS control_confirmations (
+    id VARCHAR(36) PRIMARY KEY,
+    nonce_hash VARCHAR(64) NOT NULL UNIQUE,
+    workspace_id VARCHAR(80) NOT NULL,
+    action VARCHAR(40) NOT NULL,
+    parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+    user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    telegram_user_id VARCHAR(32) NOT NULL,
+    chat_id VARCHAR(32) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    consumed_by VARCHAR(36),
+    outcome VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT ck_control_confirmations_nonce_hash_length CHECK (length(nonce_hash) = 64),
+    CONSTRAINT ck_control_confirmations_outcome CHECK (
+        outcome IS NULL OR outcome IN ('confirmed', 'cancelled')
+    ),
+    CONSTRAINT ck_control_confirmations_consumption CHECK (
+        (consumed_at IS NULL AND outcome IS NULL AND consumed_by IS NULL)
+        OR (consumed_at IS NOT NULL AND outcome IS NOT NULL AND consumed_by IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_control_confirmations_expiry
+    ON control_confirmations(expires_at, consumed_at);
+CREATE INDEX IF NOT EXISTS ix_control_confirmations_pending
+    ON control_confirmations(workspace_id, user_id, consumed_at);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     sequence BIGSERIAL PRIMARY KEY,

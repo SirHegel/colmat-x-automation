@@ -48,7 +48,11 @@ def test_private_runtime_paths_are_ignored() -> None:
         "*.sqlite",
         "*.sqlite3",
         "*.log",
+        # Los textos de Gustavo Bueno están protegidos por derechos de autor: nunca al repo.
+        "corpus/",
+        "*.corpus/",
     } <= ignore_rules
+    assert not list((PROJECT_ROOT / "config").glob("**/*.txt"))
 
 
 def test_vercel_bundle_explicitly_excludes_private_runtime_files() -> None:

@@ -78,6 +78,17 @@ class FetchedResearchSource:
     sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class FetchedResearchDocument:
+    """Cuerpo íntegro (acotado en bytes) de una fuente oficial, sin convertir a texto."""
+
+    url: str
+    body: bytes
+    mime_type: str
+    charset: str | None
+    sha256: str
+
+
 class _VisibleTextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -133,6 +144,9 @@ class ResearchFetcher:
         session: requests.Session | None = None,
         connect_timeout_seconds: float = 5.0,
         read_timeout_seconds: float = 15.0,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+        max_text_characters: int = MAX_SOURCE_TEXT_CHARACTERS,
+        user_agent: str | None = None,
     ) -> None:
         self.connect_timeout_seconds = _positive_timeout(
             connect_timeout_seconds,
@@ -142,12 +156,31 @@ class ResearchFetcher:
             read_timeout_seconds,
             field_name="read_timeout_seconds",
         )
+        self.max_response_bytes = _positive_limit(
+            max_response_bytes, field_name="max_response_bytes"
+        )
+        self.max_text_characters = _positive_limit(
+            max_text_characters, field_name="max_text_characters"
+        )
+        self.user_agent = _optional_user_agent(user_agent)
         self.session = requests.Session() if session is None else session
 
     def fetch_brief(self, brief: str) -> tuple[FetchedResearchSource, ...]:
         return tuple(self.fetch(url) for url in extract_research_urls(brief))
 
     def fetch(self, url: str) -> FetchedResearchSource:
+        document = self.fetch_document(url)
+        text = _body_to_text(
+            document.body,
+            mime_type=document.mime_type,
+            charset=document.charset,
+            max_characters=self.max_text_characters,
+        )
+        return FetchedResearchSource(url=document.url, text=text, sha256=document.sha256)
+
+    def fetch_document(self, url: str) -> FetchedResearchDocument:
+        """Recupera el cuerpo acotado de una URL autorizada sin convertirlo a texto."""
+
         current_url, original_host = _validate_source_url(url)
         visited: set[str] = set()
 
@@ -178,7 +211,7 @@ class ResearchFetcher:
                 elif not isinstance(status_code, int) or not 200 <= status_code < 300:
                     raise ResearchResponseError("La fuente respondió con un estado HTTP no válido")
                 else:
-                    body_result = _read_bounded_body(response)
+                    body_result = _read_bounded_body(response, max_bytes=self.max_response_bytes)
             except requests.RequestException:
                 transport_failed = True
             finally:
@@ -195,28 +228,39 @@ class ResearchFetcher:
             if body_result is None:
                 raise ResearchResponseError("La fuente devolvió un cuerpo no válido")
             body, mime_type, charset = body_result
-            text = _body_to_text(body, mime_type=mime_type, charset=charset)
-            return FetchedResearchSource(
+            return FetchedResearchDocument(
                 url=current_url,
-                text=text,
+                body=body,
+                mime_type=mime_type,
+                charset=charset,
                 sha256=hashlib.sha256(body).hexdigest(),
             )
 
         raise ResearchResponseError("La fuente excedió el límite de redirecciones")
 
     def _request(self, url: str) -> requests.Response:
+        headers = {"Accept": "text/html, text/plain;q=0.9"}
+        if self.user_agent is not None:
+            headers["User-Agent"] = self.user_agent
         response: requests.Response | None = None
         with suppress(requests.RequestException):
             response = self.session.get(
                 url,
                 allow_redirects=False,
-                headers={"Accept": "text/html, text/plain;q=0.9"},
+                headers=headers,
                 stream=True,
                 timeout=(self.connect_timeout_seconds, self.read_timeout_seconds),
             )
         if response is None:
             raise ResearchTransportError("No se pudo obtener una respuesta de la fuente")
         return response
+
+
+def validate_research_url(url: str) -> str:
+    """Devuelve la URL normalizada si pertenece a la lista blanca; si no, ResearchUrlError."""
+
+    normalized, _ = _validate_source_url(url)
+    return normalized
 
 
 def _validate_source_url(url: str) -> tuple[str, str]:
@@ -263,7 +307,9 @@ def _validate_source_url(url: str) -> tuple[str, str]:
     return normalized, host
 
 
-def _read_bounded_body(response: requests.Response) -> tuple[bytes, str, str | None]:
+def _read_bounded_body(
+    response: requests.Response, *, max_bytes: int = MAX_RESPONSE_BYTES
+) -> tuple[bytes, str, str | None]:
     content_type = response.headers.get("Content-Type")
     if not isinstance(content_type, str):
         raise ResearchResponseError("La fuente no declaró un tipo de contenido permitido")
@@ -276,7 +322,7 @@ def _read_bounded_body(response: requests.Response) -> tuple[bytes, str, str | N
         normalized_length = content_length.strip()
         if _CONTENT_LENGTH_PATTERN.fullmatch(normalized_length) is None:
             raise ResearchResponseError("La fuente declaró un tamaño inválido")
-        if int(normalized_length) > MAX_RESPONSE_BYTES:
+        if int(normalized_length) > max_bytes:
             raise ResearchResponseError("La fuente excede el tamaño máximo permitido")
 
     chunks: list[bytes] = []
@@ -287,7 +333,7 @@ def _read_bounded_body(response: requests.Response) -> tuple[bytes, str, str | N
         if not isinstance(chunk, bytes):
             raise ResearchResponseError("La fuente devolvió un cuerpo no válido")
         received += len(chunk)
-        if received > MAX_RESPONSE_BYTES:
+        if received > max_bytes:
             raise ResearchResponseError("La fuente excede el tamaño máximo permitido")
         chunks.append(chunk)
 
@@ -296,19 +342,50 @@ def _read_bounded_body(response: requests.Response) -> tuple[bytes, str, str | N
     return b"".join(chunks), mime_type, charset
 
 
-def _body_to_text(body: bytes, *, mime_type: str, charset: str | None) -> str:
-    try:
-        decoded = body.decode(charset or "utf-8", errors="replace")
-    except LookupError:
-        decoded = body.decode("utf-8", errors="replace")
-    decoded = decoded.lstrip("\ufeff")
+def _body_to_text(
+    body: bytes,
+    *,
+    mime_type: str,
+    charset: str | None,
+    max_characters: int = MAX_SOURCE_TEXT_CHARACTERS,
+) -> str:
+    decoded = decode_document_body(body, charset=charset)
     if mime_type == "text/html":
         parser = _VisibleTextParser()
         parser.feed(decoded)
         parser.close()
         decoded = " ".join(parser.parts)
     normalized = " ".join(decoded.split())
-    return normalized[:MAX_SOURCE_TEXT_CHARACTERS].rstrip()
+    return normalized[:max_characters].rstrip()
+
+
+def decode_document_body(body: bytes, *, charset: str | None) -> str:
+    """Decodifica un cuerpo con el charset declarado, o UTF-8 tolerante si no es v\u00e1lido."""
+
+    try:
+        decoded = body.decode(charset or "utf-8", errors="replace")
+    except LookupError:
+        decoded = body.decode("utf-8", errors="replace")
+    return decoded.lstrip("\ufeff")
+
+
+def _positive_limit(value: int, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} debe ser un entero positivo")
+    return value
+
+
+def _optional_user_agent(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 200
+        or any(not 32 <= ord(character) < 127 for character in value)
+    ):
+        raise ValueError("user_agent debe ser texto ASCII imprimible de hasta 200 caracteres")
+    return value.strip()
 
 
 def _positive_timeout(value: float, *, field_name: str) -> float:
